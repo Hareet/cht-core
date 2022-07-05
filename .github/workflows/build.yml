@@ -54,6 +54,8 @@ jobs:
         node-version: 16.x
     - name: Couch Start
       run: ./scripts/ci/couch-start
+    - name: View Docker PS
+      run: docker ps
     - name: Create logs directory
       run: mkdir tests/logs
     - run: npm ci --legacy-peer-deps
