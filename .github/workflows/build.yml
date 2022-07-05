@@ -180,7 +180,7 @@ jobs:
       with:
         name: cht-images
         path: images/
-      if: ${{ env.INTERNAL_CONTRIBUTOR }}
+      if: ${{ !env.INTERNAL_CONTRIBUTOR }}
     - name: Load docker images
       run: ls -1 *.tar | xargs --no-run-if-empty -L 1 docker load -i
       working-directory: images/
