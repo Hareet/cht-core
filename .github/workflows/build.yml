@@ -52,12 +52,14 @@ jobs:
       uses: actions/setup-node@v1
       with:
         node-version: 16.x
+    - name: what is in hosts
+      run: cat /etc/hosts
     - name: Couch Start
       run: ./scripts/ci/couch-start
     - name: View Docker PS
       run: docker ps
     - name: Curl to localhost
-      run: curl http://localhost:5984/
+      run: curl http://0.0.0.0:5984/
     - name: Create logs directory
       run: mkdir tests/logs
     - run: npm ci --legacy-peer-deps
