@@ -12,6 +12,7 @@ env:
   DOCKERHUB_USERNAME: 'dockermedic'
   ECR_REPO: '720541322708.dkr.ecr.eu-west-2.amazonaws.com/medic'
   COUCHDB_LOG_LEVEL: 'debug'
+# just an empty test
 
 jobs:
 
