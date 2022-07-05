@@ -78,6 +78,7 @@ jobs:
     needs: build
     name: Config Tests
     runs-on: ubuntu-18.04
+    environment: testing
     strategy:
       matrix:
         grunt-cmd: [ 'exec:test-config-standard', 'exec:test-config-default']
@@ -98,6 +99,7 @@ jobs:
     needs: [tests,config-tests]
     name: Publish branch build
     runs-on: ubuntu-18.04
+    environment: testing
 
     steps:
     - name: Delete image artifacts
@@ -136,6 +138,7 @@ jobs:
     needs: build
     name: ${{ matrix.grunt-cmd }} on node ${{ matrix.node-version }}
     runs-on: ubuntu-18.04
+    environment: testing
     env:
       NODE: ${{ matrix.node-version }}
 
