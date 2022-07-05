@@ -72,7 +72,7 @@ jobs:
       with:
         name: cht-images
         path: images/
-      if: ${{ env.INTERNAL_CONTRIBUTOR }}
+      if: ${{ !env.INTERNAL_CONTRIBUTOR }}
 
   config-tests:
     needs: build
@@ -106,7 +106,7 @@ jobs:
       uses: geekyeggo/delete-artifact@v1
       with:
         name: cht-images
-      if: ${{ env.INTERNAL_CONTRIBUTOR }}
+      if: ${{ !env.INTERNAL_CONTRIBUTOR }}
     - name: Configure AWS credentials
       uses: aws-actions/configure-aws-credentials@v1
       with:
@@ -184,7 +184,7 @@ jobs:
     - name: Load docker images
       run: ls -1 *.tar | xargs --no-run-if-empty -L 1 docker load -i
       working-directory: images/
-      if: ${{ env.INTERNAL_CONTRIBUTOR }}
+      if: ${{ !env.INTERNAL_CONTRIBUTOR }}
 
     - name: Set ENV
       run: |
