@@ -3,5 +3,22 @@
 # start couchdb 2.x docker instance
 docker run -d -p 0.0.0.0:5984:5984 --name couch -e COUCHDB_PASSWORD=pass -e COUCHDB_USER=admin medicmobile/cht-couchdb:clustered-test4
 echo "Starting CouchDB 2.x"
-until nc -z localhost 5984; do sleep 1; done
-echo "CouchDB Started"
+
+COUCHDB_URL=http://admin:pass@localhost:5984
+WAIT_THRESHOLD=20
+SLEEP_SECONDS=5
+wait_count=0
+until curl -s --head  --request GET $COUCHDB_URL | grep "200 OK" > /dev/null
+do
+  echo "Waiting for cht couchdb" >&2
+    wait_count=$((wait_count +1))
+    if [[ "$wait_count" -gt $WAIT_THRESHOLD ]]; then
+      echo "No couchdb end point Found at $COUCHDB_URL" >&2
+      exit 1
+    fi
+      sleep $SLEEP_SECONDS
+    done
+echo "couchdb  is ready">&2
+
+#until nc -z localhost 5984; do sleep 1; done
+#echo "CouchDB Started"

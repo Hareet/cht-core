@@ -58,6 +58,8 @@ jobs:
       run: ./scripts/ci/couch-start
     - name: View Docker PS
       run: docker ps
+    - name: Docker logs
+      run: docker logs couch
     - name: Curl to localhost
       run: curl http://0.0.0.0:5984/
     - name: Create logs directory
@@ -68,6 +70,9 @@ jobs:
     - name: Grunt CI-Compile
       run: |
         node --stack_size=10000 `which grunt` ci-compile-github
+    - name: Failed Docker logs
+      run: docker logs couch
+      if: ${{ failure() }}
     - name: Archive Results
       uses: actions/upload-artifact@v2
       with:
