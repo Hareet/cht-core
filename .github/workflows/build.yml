@@ -18,7 +18,7 @@ jobs:
 
   build:
     name: Compile the app
-    runs-on: ubuntu-18.04
+    runs-on: self-hosted
     environment: testing
 
     steps:
@@ -77,7 +77,7 @@ jobs:
   config-tests:
     needs: build
     name: Config Tests
-    runs-on: ubuntu-18.04
+    runs-on: self-hosted
     environment: testing
     strategy:
       matrix:
@@ -98,7 +98,7 @@ jobs:
   publish:
     needs: [tests,config-tests]
     name: Publish branch build
-    runs-on: ubuntu-18.04
+    runs-on: self-hosted
     environment: testing
 
     steps:
@@ -137,7 +137,7 @@ jobs:
   tests:
     needs: build
     name: ${{ matrix.grunt-cmd }} on node ${{ matrix.node-version }}
-    runs-on: ubuntu-18.04
+    runs-on: self-hosted
     environment: testing
     env:
       NODE: ${{ matrix.node-version }}
