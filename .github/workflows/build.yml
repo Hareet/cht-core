@@ -69,12 +69,9 @@ jobs:
     - name: Archive Results
       uses: actions/upload-artifact@v2
       with:
-        name: ${{ matrix.grunt-cmd }} on node ${{ matrix.node-version }}
+        name: compile-app-ci
         path: |
-          allure-results
-          allure-report
           tests/logs
-          tests/results/
       if: ${{ failure() }}
     - name: Publish for testing
       run: |
