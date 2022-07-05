@@ -64,6 +64,16 @@ jobs:
     - name: Grunt CI-Compile
       run: |
         node --stack_size=10000 `which grunt` ci-compile-github
+    - name: Archive Results
+      uses: actions/upload-artifact@v2
+      with:
+        name: ${{ matrix.grunt-cmd }} on node ${{ matrix.node-version }}
+        path: |
+          allure-results
+          allure-report
+          tests/logs
+          tests/results/
+      if: ${{ failure() }}
     - name: Publish for testing
       run: |
         node --stack_size=10000 `which grunt` publish-for-testing
