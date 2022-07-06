@@ -56,12 +56,6 @@ jobs:
       run: docker run --rm ubuntu bash -c "ulimit -n"
     - name: Couch Start
       run: ./scripts/ci/couch-start
-    - name: View Docker PS
-      run: docker ps
-    - name: Docker logs
-      run: docker logs couch
-    - name: Curl to localhost
-      run: curl http://0.0.0.0:5984/
     - name: Create logs directory
       run: mkdir tests/logs
     - run: npm ci --legacy-peer-deps
@@ -218,10 +212,6 @@ jobs:
     - name: Install cht-conf
       run:  npm install -g cht-conf
     - run: npm ci --legacy-peer-deps
-    - name: List dir contents
-      run: ls -lA /opt/actions-runner/_work/cht-core/cht-core/
-    - name: list one level up 
-      run: ls -lA $GITHUB_WORKSPACE
     - name: Grunt install
       run: npm install -g grunt-cli
     - name: Set NODE PATH
