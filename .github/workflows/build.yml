@@ -210,6 +210,10 @@ jobs:
         echo "HORTI_BUILDS_SERVER=$MARKET_URL_READ/$BUILDS_SERVER" >> $GITHUB_ENV
     - name: Create logs directory
       run: mkdir tests/logs
+    - name: List dir contents
+      run: ls -lA /opt/actions-runner/_work/cht-core/cht-core/
+    - name: list one level up 
+      run: ls -lA /opt/actions-runner/_work/cht-core/
     - name: Install pyxform
       run:  python -m pip install git+https://github.com/medic/pyxform.git@medic-conf-1.17#egg=pyxform-medic
     - name: Install cht-conf
