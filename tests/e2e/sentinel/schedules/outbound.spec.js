@@ -1,3 +1,4 @@
+/*
 const utils = require('../../../utils');
 const sentinelUtils = require('../utils');
 const chai = require('chai');
@@ -72,7 +73,7 @@ const wipeTasks = () => {
     return utils.sentinelDb.bulkDocs(docsToDelete);
   });
 };
-/*
+
 describe('Outbound', () => {
   before(() => {
     server = destinationApp.listen();
