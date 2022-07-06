@@ -223,8 +223,6 @@ jobs:
       run: ls -lA $GITHUB_WORKSPACE
     - name: Run tests
       run: node --stack_size=10000 `which grunt` ${{ matrix.grunt-cmd }}
-      with:
-        path: ''
     - name: Archive Results
       uses: actions/upload-artifact@v2
       with:
