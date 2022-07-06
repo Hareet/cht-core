@@ -221,8 +221,10 @@ jobs:
       run: ls -lA /opt/actions-runner/_work/cht-core/cht-core/
     - name: list one level up 
       run: ls -lA $GITHUB_WORKSPACE
+    - name: Set NODE PATH
+      run: echo NODE_PATH=$GITHUB_WORKSPACE/node_modules >> $GITHUB_ENV
     - name: Run tests
-      run: node --stack_size=10000 `which grunt` ${{ matrix.grunt-cmd }}
+      run: NODE_PATH=$GITHUB_WORKSPACE/node_modules node --stack_size=10000 `which grunt` ${{ matrix.grunt-cmd }}
     - name: Archive Results
       uses: actions/upload-artifact@v2
       with:
