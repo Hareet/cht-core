@@ -313,7 +313,7 @@ describe('Users API', () => {
         });
 
     });
-
+/*
     it('should allow to update the admin password and login successfully', async () => {
       const newPassword = 'medic.456';
       const otherAdmin = {
@@ -354,7 +354,7 @@ describe('Users API', () => {
       await expectPasswordLoginToFail(otherAdmin);
       await expectPasswordLoginToWork({ username: otherAdmin.username, password: newPassword });
     });
-
+*/
   });
 
   describe('/api/v1/users-info', () => {
