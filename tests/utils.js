@@ -632,7 +632,7 @@ const prepServices = async (defaultSettings) => {
 
 const dockerComposeCmd = (...params) => {
   return new Promise((resolve, reject) => {
-    const cmd = spawn('DOCKER_HOST=unix:///run/user/1000/docker.sock docker compose', [ '-f', COMPOSE_FILE, ...params ]);
+    const cmd = spawn('DOCKER_HOST=unix:///run/user/1000/docker.sock /home/ubuntu/bin/docker compose', [ '-f', COMPOSE_FILE, ...params ]);
     const output = [];
     const log = (data, error) => {
       data = data.toString();
