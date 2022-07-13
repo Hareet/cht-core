@@ -96,6 +96,7 @@ services:
       - {{ network }}
 
   healthcheck:
+    container_name: cht-haproxy-healthcheck
     image: medicmobile/healthcheck-agent:python3.10.5-slim-071222
     environment:
       - COUCHDB_USER=${COUCHDB_USER:-admin}
