@@ -1,0 +1,19 @@
+version: '3.7'
+
+networks:
+    desktop_cht-net:
+        name: desktop_cht-net
+        external: true
+
+services:
+
+    healthcheck:
+        image: python:3.10.5-slim
+        volumes:
+            - ./check.py:/app/check.py
+            - ./check-entrypoint.sh:/app/check-entrypoint.sh
+        entrypoint: ["/app/check-entrypoint.sh"]
+        ports:
+            - 5555:5555
+        networks:
+            - desktop_cht-net
