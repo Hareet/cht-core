@@ -97,11 +97,11 @@ services:
 
   healthcheck:
     container_name: cht-haproxy-healthcheck
-    image: medicmobile/healthcheck-agent:python3.10.5-slim-071222
+    image: medicmobile/healthcheck-agent:python3.10.5-slim-080422
     environment:
-      - COUCHDB_USER=${COUCHDB_USER:-admin}
-      - COUCHDB_PASSWORD=${COUCHDB_PASSWORD:-pass}
-      - SERVICE_NAMES=${SERVICE_NAMES:-couchdb.1,couchdb.2,couchdb.3}
+      - "COUCHDB_SERVERS=${COUCHDB_SERVERS:-couchdb.1,couchdb.2,couchdb.3}"
+      - "COUCHDB_USER=${COUCHDB_USER:-admin}"
+      - "COUCHDB_PASSWORD=${COUCHDB_PASSWORD:-password}"
     networks:
       - {{ network }}
 
