@@ -101,7 +101,7 @@ services:
     environment:
       - "COUCHDB_SERVERS=${COUCHDB_SERVERS:-couchdb.1,couchdb.2,couchdb.3}"
       - "COUCHDB_USER=${COUCHDB_USER:-admin}"
-      - "COUCHDB_PASSWORD=${COUCHDB_PASSWORD:-password}"
+      - "COUCHDB_PASSWORD=${COUCHDB_PASSWORD:-pass}"
     networks:
       - {{ network }}
 
