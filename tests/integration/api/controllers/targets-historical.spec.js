@@ -20,7 +20,6 @@ describe('Historical Targets API Integration', () => {
   };
 
   before(async () => {
-    // Set up test user and contact
     userCtx = {
       name: 'test-chw',
       contact_id: 'contact-123',
@@ -35,19 +34,15 @@ describe('Historical Targets API Integration', () => {
       parent: { _id: userCtx.facility_id }
     };
     
-    // Delete existing contact if it exists before creating new one
     try {
       await utils.deleteDoc(contact._id);
     } catch (err) {
-      // Document doesn't exist, which is fine
     }
     
-    // Create test documents
     await utils.saveDocs([contact]);
   });
 
   beforeEach(async () => {
-    // Create stored target documents
     const previousTag = getPreviousMonthTag();
     const currentTag = getCurrentMonthTag();
     
@@ -79,12 +74,10 @@ describe('Historical Targets API Integration', () => {
       reported_date: moment().subtract(1, 'day').toISOString()
     };
     
-    // Delete existing documents if they exist before creating new ones
     for (const doc of [previousTargetDoc, currentTargetDoc]) {
       try {
         await utils.deleteDoc(doc._id);
       } catch (err) {
-        // Document doesn't exist, which is fine
       }
     }
     
@@ -92,22 +85,18 @@ describe('Historical Targets API Integration', () => {
   });
 
   afterEach(async () => {
-    // Clean up target documents
     try {
       await utils.deleteDoc(previousTargetDoc._id);
     } catch (err) {
-      // Document doesn't exist
     }
     
     try {
       await utils.deleteDoc(currentTargetDoc._id);
     } catch (err) {
-      // Document doesn't exist
     }
   });
 
   after(async () => {
-    // Clean up test data
     await utils.revertDb([], true);
   });
 
@@ -153,12 +142,10 @@ describe('Historical Targets API Integration', () => {
     });
 
     it('should retrieve correct document based on interval calculation', async () => {
-      // Test with specific date (15th of month)
       const testDate = moment().date(15);
       const expectedTag = testDate.endOf('month').format('YYYY-MM');
       const docId = `target~${expectedTag}~${userCtx.contact_id}~${userCtx.name}`;
       
-      // Should still get current month when on 15th
       const doc = await utils.getDoc(docId);
       expect(doc).to.exist;
       expect(doc._id).to.include(expectedTag);
@@ -179,7 +166,6 @@ describe('Historical Targets API Integration', () => {
       const endOfMonth = moment().endOf('month');
       const tag = endOfMonth.format('YYYY-MM');
       
-      // Tag should use end of month, not start
       expect(tag).to.equal(getCurrentMonthTag());
       expect(tag).not.to.equal(startOfMonth.format('YYYY-MM-DD'));
     });
@@ -189,7 +175,6 @@ describe('Historical Targets API Integration', () => {
     it('should retrieve correct document for specific user', async () => {
       const previousTag = getPreviousMonthTag();
       
-      // Create another user's document
       const otherUserDoc = {
         _id: `target~${previousTag}~${userCtx.contact_id}~other-user`,
         type: 'target',
@@ -202,7 +187,6 @@ describe('Historical Targets API Integration', () => {
       
       await utils.saveDocs([otherUserDoc]);
       
-      // Get both documents and verify the correct one
       const userDoc = await utils.getDoc(`target~${previousTag}~${userCtx.contact_id}~${userCtx.name}`);
       const otherDoc = await utils.getDoc(otherUserDoc._id);
       
@@ -211,14 +195,12 @@ describe('Historical Targets API Integration', () => {
       expect(otherDoc.user).to.equal('other-user');
       expect(otherDoc.targets[0].value.pass).to.equal(10);
       
-      // Clean up
       await utils.deleteDoc(otherUserDoc._id);
     });
 
     it('should not retrieve documents from different contacts', async () => {
       const previousTag = getPreviousMonthTag();
       
-      // Create document for different contact
       const otherContactDoc = {
         _id: `target~${previousTag}~other-contact~${userCtx.name}`,
         type: 'target',
@@ -231,14 +213,12 @@ describe('Historical Targets API Integration', () => {
       
       await utils.saveDocs([otherContactDoc]);
       
-      // Verify each document has correct owner
       const userDoc = await utils.getDoc(`target~${previousTag}~${userCtx.contact_id}~${userCtx.name}`);
       const otherDoc = await utils.getDoc(otherContactDoc._id);
       
       expect(userDoc.owner).to.equal(userCtx.contact_id);
       expect(otherDoc.owner).to.equal('other-contact');
       
-      // Clean up
       await utils.deleteDoc(otherContactDoc._id);
     });
   });
@@ -295,7 +275,6 @@ describe('Historical Targets API Integration', () => {
       const previousTag = getPreviousMonthTag();
       const docId = `target~${previousTag}~${userCtx.contact_id}~${userCtx.name}`;
       
-      // Make concurrent requests
       const promises = [];
       for (let i = 0; i < 5; i++) {
         promises.push(utils.getDoc(docId));
@@ -303,7 +282,6 @@ describe('Historical Targets API Integration', () => {
       
       const results = await Promise.all(promises);
       
-      // All should return the same document
       results.forEach(doc => {
         expect(doc._id).to.equal(docId);
         expect(doc.targets).to.have.lengthOf(3);
@@ -315,15 +293,14 @@ describe('Historical Targets API Integration', () => {
     it('should handle malformed document IDs', async () => {
       const malformedIds = [
         'target~invalid',
-        'target~2024-13~contact~user', // Invalid month
-        'target~2024-01~', // Missing parts
-        '~2024-01~contact~user', // Missing prefix
+        'target~2024-13~contact~user',
+        'target~2024-01~',
+        '~2024-01~contact~user',
       ];
       
       for (const id of malformedIds) {
         try {
           await utils.getDoc(id);
-          // If document exists (unlikely), it's still a valid test
         } catch (err) {
           expect(err.status).to.equal(404);
         }
