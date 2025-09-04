@@ -750,7 +750,6 @@ describe('RulesEngineService', () => {
     expect(rulesEngineCoreStubs.fetchTargets.args[0][0]).to.have.keys('start', 'end');
   });
 
-
   it('fetchTargets should wait for contacts to be marked as dirty', fakeAsync(async () => {
     fetchTargetsResult = sinon.stub().resolves([{ ...sampleTarget }]);
     service = TestBed.inject(RulesEngineService);
@@ -999,5 +998,4 @@ describe('RulesEngineService', () => {
     });
   });
 
-  // TODO: Add tests for Target Aggregates Service when implementing Phase 4
 });
