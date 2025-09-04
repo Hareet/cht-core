@@ -1213,6 +1213,357 @@ describe('TargetAggregatesService', () => {
     });
   });
 
+  describe('getIndividualTargets', () => {
+    it('should fetch and transform stored targets for previous period', async () => {
+      const options = {
+        contact_id: 'contact-123',
+        user_id: 'org.couchdb.user:user123',
+        reporting_period: ReportingPeriod.PREVIOUS
+      };
+      
+      const config = {
+        tasks: { 
+          targets: { 
+            items: [
+              { id: 'target1', type: 'count', title: 'Target 1' },
+              { id: 'target2', type: 'percent', translation_key: 'targets.target2' }
+            ] 
+          } 
+        }
+      };
+      
+      const storedDoc = {
+        _id: 'target~2024-01~contact-123~org.couchdb.user:user123',
+        owner: 'contact-123',
+        user: 'org.couchdb.user:user123',
+        reporting_period: '2024-01',
+        updated_date: 1704067200000, // 2024-01-01
+        targets: [
+          { id: 'target1', value: { pass: 10, total: 15 } },
+          { id: 'target2', value: { pass: 20, total: 25 } }
+        ]
+      };
+      
+      settingsService.get.resolves(config);
+      uhcSettingsService.getMonthStartDate.returns(1);
+      calendarIntervalService.getCurrent.returns({
+        start: moment('2024-02-01').valueOf(),
+        end: moment('2024-03-01').valueOf()
+      });
+      calendarIntervalService.getInterval.returns({
+        start: moment('2024-01-01').valueOf(),
+        end: moment('2024-02-01').valueOf()
+      });
+      
+      dbService.get.returns({
+        get: sinon.stub().resolves(storedDoc)
+      });
+      
+      translateFromService.get.callsFake(key => key === 'Target 1' ? 'Target 1' : 'Target 2');
+      
+      const result = await service.getIndividualTargets(options);
+      
+      expect(result.is_historical).to.equal(true);
+      expect(result.document_date).to.equal(1704067200000);
+      expect(result.targets).to.have.lengthOf(2);
+      
+      // Check first target
+      expect(result.targets[0]).to.include({
+        id: 'target1',
+        type: 'count',
+        title: 'Target 1',
+        visible: true,
+        sort_order: 0
+      });
+      expect(result.targets[0].value).to.deep.equal({ pass: 10, total: 15 });
+      
+      // Check second target
+      expect(result.targets[1]).to.include({
+        id: 'target2',
+        type: 'percent',
+        translation_key: 'targets.target2',
+        visible: true,
+        sort_order: 1
+      });
+      expect(result.targets[1].value).to.deep.equal({ pass: 20, total: 25 });
+      
+      expect(settingsService.get.callCount).to.equal(1);
+      expect(uhcSettingsService.getMonthStartDate.callCount).to.equal(1);
+      expect(calendarIntervalService.getInterval.callCount).to.equal(1);
+      expect(dbService.get.callCount).to.equal(1);
+      expect(translateFromService.get.callCount).to.equal(0);
+    });
+
+    it('should handle 404 error when no stored target document exists', async () => {
+      const options = {
+        contact_id: 'contact-123',
+        user_id: 'org.couchdb.user:user123',
+        reporting_period: ReportingPeriod.PREVIOUS
+      };
+      
+      settingsService.get.resolves({
+        tasks: { 
+          targets: { 
+            items: [
+              { id: 'target1', type: 'count' }
+            ] 
+          } 
+        }
+      });
+      
+      uhcSettingsService.getMonthStartDate.returns(1);
+      calendarIntervalService.getCurrent.returns({
+        start: moment('2024-02-01').valueOf(),
+        end: moment('2024-03-01').valueOf()
+      });
+      calendarIntervalService.getInterval.returns({
+        start: moment('2024-01-01').valueOf(),
+        end: moment('2024-02-01').valueOf()
+      });
+      
+      dbService.get.returns({
+        get: sinon.stub().rejects({ status: 404, message: 'not found' })
+      });
+      
+      const result = await service.getIndividualTargets(options);
+      
+      expect(result).to.deep.equal({
+        targets: [],
+        is_historical: true
+      });
+      
+      expect(settingsService.get.callCount).to.equal(1);
+      expect(dbService.get.callCount).to.equal(1);
+    });
+
+    it('should rethrow non-404 errors from database', async () => {
+      const options = {
+        contact_id: 'contact-123',
+        user_id: 'org.couchdb.user:user123',
+        reporting_period: ReportingPeriod.PREVIOUS
+      };
+      
+      settingsService.get.resolves({
+        tasks: { targets: { items: [] } }
+      });
+      
+      uhcSettingsService.getMonthStartDate.returns(1);
+      calendarIntervalService.getCurrent.returns({
+        start: moment('2024-02-01').valueOf(),
+        end: moment('2024-03-01').valueOf()
+      });
+      calendarIntervalService.getInterval.returns({
+        start: moment('2024-01-01').valueOf(),
+        end: moment('2024-02-01').valueOf()
+      });
+      
+      const dbError = { status: 500, message: 'Internal server error' };
+      dbService.get.returns({
+        get: sinon.stub().rejects(dbError)
+      });
+      
+      try {
+        await service.getIndividualTargets(options);
+        assert.fail('Should have thrown');
+      } catch (error) {
+        expect(error).to.deep.equal(dbError);
+      }
+      
+      expect(settingsService.get.callCount).to.equal(1);
+      expect(dbService.get.callCount).to.equal(1);
+    });
+
+    it('should transform targets with settings configuration', async () => {
+      const options = {
+        contact_id: 'contact-123',
+        user_id: 'user123',
+        reporting_period: ReportingPeriod.PREVIOUS
+      };
+      
+      const config = {
+        tasks: { 
+          targets: { 
+            items: [
+              { 
+                id: 'target1', 
+                type: 'count',
+                title: 'My Title',
+                subtitle: 'My Subtitle',
+                goal: 10
+              },
+              { 
+                id: 'target2', 
+                type: 'percent',
+                translation_key: 'my.translation',
+                icon: 'icon-heart',
+                goal: 80
+              },
+              { 
+                id: 'target3', 
+                type: 'count'
+              }
+            ] 
+          } 
+        }
+      };
+      
+      const storedDoc = {
+        _id: 'target~2024-01~contact-123~user123',
+        updated_date: 1704067200000,
+        targets: [
+          { id: 'target1', value: { pass: 8, total: 12 } },
+          { id: 'target2', value: { pass: 60, total: 75 } },
+          { id: 'target3', value: { pass: 5, total: 5 } }
+        ]
+      };
+      
+      settingsService.get.resolves(config);
+      uhcSettingsService.getMonthStartDate.returns(1);
+      calendarIntervalService.getCurrent.returns({
+        start: moment('2024-02-01').valueOf(),
+        end: moment('2024-03-01').valueOf()
+      });
+      calendarIntervalService.getInterval.returns({
+        start: moment('2024-01-01').valueOf(),
+        end: moment('2024-02-01').valueOf()
+      });
+      
+      dbService.get.returns({
+        get: sinon.stub().resolves(storedDoc)
+      });
+      
+      translateFromService.get.callsFake(key => {
+        if (key === 'My Title') return 'Translated Title';
+        if (key === 'my.translation') return 'Translated Target';
+        return key;
+      });
+      
+      const result = await service.getIndividualTargets(options);
+      
+      expect(result.targets).to.have.lengthOf(3);
+      expect(result.targets[0]).to.include({
+        id: 'target1',
+        type: 'count',
+        title: 'My Title',
+        subtitle: 'My Subtitle',
+        goal: 10,
+        visible: true,
+        sort_order: 0
+      });
+      expect(result.targets[0].value).to.deep.equal({ pass: 8, total: 12 });
+      
+      expect(result.targets[1]).to.include({
+        id: 'target2',
+        type: 'percent',
+        translation_key: 'my.translation',
+        icon: 'icon-heart',
+        goal: 80,
+        visible: true,
+        sort_order: 1
+      });
+      expect(result.targets[1].value).to.deep.equal({ pass: 60, total: 75 });
+      
+      expect(result.targets[2]).to.include({
+        id: 'target3',
+        type: 'count',
+        visible: true,
+        sort_order: 2
+      });
+      expect(result.targets[2].value).to.deep.equal({ pass: 5, total: 5 });
+      
+      expect(result.is_historical).to.equal(true);
+      expect(result.document_date).to.equal(1704067200000);
+    });
+
+    it('should use correct interval calculation for different month start dates', async () => {
+      const options = {
+        contact_id: 'contact-123',
+        user_id: 'user123',
+        reporting_period: ReportingPeriod.PREVIOUS
+      };
+      
+      settingsService.get.resolves({
+        tasks: { targets: { items: [] } }
+      });
+      
+      uhcSettingsService.getMonthStartDate.returns(15); // Month starts on 15th
+      calendarIntervalService.getCurrent.returns({
+        start: moment('2024-02-15').valueOf(),
+        end: moment('2024-03-15').valueOf()
+      });
+      calendarIntervalService.getInterval.returns({
+        start: moment('2024-01-15').valueOf(),
+        end: moment('2024-02-15').valueOf()
+      });
+      
+      dbService.get.returns({
+        get: sinon.stub().rejects({ status: 404 })
+      });
+      
+      await service.getIndividualTargets(options);
+      
+      expect(uhcSettingsService.getMonthStartDate.callCount).to.equal(1);
+      expect(calendarIntervalService.getCurrent.callCount).to.equal(1);
+      expect(calendarIntervalService.getCurrent.args[0]).to.deep.equal([15]);
+      expect(calendarIntervalService.getInterval.callCount).to.equal(1);
+      expect(calendarIntervalService.getInterval.args[0]).to.deep.equal([
+        15,
+        moment('2024-02-15').valueOf()  // subtract 1 month from current_interval.end
+      ]);
+      
+      const dbGetStub = dbService.get().get;
+      expect(dbGetStub.callCount).to.equal(1);
+      expect(dbGetStub.args[0][0]).to.equal('target~2024-02~contact-123~user123');
+    });
+
+    it('should handle empty targets array in stored document', async () => {
+      const options = {
+        contact_id: 'contact-123',
+        user_id: 'user123',
+        reporting_period: ReportingPeriod.PREVIOUS
+      };
+      
+      const config = {
+        tasks: { 
+          targets: { 
+            items: [
+              { id: 'target1', type: 'count' }
+            ] 
+          } 
+        }
+      };
+      
+      const storedDoc = {
+        _id: 'target~2024-01~contact-123~user123',
+        updated_date: 1704067200000,
+        targets: [] // Empty array
+      };
+      
+      settingsService.get.resolves(config);
+      uhcSettingsService.getMonthStartDate.returns(1);
+      calendarIntervalService.getCurrent.returns({
+        start: moment('2024-02-01').valueOf(),
+        end: moment('2024-03-01').valueOf()
+      });
+      calendarIntervalService.getInterval.returns({
+        start: moment('2024-01-01').valueOf(),
+        end: moment('2024-02-01').valueOf()
+      });
+      
+      dbService.get.returns({
+        get: sinon.stub().resolves(storedDoc)
+      });
+      
+      const result = await service.getIndividualTargets(options);
+      
+      expect(result).to.deep.equal({
+        targets: [],
+        is_historical: true,
+        document_date: 1704067200000
+      });
+    });
+  });
+
   describe('getAggregateDetails', () => {
     it('should return nothing when no targetId or aggregates provided', () => {
       expect(service.getAggregateDetails()).to.equal(undefined);

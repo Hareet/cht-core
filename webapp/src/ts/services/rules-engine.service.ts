@@ -459,11 +459,11 @@ export class RulesEngineService implements OnDestroy {
       });
   }
 
-  fetchTargets() {
+  fetchTargets(): Promise<any[]> {
     return this.ngZone.runOutsideAngular(() => this._fetchTargets());
   }
 
-  private async _fetchTargets(): Promise<Target[]> {
+  private async _fetchTargets(): Promise<any[]> {
     const trackName = this.getTelemetryTrackName('targets');
     let trackPerformanceQueueing;
     let trackPerformanceRunning;

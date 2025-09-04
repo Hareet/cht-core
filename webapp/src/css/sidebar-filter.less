@@ -28,8 +28,10 @@
     text-decoration: none !important;
   }
 
-  .hidden {
-    display: none !important;
+  .sidebar-main:not(.hidden) {
+    display: block !important;
+    visibility: visible !important;
+    z-index: 9999 !important;
   }
 
   .sidebar-backdrop {

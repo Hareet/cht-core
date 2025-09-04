@@ -10,7 +10,7 @@ import {
 } from '@angular/core';
 import { Store } from '@ngrx/store';
 import { ActivatedRoute, ActivationEnd, NavigationEnd, Router, RouterLink } from '@angular/router';
-import { Subscription, filter } from 'rxjs';
+import { Subscription, filter, take } from 'rxjs';
 
 import { GlobalActions } from '@mm-actions/global';
 import { Selectors } from '@mm-selectors/index';
@@ -18,6 +18,7 @@ import { SessionService } from '@mm-services/session.service';
 import { TelemetryService } from '@mm-services/telemetry.service';
 import { TargetAggregatesService } from '@mm-services/target-aggregates.service';
 import { AGGREGATE_TARGETS_ID } from '@mm-services/analytics-modules.service';
+import { RulesEngineService } from '@mm-services/rules-engine.service';
 import { NgIf, NgFor } from '@angular/common';
 import { MatIcon } from '@angular/material/icon';
 import { TranslatePipe } from '@ngx-translate/core';
@@ -44,6 +45,7 @@ export class AnalyticsFilterComponent implements AfterContentInit, AfterContentC
     private sessionService: SessionService,
     private telemetryService: TelemetryService,
     private targetAggregatesService: TargetAggregatesService,
+    private rulesEngineService: RulesEngineService,
   ) {
     this.globalActions = new GlobalActions(store);
   }
@@ -102,24 +104,45 @@ export class AnalyticsFilterComponent implements AfterContentInit, AfterContentC
   private isTargetAggregates() {
     return this.getCurrentModuleId() === AGGREGATE_TARGETS_ID;
   }
+  
+  private isTargets() {
+    return this.getCurrentModuleId() === 'targets';
+  }
 
   private isTargetAggregateEnabled() {
     return this.targetAggregatesService.isEnabled();
   }
+  
+  private isTargetsEnabled() {
+    return this.rulesEngineService.isEnabled();
+  }
 
   private async canDisplayFilterButton() {
     const isAdmin = this.sessionService.isAdmin();
-    const isTargetAggregateEnabled = await this.isTargetAggregateEnabled();
-
-    this.showFilterButton = !isAdmin && this.isTargetAggregates() && isTargetAggregateEnabled;
+    
+    if (this.isTargetAggregates()) {
+      const isTargetAggregateEnabled = await this.isTargetAggregateEnabled();
+      this.showFilterButton = !isAdmin && isTargetAggregateEnabled;
+    } else if (this.isTargets()) {
+      const isTargetsEnabled = await this.isTargetsEnabled();
+      this.showFilterButton = !isAdmin && isTargetsEnabled;
+    } else {
+      this.showFilterButton = false;
+    }
   }
 
   openSidebar() {
     this.isOpen = !this.isOpen;
     this.globalActions.setSidebarFilter({ isOpen: this.isOpen });
+    
     if (this.isOpen) {
-      // Counting every time the user opens the sidebar filter in analytics_targets_aggregrate tab.
-      this.telemetryService.record('sidebar_filter:analytics:target_aggregates:open');
+      const moduleId = this.getCurrentModuleId();
+      if (moduleId === AGGREGATE_TARGETS_ID) {
+        // Counting every time the user opens the sidebar filter in analytics_targets_aggregrate tab.
+        this.telemetryService.record('sidebar_filter:analytics:target_aggregates:open');
+      } else if (moduleId === 'targets') {
+        this.telemetryService.record('sidebar_filter:analytics:targets:open');
+      }
     }
   }
 }

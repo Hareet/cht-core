@@ -18,6 +18,7 @@ import { TranslateFromService } from '@mm-services/translate-from.service';
 import { RulesEngineCoreFactoryService, RulesEngineService } from '@mm-services/rules-engine.service';
 import { PipesService } from '@mm-services/pipes.service';
 import { CHTDatasourceService } from '@mm-services/cht-datasource.service';
+import { CalendarIntervalService } from '@mm-services/calendar-interval.service';
 
 describe('RulesEngineService', () => {
   let service: RulesEngineService;
@@ -33,6 +34,7 @@ describe('RulesEngineService', () => {
   let rulesEngineCoreStubs;
   let pipesService;
   let chtDatasourceService;
+  let calendarIntervalService;
   let performanceService;
   let stopPerformanceTrackStub;
   let clock;
@@ -126,6 +128,10 @@ describe('RulesEngineService', () => {
       getPipeNameVsIsPureMap: PipesService.prototype.getPipeNameVsIsPureMap
     };
     chtDatasourceService = { get: sinon.stub().returns(chtScriptApi) };
+    calendarIntervalService = {
+      getCurrent: sinon.stub().returns({ start: 1704067200000, end: 1706745599999 }),
+      getInterval: sinon.stub().returns({ start: 1701388800000, end: 1704067199999 })
+    };
     stopPerformanceTrackStub = sinon.stub();
     performanceService = { track: sinon.stub().returns({ stop: stopPerformanceTrackStub }) };
 
@@ -199,7 +205,8 @@ describe('RulesEngineService', () => {
         { provide: TranslateFromService, useValue: translateFromService },
         { provide: RulesEngineCoreFactoryService, useValue: rulesEngineCoreFactory },
         { provide: PipesService, useValue: pipesService },
-        { provide: CHTDatasourceService, useValue: chtDatasourceService }
+        { provide: CHTDatasourceService, useValue: chtDatasourceService },
+        { provide: CalendarIntervalService, useValue: calendarIntervalService }
       ]
     });
   });
@@ -743,6 +750,7 @@ describe('RulesEngineService', () => {
     expect(rulesEngineCoreStubs.fetchTargets.args[0][0]).to.have.keys('start', 'end');
   });
 
+
   it('fetchTargets should wait for contacts to be marked as dirty', fakeAsync(async () => {
     fetchTargetsResult = sinon.stub().resolves([{ ...sampleTarget }]);
     service = TestBed.inject(RulesEngineService);
@@ -990,4 +998,6 @@ describe('RulesEngineService', () => {
       expect(stopPerformanceTrackStub.args[1][0]).to.deep.equal({ name: 'rules-engine:tasks-breakdown:some-contacts' });
     });
   });
+
+  // TODO: Add tests for Target Aggregates Service when implementing Phase 4
 });

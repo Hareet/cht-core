@@ -1,21 +1,87 @@
-<div class="page scrolling">
+<div class="page scrolling" [ngClass]="{'sidebar-open': !!sidebarFilter?.isOpen, 'sidebar-closed': !sidebarFilter?.isOpen}">
+  <mm-analytics-targets-sidebar-filter
+    [currentMonthDisplay]="currentMonthDisplay"
+    [previousMonthDisplay]="previousMonthDisplay"
+    [currentPeriod]="selectedPeriod"
+    (reportingPeriodSelectionChanged)="onReportingPeriodChange($event)">
+  </mm-analytics-targets-sidebar-filter>
+  
+  <div class="targets-header" *ngIf="!loading && !targetsDisabled && selectedMonthDisplay">
+    <div class="month-display-container">
+      <div class="month-display">
+        <span class="month-label">{{ 'targets.showing_data_for' | translate }}:</span>
+        <span class="month-value">{{ selectedMonthDisplay }}</span>
+      </div>
+      <div class="period-indicator">
+        <span class="period-badge" [ngClass]="{'current': selectedPeriod === 'current', 'previous': selectedPeriod === 'previous'}">
+          {{ ('targets.period.' + selectedPeriod) | translate }}
+        </span>
+      </div>
+    </div>
+  </div>
+  
   <div class="item-content empty-selection" *ngIf="targetsDisabled">
     <div>{{ 'targets.disabled' | translate }}</div>
   </div>
 
-  <div class="item-content empty-selection" *ngIf="!targetsDisabled && loading">
-    <div><div class="loader"></div></div>
+  <div class="item-content empty-selection loading-container" 
+       *ngIf="!targetsDisabled && loading && !targetsCache.has(selectedPeriod)">
+    <div class="loader-wrapper">
+      <div class="loader"></div>
+      <p class="loading-text">{{ loadingMessage || ('targets.loading.default' | translate) }}</p>
+    </div>
+  </div>
+  
+  <div class="stale-data-warning" *ngIf="showStaleDataWarning">
+    <div class="alert alert-warning">
+      <i class="fa fa-exclamation-triangle"></i>
+      <span>{{ 'targets.stale_data_warning' | translate }}</span>
+      <span class="last-update" *ngIf="getLastUpdateDisplay(selectedPeriod)">
+        {{ 'targets.last_updated' | translate }}: {{ getLastUpdateDisplay(selectedPeriod) }}
+      </span>
+      <button class="btn btn-sm btn-link" (click)="fetchTargets(selectedPeriod, true)">
+        {{ 'targets.retry' | translate }}
+      </button>
+    </div>
   </div>
 
-  <div class="item-content empty-selection" *ngIf="!targetsDisabled && !loading && !targets?.length && !errorStack">
-    <div>{{ 'targets.no_targets' | translate }}</div>
+  <div class="item-content empty-selection empty-targets" 
+       *ngIf="!targetsDisabled && !loading && !targets?.length && !errorStack">
+    <div class="empty-state-container">
+      <div class="empty-state-icon" [ngClass]="{'historical-missing': noHistoricalDataAvailable}">
+        <i class="fa {{ emptyStateIcon || 'fa-bar-chart-o' }} fa-3x"></i>
+      </div>
+      <div class="empty-state-content">
+        <h3>{{ emptyStateMessage || ('targets.no_targets' | translate) }}</h3>
+        <p class="empty-state-subtitle" *ngIf="!noHistoricalDataAvailable">
+          {{ ('targets.no_data.subtitle.' + selectedPeriod) | translate }}
+        </p>
+        <p class="empty-state-subtitle" *ngIf="noHistoricalDataAvailable">
+          {{ 'targets.historical_data.not_available' | translate }}
+        </p>
+        <div class="empty-state-actions" *ngIf="showEmptyStateAction">
+          <button class="btn btn-primary" (click)="fetchTargets(selectedPeriod, true)">
+            <i class="fa fa-refresh"></i>
+            {{ 'targets.refresh_data' | translate }}
+          </button>
+        </div>
+        <div class="empty-state-help" *ngIf="noHistoricalDataAvailable">
+          <p class="help-text">
+            <i class="fa fa-info-circle"></i>
+            {{ 'targets.historical_data.help_text' | translate }}
+          </p>
+        </div>
+      </div>
+    </div>
   </div>
 
   <error-log class="targets" *ngIf="!targetsDisabled && !loading && !!errorStack" [errorStack]="errorStack" [errorFor]="'targets'"></error-log>
 
-  <div class="targets" *ngIf="!targetsDisabled && !loading && targets?.length && !errorStack">
+  <div class="targets" 
+       [ngClass]="{'with-sidebar': !!sidebarFilter?.isOpen, 'historical': isShowingHistoricalData}"
+       *ngIf="!targetsDisabled && !loading && targets?.length && !errorStack">
     <div class="target" *ngFor="let target of targets"
-      [ngClass]="{ 'has-goal': target.goal >= 0, 'goal-met': (target.value?.pass >= target.goal) || (target.value?.percent >= target.goal) }"
+      [ngClass]="{ 'has-goal': target.goal >= 0, 'goal-met': (target.value?.pass >= target.goal) || (target.value?.percent >= target.goal), 'historical-target': target.isHistorical }"
       attr.test-target-id="{{ target.id }}">
       <div class="body">
         <mm-analytics-targets-progress
@@ -36,6 +102,7 @@
           <h2 *ngIf="target.translation_key">{{ target.translation_key | translate }}</h2>
           <h2 *ngIf="!target.translation_key">{{ target.name | translateFrom }}</h2>
           <p *ngIf="target.subtitle_translation_key">{{ target.subtitle_translation_key | translate }}</p>
+          <p class="period-label" *ngIf="target.periodDisplay">{{ target.periodDisplay }}</p>
         </div>
       </div>
     </div>

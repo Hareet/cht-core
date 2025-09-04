@@ -16,6 +16,18 @@ import { TranslateService } from '@mm-services/translate.service';
 import { Target, TargetValue } from '@mm-services/rules-engine.service';
 import { ReportingPeriod } from '@mm-modules/analytics/analytics-target-aggregates-sidebar-filter.component';
 
+interface IndividualTargetOptions {
+  contact_id: string;
+  user_id: string;
+  reporting_period: ReportingPeriod;
+}
+
+interface TargetResponse {
+  targets: Target[];
+  is_historical: boolean;
+  document_date?: number;
+}
+
 @Injectable({
   providedIn: 'root'
 })
@@ -320,6 +332,10 @@ export class TargetAggregatesService {
     return !facilityIds || facilityIds.length > 0;
   }
 
+  async getIndividualTargets(options: IndividualTargetOptions): Promise<TargetResponse> {
+    return this._fetchStoredIndividualTargets(options);
+  }
+
   getReportingMonth(reportingPeriod:ReportingPeriod) {
     return this.settingsService
       .get()
@@ -390,6 +406,76 @@ export class TargetAggregatesService {
     const targetDocs = await this.fetchTargetDocs(settings, targetContact);
     return targetDocs.map(targetDoc => this.getTargetDetails(targetDoc, settings));
   }
+
+  private async _fetchStoredIndividualTargets(options: IndividualTargetOptions): Promise<TargetResponse> {
+    try {
+      const settings = await this.settingsService.get();
+      const uhc_month_start_date = this.uhcSettingsService.getMonthStartDate(settings);
+
+      const current_interval = this.calendarIntervalService.getCurrent(uhc_month_start_date);
+      const previous_date = moment(current_interval.end).subtract(1, 'month');
+      const target_interval = this.calendarIntervalService.getInterval(
+        uhc_month_start_date,
+        previous_date.valueOf()
+      );
+
+      const interval_tag = this.getIntervalTag(target_interval);
+      const doc_id = `target~${interval_tag}~${options.contact_id}~${options.user_id}`;
+
+      const db = this.dbService.get();
+      const target_doc = await db.get(doc_id);
+
+      const transformed = this._transformStoredTargets(target_doc, settings);
+      const response: TargetResponse = {
+        targets: transformed,
+        is_historical: true,
+        document_date: target_doc.updated_date || target_doc.reported_date
+      };
+
+      return response;
+
+    } catch (error:any) {
+      if (error.status === 404) {
+        console.debug('No stored target document found for period:', options.reporting_period);
+        return { targets: [], is_historical: true };
+      }
+      console.error('Error fetching stored target document:', error);
+      throw error;
+    }
+  }
+
+  private _transformStoredTargets(target_doc: any, settings: any): Target[] {
+    if (!target_doc?.targets) {
+      return [];
+    }
+
+    const targets_config = settings?.tasks?.targets?.items || [];
+
+    const config_order = new Map<string, number>();
+    targets_config.forEach((config:any, index:number) => {
+      config_order.set(config.id, index);
+    });
+
+    return target_doc.targets
+      .map((stored_target:any) => {
+        const config = targets_config.find((c:any) => c.id === stored_target.id) || {};
+
+        return {
+          ...config,
+          ...stored_target,
+          translation_key: config.translation_key || stored_target.translation_key,
+          subtitle_translation_key: config.subtitle_translation_key || stored_target.subtitle_translation_key,
+          icon: config.icon || stored_target.icon,
+          type: config.type || stored_target.type,
+          goal: stored_target.goal !== undefined ? stored_target.goal : config.goal,
+          value: stored_target.value || { pass: 0, total: 0 },
+          visible: config.visible !== false,
+          sort_order: config_order.get(stored_target.id) ?? 999
+        };
+      })
+      .sort((a:any, b:any) => a.sort_order - b.sort_order);
+  }
+
 }
 
 export interface AggregateTarget extends Target {
