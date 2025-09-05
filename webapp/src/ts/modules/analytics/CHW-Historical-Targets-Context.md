@@ -150,7 +150,7 @@ Following the Supervisor pattern, caching is handled at the component level, not
 - Clear data flow
 - Component controls cache lifecycle
 
-### 2. Response Object Structure
+### 2. Response Object Structure // Needs confirmation if this impacts anything else
 Changed from returning raw arrays to structured objects:
 ```typescript
 interface TargetResponse {
@@ -161,7 +161,7 @@ interface TargetResponse {
 ```
 This provides metadata about the data source and freshness.
 
-### 3. Early Return Pattern
+### 3. Early Return Pattern // Interesting, it wants to prevent future agents from that mistake
 For current period requests to TargetAggregatesService:
 ```typescript
 if (options.reporting_period !== ReportingPeriod.PREVIOUS) {
