@@ -34,7 +34,14 @@ teardown_worktree() {
 
   cd "$REPO"
   echo "[agent-$id] Removing worktree at $worktree_dir..."
-  git worktree remove "$worktree_dir" --force
+  # git worktree remove can fail with relative gitdir paths.
+  # Fall back to manual cleanup + prune if it does.
+  if ! git worktree remove "$worktree_dir" --force 2>/dev/null; then
+    echo "[agent-$id] git worktree remove failed, cleaning manually..."
+    rm -rf "$worktree_dir"
+    rm -rf "$REPO/.git/worktrees/agent-${id}"
+    git worktree prune
+  fi
   echo "[agent-$id] Removed."
 }
 

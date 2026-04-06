@@ -46,13 +46,14 @@ RUN mkdir -p /home/agent/.ssh && \
 RUN mkdir -p /workspace/cht-core /workspace/worktree /workspace/cht-ai-tools \
     && chown -R agent:agent /workspace
 
+USER agent
+
 # --- Install Claude Code CLI ---
-# Must set WORKDIR to /tmp first — installing as root into / causes hangs.
+# Install as agent user so it goes to ~/.local/bin/claude
 WORKDIR /tmp
 RUN curl -fsSL https://claude.ai/install.sh | bash
-ENV PATH="/home/agent/.claude/bin:$PATH"
+ENV PATH="/home/agent/.local/bin:$PATH"
 
-USER agent
 WORKDIR /workspace/worktree
 
 # Agent-level git config: dummy identity, no credential helpers

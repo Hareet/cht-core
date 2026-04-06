@@ -1,0 +1,28 @@
+{
+  "mcpServers": {
+    "cht-core-wiki": {
+      "type": "http",
+      "url": "https://opendeepwiki.dev.medicmobile.org/api/mcp?owner=medic&name=cht-core"
+    },
+    "cht-sync-wiki": {
+      "type": "http",
+      "url": "https://opendeepwiki.dev.medicmobile.org/api/mcp?owner=medic&name=cht-sync"
+    },
+    "cht-conf-wiki": {
+      "type": "http",
+      "url": "https://opendeepwiki.dev.medicmobile.org/api/mcp?owner=medic&name=cht-conf"
+    },
+    "cht-watchdog-wiki": {
+      "type": "http",
+      "url": "https://opendeepwiki.dev.medicmobile.org/api/mcp?owner=medic&name=cht-watchdog"
+    },
+    "cht-kapa-docs": {
+      "type": "http",
+      "url": "https://mcp-docs.dev.medicmobile.org/mcp"
+    },
+    "powersync-docs": {
+      "type": "http",
+      "url": "https://docs.powersync.com/mcp"
+    }
+  }
+}

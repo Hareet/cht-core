@@ -1,0 +1,52 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm run *)",
+      "Bash(npm test *)",
+      "Bash(node *)",
+      "Bash(npx *)",
+      "Bash(git add *)",
+      "Bash(git commit *)",
+      "Bash(git status *)",
+      "Bash(git log *)",
+      "Bash(git diff *)",
+      "Bash(git branch *)",
+      "Bash(git stash *)",
+      "Bash(git merge *)",
+      "Bash(git rebase *)",
+      "Bash(curl *)",
+      "Bash(psql *)",
+      "Bash(ls *)",
+      "Bash(cat *)",
+      "Bash(head *)",
+      "Bash(tail *)",
+      "Bash(wc *)",
+      "Bash(mkdir *)",
+      "Bash(cp *)",
+      "Bash(mv *)",
+      "Bash(touch *)",
+      "Read",
+      "Write",
+      "Edit",
+      "Glob",
+      "Grep",
+      "WebSearch",
+      "WebFetch",
+      "mcp__cht-core-wiki__*",
+      "mcp__cht-sync-wiki__*",
+      "mcp__cht-conf-wiki__*",
+      "mcp__cht-watchdog-wiki__*",
+      "mcp__cht-kapa-docs__*",
+      "mcp__powersync-docs__*"
+    ],
+    "deny": [
+      "Bash(git push *)",
+      "Bash(git fetch *)",
+      "Bash(git pull *)",
+      "Bash(git remote *)",
+      "Bash(ssh *)",
+      "Bash(docker *)",
+      "Bash(rm -rf /*)"
+    ]
+  }
+}

@@ -71,19 +71,59 @@ Key insight: CHT v5 already decoupled from CouchDB sync. The API layer abstracts
   - `failed-agent-{ID}` — last failure exit code (written by ralph loop)
 - **Logs**: `/workspace/cht-core/.agents/logs/agent-{ID}-ralph.log`
 
-## MCP Servers (if configured)
+## How to Research — Tool Selection Guide
 
-| Server | Use For |
-|--------|---------|
-| `cht-core-wiki` | Replication logic, cht-datasource, rules engine, Sentinel |
-| `cht-sync-wiki` | couch2pg pipeline, dbt models, PostgreSQL schema |
-| `cht-conf-wiki` | Configuration compilation, purge.js, tasks.js |
-| PowerSync Docs MCP | Sync Streams syntax, SDK APIs, deployment config |
+You have context documents, MCP servers, local code, PowerSync skills files, and web access.
 
-## PowerSync Skills
+### Research workflow
+1. **Read context docs first** — The `context/` directory has our research findings and decisions. Your task assignment lists which ones are relevant. These give you the "why" and the constraints before you touch any code.
+2. **Query MCP servers and read local code together** — These have equal priority. Use MCP servers to understand intended behavior and architecture; use Grep/Glob to see the actual implementation. Cross-reference both before making changes.
+   - `cht-kapa-docs` → `ask_question` with natural language. Searches the CHT docs site, community forum, and GitHub issues. Tells you "what should happen."
+   - OpenDeepWiki servers → `search_documents` → `read_document`. Tells you "how the code works" with full architectural analysis.
+   - Local code → Grep/Glob/Read. The current state — what you'll actually modify.
+3. **Collate across sources.** The docs MCP, the wiki, and the local code may disagree if code has drifted from docs. Trust the local code for current behavior, trust the docs for intended behavior, trust `context/DECISIONS_AND_CONSTRAINTS.md` for what we've decided.
+4. **PowerSync questions** — Check `.agents/skills/powersync/references/` first (fast, curated), then query `powersync-docs` MCP, then WebFetch `https://docs.powersync.com/{path}.md` for anything else.
 
-If your task involves PowerSync, load `/workspace/cht-core/.agents/skills/powersync/AGENTS.md` before starting. Follow the CLI-first playbook. Key rules:
+### MCP Servers
+
+| Server | What it knows | When to use |
+|--------|--------------|-------------|
+| `cht-kapa-docs` | CHT docs site, forum posts, GitHub issues | "What does CHT do when X?", "How is Y configured?", user-facing behavior, deployment guides. Use `ask_question` with natural language. |
+| `cht-core-wiki` | cht-core codebase internals — replication, cht-datasource, rules engine, Sentinel, API, webapp | "How does the code implement X?", "What calls what?" Use `search_documents` → `read_document`. |
+| `cht-sync-wiki` | couch2pg pipeline, dbt models, cht-sync PostgreSQL schema | "How does couch2pg transform docs?", "What's the dbt model for contacts?" |
+| `cht-conf-wiki` | App config compilation, purge.js, tasks.js, targets.js, forms | "How does purge.js get invoked?", "What's the tasks.js contract?" |
+| `cht-watchdog-wiki` | Monitoring, alerting, health checks | Only if your task involves monitoring |
+| `powersync-docs` | PowerSync documentation — Sync Streams, SDKs, service config | "How do bucket parameters work?", "What's the uploadData contract?" |
+
+### WebSearch and WebFetch
+- **WebSearch**: npm package docs, PostgreSQL syntax, third-party API references, patterns not covered by MCP servers.
+- **WebFetch**: Read specific URLs. For PowerSync docs: `https://docs.powersync.com/{path}.md` returns markdown.
+
+### PowerSync Skills (local reference files)
+Curated documentation at `.agents/skills/powersync/references/`. Faster and more targeted than the MCP — **check these first** for PowerSync questions.
+
+| Need | Read first |
+|------|-----------|
+| Sync Streams / sync config | `references/sync-config.md` |
+| PowerSync Service setup | `references/powersync-service.md` |
+| JS/TS Web SDK | `references/sdks/powersync-js.md` |
+| Debugging sync issues | `references/powersync-debug.md` |
+| Custom backend (non-Supabase) | `references/custom-backend.md` |
+| CLI commands | `references/powersync-cli.md` |
+
+If your task involves PowerSync, read `.agents/skills/powersync/AGENTS.md` first. Key rules:
 - Use Sync Streams (not legacy Sync Rules)
 - Never define `id` column in PowerSync table schema
 - `connect()` is fire-and-forget; use `waitForFirstSync()` for readiness
-- `transaction.complete()` is mandatory
+- `transaction.complete()` is mandatory or upload queue stalls permanently
+
+## Workflow — How to Approach Your Task
+
+1. **Read your assignment** — `.agents/tasks/agent-assignments/agent-{ID}-{NAME}.md` defines your scope, tasks, and success criteria.
+2. **Read context docs** — Start with `CLAUDE.md` (root), then the context files your assignment references.
+3. **Research** — Query MCP servers and read local code at the same priority. Collate findings before writing anything.
+4. **Check the phase gate** — Run `phase-gate.sh check <N>` for your phase dependency. If blocked, focus on unit-testable code that doesn't need live services.
+5. **Implement** — Match existing patterns (CommonJS, mocha/chai, npm workspaces). Start with the smallest testable unit.
+6. **Test** — Run relevant unit tests after each change. Don't batch.
+7. **Commit** — After each passing test or completed sub-task. Descriptive messages. The ralph loop and human rely on git history.
+8. **Signal** — When done: write `DONE.md` at your worktree root. When blocked: `touch .agents/signals/build-request-agent-{ID}` for image rebuilds.
