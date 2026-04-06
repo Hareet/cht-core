@@ -1,0 +1,23 @@
+{
+  "name": "CHT Migration Agent",
+  "dockerComposeFile": ["docker-compose.agents.yml"],
+  "service": "agent-1",
+  "workspaceFolder": "/workspace/cht-core/.agents/worktrees/agent-1",
+  "remoteUser": "agent",
+  "features": {
+    "ghcr.io/devcontainers/features/git:1": {}
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "dbaeumer.vscode-eslint",
+        "ms-vscode.vscode-typescript-next"
+      ],
+      "settings": {
+        "terminal.integrated.defaultProfile.linux": "bash"
+      }
+    }
+  },
+  "forwardPorts": [],
+  "postCreateCommand": "echo 'Agent container ready. Worktree at /workspace/cht-core/.agents/worktrees/agent-${AGENT_ID}'"
+}

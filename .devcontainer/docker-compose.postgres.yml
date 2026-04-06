@@ -1,0 +1,81 @@
+# Phase 2: PostgreSQL + cht-sync
+# Adds PostgreSQL as the target database and cht-sync as the CouchDB->PG bridge.
+#
+# Prerequisites:
+#   1. Phase 1 services running
+#   2. .env file has POSTGRES_PASSWORD set
+#
+# Usage:
+#   docker compose -f docker-compose.postgres.yml up -d
+#   # Wait for PG readiness:
+#   docker exec cht-postgres pg_isready
+#   # Then approve:
+#   ./scripts/phase-gate.sh approve 2
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: cht-postgres
+    hostname: postgres
+    restart: always
+    environment:
+      - POSTGRES_DB=cht
+      - POSTGRES_USER=${POSTGRES_USER:-cht}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
+    volumes:
+      - cht-pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-cht} -d cht"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    logging:
+      driver: "local"
+      options:
+        max-size: "50m"
+        max-file: "20"
+    networks:
+      - cht-net
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+    command: >
+      postgres
+        -c shared_buffers=1GB
+        -c work_mem=20MB
+        -c jit=off
+        -c wal_level=logical
+        -c max_replication_slots=4
+        -c max_wal_senders=4
+
+  cht-sync:
+    image: public.ecr.aws/medic/cht-sync:latest
+    container_name: cht-sync
+    hostname: cht-sync
+    restart: always
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      - COUCHDB_URL=http://${COUCHDB_USER:-admin}:${COUCHDB_PASSWORD}@couchdb:5984
+      - POSTGRES_URL=postgresql://${POSTGRES_USER:-cht}:${POSTGRES_PASSWORD}@postgres:5432/cht
+      - COUCHDB_DBS=medic
+      - DATAEMON_INTERVAL=60
+    logging:
+      driver: "local"
+      options:
+        max-size: "50m"
+        max-file: "20"
+    networks:
+      - cht-net
+
+volumes:
+  cht-pgdata:
+
+networks:
+  cht-net:
+    external: true
+    name: ${CHT_NETWORK:-cht-net}

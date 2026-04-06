@@ -62,3 +62,12 @@ user-password-change.csv
 .envrc
 release-notes.md
 /scripts/build/helm/values.yaml
+
+# Multi-agent development environment
+.agents/worktrees/
+.agents/signals/
+.agents/logs/
+.devcontainer/.current-phase
+.devcontainer/.gates/
+.devcontainer/.env
+.devcontainer/powersync-config/

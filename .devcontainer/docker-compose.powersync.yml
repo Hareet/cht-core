@@ -1,0 +1,48 @@
+# Phase 3: PowerSync Service
+# Self-hosted PowerSync reads PostgreSQL WAL and streams filtered sync to clients.
+#
+# Prerequisites:
+#   1. Phase 2 (PostgreSQL) running with wal_level=logical
+#   2. Sync config prepared in ./powersync-config/sync-config.yaml
+#   3. .env file has POWERSYNC_ADMIN_TOKEN set
+#
+# Usage:
+#   docker compose -f docker-compose.powersync.yml up -d
+#   # Verify sync service:
+#   curl http://localhost:8080/api/admin/v1/diagnostics -H "Authorization: Bearer $POWERSYNC_ADMIN_TOKEN"
+#   # Then approve:
+#   ./scripts/phase-gate.sh approve 3
+
+services:
+  powersync:
+    image: journeyapps/powersync-service:latest
+    container_name: cht-powersync
+    hostname: powersync
+    restart: always
+    depends_on:
+      - postgres
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./powersync-config:/config:ro
+    environment:
+      - PS_DATABASE_URI=postgresql://${POSTGRES_USER:-cht}:${POSTGRES_PASSWORD}@postgres:5432/cht
+      - PS_ADMIN_TOKEN=${POWERSYNC_ADMIN_TOKEN:?POWERSYNC_ADMIN_TOKEN must be set}
+      - PS_CONFIG_PATH=/config/powersync.yaml
+    logging:
+      driver: "local"
+      options:
+        max-size: "50m"
+        max-file: "20"
+    networks:
+      - cht-net
+
+  # Note: postgres service is defined in docker-compose.postgres.yml
+  # This compose file expects it to already be running on cht-net.
+  # The depends_on above is for documentation; cross-compose depends_on
+  # doesn't work. Use phase-gate.sh to ensure ordering.
+
+networks:
+  cht-net:
+    external: true
+    name: ${CHT_NETWORK:-cht-net}
