@@ -27,15 +27,24 @@ import { PostgresDataContext } from './data-context';
  * @internal
  */
 export const getLineageDocsById = (ctx: PostgresDataContext) => async (id: string): Promise<Nullable<Doc>[]> => {
+  // The parent field can be either:
+  //   - An object: { _id: "parent-uuid", parent: { _id: "grandparent-uuid" } }
+  //   - A plain string: "parent-uuid" (for API-created persons)
+  // This COALESCE handles both formats to extract the parent ID.
+  const parentIdExpr = `COALESCE(
+    doc->'parent'->>'_id',
+    CASE WHEN jsonb_typeof(doc->'parent') = 'string' THEN doc->>'parent' ELSE NULL END
+  )`;
+
   const { rows } = await ctx.pool.query<{ doc: Doc, depth: number }>(
     `WITH RECURSIVE lineage AS (
-       SELECT doc, doc->'parent'->>'_id' AS parent_id, 0 AS depth
+       SELECT doc, ${parentIdExpr} AS parent_id, 0 AS depth
        FROM ${ctx.qualifiedTable}
        WHERE _id = $1 AND (_deleted IS NULL OR _deleted = false)
 
        UNION ALL
 
-       SELECT c.doc, c.doc->'parent'->>'_id', l.depth + 1
+       SELECT c.doc, ${parentIdExpr}, l.depth + 1
        FROM ${ctx.qualifiedTable} c
        JOIN lineage l ON c._id = l.parent_id
        WHERE l.parent_id IS NOT NULL
