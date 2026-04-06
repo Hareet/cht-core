@@ -7,13 +7,14 @@
  * purge.js logic in SQL, so a server-side service must precompute purge
  * decisions and store them in a table that Sync Streams can reference.
  *
- * Schema under test:
+ * Schema under test (new table, separate from cht-sync's v1.couchdb):
  *   purge_status (
- *     doc_id TEXT PRIMARY KEY,
+ *     doc_id TEXT NOT NULL,       -- references v1.couchdb._id
  *     role TEXT NOT NULL,
  *     purged BOOLEAN NOT NULL DEFAULT false,
  *     evaluated_at TIMESTAMP DEFAULT NOW(),
- *     purge_reason TEXT
+ *     purge_reason TEXT,
+ *     PRIMARY KEY (doc_id, role)
  *   )
  *
  * Prerequisites: CouchDB, API, PostgreSQL, and cht-sync must be running.
@@ -296,15 +297,16 @@ describe('Purge preprocessing for PostgreSQL', () => {
       await utils.waitForDocInPostgres(docId, 45000);
 
       // Query for documents that have no purge_status entry
+      // cht-sync uses _id as the PK; purge_status uses doc_id
       const result = await utils.pgQuery(
-        `SELECT c.doc_id FROM couchdb c
-         LEFT JOIN purge_status ps ON c.doc_id = ps.doc_id AND ps.role = 'chw'
-         WHERE c.doc_id = $1 AND ps.doc_id IS NULL`,
+        `SELECT c._id FROM ${utils.pgDocsTable()} c
+         LEFT JOIN purge_status ps ON c._id = ps.doc_id AND ps.role = 'chw'
+         WHERE c._id = $1 AND ps.doc_id IS NULL`,
         [docId]
       );
 
       expect(result.rows).to.have.length(1);
-      expect(result.rows[0].doc_id).to.equal(docId);
+      expect(result.rows[0]._id).to.equal(docId);
     });
   });
 
@@ -341,15 +343,16 @@ describe('Purge preprocessing for PostgreSQL', () => {
       // Third doc has no purge_status entry (should be included)
 
       // Sync Stream pattern: include docs that are NOT purged for this role
+      // cht-sync table uses _id; purge_status uses doc_id
       const result = await utils.pgQuery(
-        `SELECT c.doc_id FROM couchdb c
-         LEFT JOIN purge_status ps ON c.doc_id = ps.doc_id AND ps.role = $1
-         WHERE c.doc_id = ANY($2)
+        `SELECT c._id FROM ${utils.pgDocsTable()} c
+         LEFT JOIN purge_status ps ON c._id = ps.doc_id AND ps.role = $1
+         WHERE c._id = ANY($2)
          AND (ps.purged IS NULL OR ps.purged = false)`,
         ['chw', docIds]
       );
 
-      const syncedIds = result.rows.map(r => r.doc_id);
+      const syncedIds = result.rows.map(r => r._id);
       expect(syncedIds).to.have.length(2);
       expect(syncedIds).to.include(docIds[1]); // explicitly not purged
       expect(syncedIds).to.include(docIds[2]); // no entry = not purged

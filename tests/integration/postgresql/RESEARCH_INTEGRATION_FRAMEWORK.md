@@ -120,12 +120,64 @@ The agent-harness wrapper must:
 ```
 COUCH_URL=https://admin:pass@couchdb:5984
 API_URL=https://api:5988
-POSTGRES_URL=postgresql://postgres:postgres@postgres:5432/cht
+POSTGRES_URL=postgresql://postgres:postgres@postgres:5432/cht_sync
+POSTGRES_SCHEMA=v1
+POSTGRES_TABLE=couchdb
 POWERSYNC_URL=http://powersync:8080
 ```
+
+### cht-sync Schema (Verified via MCP)
+
+**CRITICAL**: The actual cht-sync PostgreSQL schema (confirmed from cht-sync source) is:
+
+```sql
+-- Table: v1.couchdb (default: POSTGRES_SCHEMA=v1, POSTGRES_TABLE=couchdb)
+CREATE TABLE v1.couchdb (
+  saved_timestamp TIMESTAMP,
+  _id VARCHAR PRIMARY KEY,      -- CouchDB doc _id (NOT uuid, NOT doc_id)
+  _deleted BOOLEAN,             -- soft delete flag (true when doc deleted in CouchDB)
+  source VARCHAR,               -- CouchDB hostname:port/dbname
+  doc JSONB                     -- full CouchDB document
+);
+
+-- Indexes: _deleted, saved_timestamp, source
+-- UPSERT: ON CONFLICT (_id) DO UPDATE SET saved_timestamp, _deleted, source, doc
+
+-- Table: v1.couchdb_progress (sync checkpointing)
+CREATE TABLE v1.couchdb_progress (
+  seq VARCHAR,
+  pending INTEGER,
+  updated_at TIMESTAMPTZ,
+  source VARCHAR PRIMARY KEY
+);
+```
+
+Key differences from CLAUDE.md description:
+- PK column is `_id` (not `uuid`)
+- No `doc_id` or `seq` columns on the couchdb table
+- `_deleted` BOOLEAN column for soft deletes (rows are NOT removed on deletion)
+- `seq` is per-source in `couchdb_progress`, NOT per-document
+- Default schema prefix is `v1`, default DB name is `cht_sync`
+
+### MCP-Verified Gap Analysis (2026-04-06)
+
+Gaps identified by cross-referencing cht-sync-wiki, cht-core-wiki, and cht-kapa-docs:
+
+| Gap | Severity | Fixed In |
+|-----|----------|----------|
+| Wrong column names (_id not doc_id/uuid, no seq on couchdb) | CRITICAL | All spec files + agent-harness |
+| Missing schema prefix (v1.) | CRITICAL | agent-harness pgDocsTable()/pgProgressTable() |
+| Soft delete not tested (_deleted=true, row preserved) | HIGH | cht-sync-data-integrity.spec.js |
+| Security stripping not tested (user docs) | MEDIUM | cht-sync-data-integrity.spec.js |
+| Message docs not tested (data_record without form) | MEDIUM | cht-sync-data-integrity.spec.js |
+| Private/sensitive field replication not tested | MEDIUM | cht-sync-data-integrity.spec.js |
+| couchdb_progress table not tested | MEDIUM | cht-sync-data-integrity.spec.js |
+| Source identifier tracking not tested | LOW | cht-sync-data-integrity.spec.js |
+| UPSERT conflict resolution not tested | LOW | cht-sync-data-integrity.spec.js |
 
 ### Risk Areas
 
 - **Module aliases** (`@utils`, `@constants`) must still resolve correctly — the aliases.js + jsconfig.json system is path-relative and should work from any working directory within the repo.
 - **TLS certificates** — Existing tests set `NODE_TLS_REJECT_UNAUTHORIZED=0` for self-signed certs. Agent environment may use different cert setup.
 - **PouchDB clients are module-level singletons** — They're created when `tests/utils/index.js` is first imported, using `constants.BASE_URL`. The harness must ensure env vars are set BEFORE the module is imported.
+- **cht-sync schema prefix** — All PostgreSQL queries must use the `v1.` schema prefix (or use `pgDocsTable()` helper). The default `search_path` may not include `v1`.

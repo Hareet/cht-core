@@ -116,7 +116,7 @@ describe('Sentinel transitions in PostgreSQL', () => {
       let foundProcessed = false;
       while (Date.now() - start < maxWait) {
         const result = await utils.pgQuery(
-          'SELECT doc FROM couchdb WHERE doc_id = $1',
+          `SELECT doc FROM ${utils.pgDocsTable()} WHERE _id = $1`,
           [reportId]
         );
         if (result.rows.length > 0 && result.rows[0].doc.contact) {
@@ -157,7 +157,7 @@ describe('Sentinel transitions in PostgreSQL', () => {
   });
 
   describe('changes detection for Sentinel processing', () => {
-    it('should track document sequence numbers for change detection', async function () {
+    it('should update saved_timestamp when documents are re-synced after Sentinel processing', async function () {
       this.timeout(60000);
 
       const docId = uuid();
@@ -172,37 +172,62 @@ describe('Sentinel transitions in PostgreSQL', () => {
       await utils.saveDoc(doc);
       await utils.waitForDocInPostgres(docId, 45000);
 
-      // The couchdb table should have a seq value that can be used for change detection
-      const result = await utils.pgQuery(
-        'SELECT seq, saved_timestamp FROM couchdb WHERE doc_id = $1',
-        [docId]
-      );
-      expect(result.rows).to.have.length(1);
-      expect(result.rows[0].seq).to.exist;
-      expect(result.rows[0].saved_timestamp).to.exist;
+      // Get the initial saved_timestamp from the raw row
+      const initialRow = await utils.getPostgresRawRow(docId);
+      expect(initialRow).to.exist;
+      expect(initialRow.saved_timestamp).to.exist;
+      const initialTimestamp = initialRow.saved_timestamp;
 
-      // After updating the doc, the seq should change
+      // Update the doc (simulates Sentinel re-processing or user edit)
       const savedDoc = await utils.getDoc(docId);
       savedDoc.fields.updated = true;
       await utils.saveDoc(savedDoc);
 
-      // Wait for the update to propagate
+      // Wait for the update to propagate — cht-sync UPSERTs on _id,
+      // so saved_timestamp should be updated
+      const maxWait = 45000;
       const startTime = Date.now();
-      const originalSeq = result.rows[0].seq;
-      let newSeq;
-      while (Date.now() - startTime < 45000) {
-        const updated = await utils.pgQuery(
-          'SELECT seq FROM couchdb WHERE doc_id = $1',
-          [docId]
-        );
-        if (updated.rows.length > 0 && updated.rows[0].seq !== originalSeq) {
-          newSeq = updated.rows[0].seq;
+      let updatedRow;
+      while (Date.now() - startTime < maxWait) {
+        updatedRow = await utils.getPostgresRawRow(docId);
+        if (updatedRow && updatedRow.doc.fields?.updated === true) {
           break;
         }
         await new Promise(resolve => setTimeout(resolve, 500));
       }
-      expect(newSeq).to.exist;
-      expect(newSeq).to.not.equal(originalSeq);
+      expect(updatedRow).to.exist;
+      expect(updatedRow.doc.fields.updated).to.be.true;
+      // saved_timestamp should have been updated by the UPSERT
+      expect(new Date(updatedRow.saved_timestamp).getTime())
+        .to.be.at.least(new Date(initialTimestamp).getTime());
+    });
+
+    it('should advance seq in couchdb_progress as documents are processed', async function () {
+      this.timeout(60000);
+
+      // cht-sync tracks progress per source in couchdb_progress, not per document
+      const progressBefore = await utils.getPostgresProgress();
+      expect(progressBefore).to.be.an('array').that.is.not.empty;
+      const seqBefore = progressBefore[0].seq;
+
+      // Create a new document to advance the changes feed
+      const docId = uuid();
+      await utils.saveDoc({
+        _id: docId,
+        type: 'data_record',
+        fields: { progress_test: true },
+        reported_date: Date.now(),
+      });
+
+      // Wait for it to arrive
+      await utils.waitForDocInPostgres(docId, 45000);
+
+      // seq should have advanced in the progress table
+      const progressAfter = await utils.getPostgresProgress();
+      const seqAfter = progressAfter.find(p => p.source === progressBefore[0].source)?.seq;
+      expect(seqAfter).to.exist;
+      // CouchDB seq values are strings; they should differ after new docs
+      expect(seqAfter).to.not.equal(seqBefore);
     });
   });
 });

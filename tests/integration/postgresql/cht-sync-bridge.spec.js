@@ -96,7 +96,7 @@ describe('cht-sync bridge: CouchDB → PostgreSQL', () => {
       let found = false;
       while (Date.now() - start < maxWait) {
         const result = await utils.pgQuery(
-          'SELECT doc FROM couchdb WHERE doc_id = $1',
+          `SELECT doc FROM ${utils.pgDocsTable()} WHERE _id = $1`,
           [doc._id]
         );
         if (result.rows.length > 0 && result.rows[0].doc.fields?.status === 'submitted') {
@@ -124,19 +124,18 @@ describe('cht-sync bridge: CouchDB → PostgreSQL', () => {
       // Delete the document
       await utils.deleteDoc(doc._id);
 
-      // cht-sync should handle the deletion
-      // The behavior depends on cht-sync config — it may remove the row
-      // or mark the doc as deleted in the JSONB
+      // cht-sync marks deleted docs with _deleted=true in the row AND
+      // stores a minimal {_id, _rev, _deleted: true} in the doc JSONB column.
+      // The row is NOT removed — it stays for downstream consumers.
       const maxWait = 30000;
       const start = Date.now();
       let handled = false;
       while (Date.now() - start < maxWait) {
         const result = await utils.pgQuery(
-          'SELECT doc FROM couchdb WHERE doc_id = $1',
+          `SELECT _deleted, doc FROM ${utils.pgDocsTable()} WHERE _id = $1`,
           [doc._id]
         );
-        // Either the row is removed, or the doc has _deleted: true
-        if (result.rows.length === 0 || result.rows[0].doc._deleted === true) {
+        if (result.rows.length > 0 && result.rows[0]._deleted === true) {
           handled = true;
           break;
         }
@@ -147,23 +146,50 @@ describe('cht-sync bridge: CouchDB → PostgreSQL', () => {
   });
 
   describe('schema correctness', () => {
-    it('should have correct couchdb table schema', async () => {
+    it('should have correct cht-sync couchdb table schema', async () => {
+      // cht-sync creates: v1.couchdb(_id VARCHAR PK, saved_timestamp, _deleted BOOLEAN, source VARCHAR, doc JSONB)
+      const pgSchema = process.env.POSTGRES_SCHEMA || 'v1';
+      const pgTable = process.env.POSTGRES_TABLE || 'couchdb';
       const result = await utils.pgQuery(`
         SELECT column_name, data_type
         FROM information_schema.columns
-        WHERE table_name = 'couchdb'
+        WHERE table_schema = $1 AND table_name = $2
         ORDER BY ordinal_position
-      `);
+      `, [pgSchema, pgTable]);
 
       const columns = result.rows.reduce((acc, row) => {
         acc[row.column_name] = row.data_type;
         return acc;
       }, {});
 
-      // Core columns from cht-sync schema
-      expect(columns).to.have.property('uuid');
+      // Exact cht-sync schema columns
+      expect(columns).to.have.property('_id');
+      expect(columns._id).to.include('character'); // VARCHAR
+      expect(columns).to.have.property('saved_timestamp');
+      expect(columns).to.have.property('_deleted');
+      expect(columns).to.have.property('source');
       expect(columns).to.have.property('doc');
       expect(columns.doc).to.equal('jsonb');
+    });
+
+    it('should have couchdb_progress table for sync tracking', async () => {
+      const pgSchema = process.env.POSTGRES_SCHEMA || 'v1';
+      const result = await utils.pgQuery(`
+        SELECT column_name, data_type
+        FROM information_schema.columns
+        WHERE table_schema = $1 AND table_name = 'couchdb_progress'
+        ORDER BY ordinal_position
+      `, [pgSchema]);
+
+      const columns = result.rows.reduce((acc, row) => {
+        acc[row.column_name] = row.data_type;
+        return acc;
+      }, {});
+
+      expect(columns).to.have.property('seq');
+      expect(columns).to.have.property('pending');
+      expect(columns).to.have.property('updated_at');
+      expect(columns).to.have.property('source');
     });
 
     it('should store the full CouchDB document in JSONB', async function () {
@@ -210,18 +236,16 @@ describe('cht-sync bridge: CouchDB → PostgreSQL', () => {
 
       await utils.waitForDocInPostgres(doc._id, 45000);
 
-      const result = await utils.pgQuery(
-        'SELECT uuid, doc_id, saved_timestamp, source, seq FROM couchdb WHERE doc_id = $1',
-        [doc._id]
-      );
-      expect(result.rows).to.have.length(1);
-      const row = result.rows[0];
-
-      expect(row.uuid).to.exist;
-      expect(row.doc_id).to.equal(doc._id);
+      // cht-sync schema: _id, saved_timestamp, _deleted, source, doc
+      const row = await utils.getPostgresRawRow(doc._id);
+      expect(row).to.exist;
+      expect(row._id).to.equal(doc._id);
       expect(row.saved_timestamp).to.exist;
-      // seq tracks the CouchDB change sequence
-      expect(row.seq).to.exist;
+      expect(row._deleted).to.satisfy(v => v === false || v === null);
+      expect(row.source).to.be.a('string').that.is.not.empty;
+      // doc column should contain the full JSONB document
+      expect(row.doc).to.be.an('object');
+      expect(row.doc._id).to.equal(doc._id);
 
       // Clean up
       await utils.deleteDoc(doc._id);

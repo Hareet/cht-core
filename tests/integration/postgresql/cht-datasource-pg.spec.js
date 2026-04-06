@@ -169,10 +169,10 @@ describe('cht-datasource PostgreSQL adapter', () => {
     it('should query documents by reported_date range', async () => {
       const tenSecondsAgo = Date.now() - 15000;
       const result = await utils.pgQuery(
-        `SELECT doc FROM couchdb
+        `SELECT doc FROM ${utils.pgDocsTable()}
          WHERE doc->>'type' = 'person'
          AND (doc->>'reported_date')::bigint >= $1
-         AND doc->>'_id' IN ($2, $3)
+         AND _id IN ($2, $3)
          ORDER BY (doc->>'reported_date')::bigint ASC`,
         [tenSecondsAgo, patient1._id, patient2._id]
       );
@@ -184,10 +184,10 @@ describe('cht-datasource PostgreSQL adapter', () => {
     it('should support date-filtered queries for recent documents', async () => {
       const fiveSecondsAgo = Date.now() - 5000;
       const result = await utils.pgQuery(
-        `SELECT doc FROM couchdb
+        `SELECT doc FROM ${utils.pgDocsTable()}
          WHERE doc->>'type' = 'person'
          AND (doc->>'reported_date')::bigint >= $1
-         AND doc->>'_id' IN ($2, $3)`,
+         AND _id IN ($2, $3)`,
         [fiveSecondsAgo, patient1._id, patient2._id]
       );
       // patient2 has the more recent reported_date
@@ -209,13 +209,14 @@ describe('cht-datasource PostgreSQL adapter', () => {
       await utils.saveDoc(doc);
 
       // Wait for the update to propagate to PostgreSQL
+      // cht-sync UPSERTs on _id, so saved_timestamp updates in-place
       const maxWait = 45000;
       const start = Date.now();
       let found = false;
       while (Date.now() - start < maxWait) {
         const result = await utils.pgQuery(
-          `SELECT doc, saved_timestamp FROM couchdb
-           WHERE doc_id = $1 AND saved_timestamp > $2`,
+          `SELECT doc, saved_timestamp FROM ${utils.pgDocsTable()}
+           WHERE _id = $1 AND saved_timestamp > $2`,
           [patient1._id, beforeUpdate]
         );
         if (result.rows.length > 0 && result.rows[0].doc.name === 'pg-test-patient-1-updated') {
@@ -227,15 +228,28 @@ describe('cht-datasource PostgreSQL adapter', () => {
       expect(found).to.be.true;
     });
 
-    it('should track sequence numbers for change detection', async function () {
+    it('should track sync progress in couchdb_progress table', async function () {
       this.timeout(30000);
-      // The couchdb table tracks seq for each document
-      const result = await utils.pgQuery(
-        'SELECT seq FROM couchdb WHERE doc_id = $1 LIMIT 1',
-        [patient1._id]
-      );
-      expect(result.rows).to.have.length(1);
-      expect(result.rows[0].seq).to.exist;
+      // cht-sync tracks seq per source in a separate progress table, NOT per document
+      const progress = await utils.getPostgresProgress();
+      expect(progress).to.be.an('array').that.is.not.empty;
+      // Each source should have a seq and updated_at
+      const entry = progress[0];
+      expect(entry.source).to.exist;
+      expect(entry.seq).to.exist;
+      expect(entry.updated_at).to.exist;
+    });
+
+    it('should have correct raw row metadata', async function () {
+      this.timeout(60000);
+      const row = await utils.getPostgresRawRow(patient1._id);
+      expect(row).to.exist;
+      expect(row._id).to.equal(patient1._id);
+      expect(row.saved_timestamp).to.exist;
+      expect(row._deleted).to.satisfy(v => v === false || v === null);
+      expect(row.source).to.be.a('string');
+      expect(row.doc).to.be.an('object');
+      expect(row.doc._id).to.equal(patient1._id);
     });
   });
 });
