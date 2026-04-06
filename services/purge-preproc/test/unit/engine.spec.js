@@ -154,6 +154,8 @@ describe('Purge Engine', () => {
 
     beforeEach(() => {
       queryStub = sinon.stub(db, 'query');
+      // Default: return empty rows for any unmatched query (task/target auto-purge)
+      queryStub.resolves({ rows: [] });
     });
 
     it('should skip when no purge function configured', async () => {
@@ -311,6 +313,74 @@ describe('Purge Engine', () => {
       const stats = purgeStatus.completeRunLog.args[0][1];
       expect(stats.skippedContacts).to.include('big_contact');
       expect(stats.contactsProcessed).to.equal(0);
+    });
+  });
+
+  describe('purgeExpiredTasks', () => {
+    it('should purge tasks in terminal state older than 60 days', async () => {
+      const queryStub = sinon.stub(db, 'query');
+      const oldDate = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+
+      queryStub.resolves({
+        rows: [
+          { doc_id: 'task1', doc: { _id: 'task1', type: 'task', state: 'Completed' } },
+          { doc_id: 'task2', doc: { _id: 'task2', type: 'task', state: 'Failed' } },
+        ],
+      });
+
+      sinon.stub(purgeStatus, 'writePurgeResults').resolves();
+      sinon.stub(console, 'log');
+
+      const rolesByHash = { hash_a: ['chw'], hash_b: ['chw_supervisor'] };
+      const stats = { docsEvaluated: 0, docsPurged: 0, docsUnpurged: 0 };
+
+      await engine._purgeExpiredTasks(rolesByHash, stats);
+
+      expect(purgeStatus.writePurgeResults.calledOnce).to.be.true;
+      const result = purgeStatus.writePurgeResults.args[0][0];
+      // Both tasks purged for both roles
+      expect(result.hash_a.task1).to.be.true;
+      expect(result.hash_a.task2).to.be.true;
+      expect(result.hash_b.task1).to.be.true;
+      expect(result.hash_b.task2).to.be.true;
+      expect(stats.docsEvaluated).to.equal(2);
+    });
+
+    it('should skip when no expired tasks', async () => {
+      sinon.stub(db, 'query').resolves({ rows: [] });
+      sinon.stub(purgeStatus, 'writePurgeResults').resolves();
+
+      const stats = { docsEvaluated: 0, docsPurged: 0, docsUnpurged: 0 };
+      await engine._purgeExpiredTasks({ hash_a: ['chw'] }, stats);
+
+      expect(purgeStatus.writePurgeResults.callCount).to.equal(0);
+    });
+  });
+
+  describe('purgeExpiredTargets', () => {
+    it('should purge target documents older than 6 months', async () => {
+      const queryStub = sinon.stub(db, 'query');
+
+      queryStub.resolves({
+        rows: [
+          { doc_id: 'target~2024-01~owner1~12345' },
+          { doc_id: 'target~2024-03~owner2~67890' },
+        ],
+      });
+
+      sinon.stub(purgeStatus, 'writePurgeResults').resolves();
+      sinon.stub(console, 'log');
+
+      const rolesByHash = { hash_a: ['chw'] };
+      const stats = { docsEvaluated: 0, docsPurged: 0, docsUnpurged: 0 };
+
+      await engine._purgeExpiredTargets(rolesByHash, stats);
+
+      expect(purgeStatus.writePurgeResults.calledOnce).to.be.true;
+      const result = purgeStatus.writePurgeResults.args[0][0];
+      expect(result.hash_a['target~2024-01~owner1~12345']).to.be.true;
+      expect(result.hash_a['target~2024-03~owner2~67890']).to.be.true;
+      expect(stats.docsEvaluated).to.equal(2);
     });
   });
 

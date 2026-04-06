@@ -7,11 +7,15 @@ const rolesService = require('./roles');
 
 const CONTACT_BATCH_SIZE = parseInt(process.env.PURGE_CONTACT_BATCH_SIZE || '500', 10);
 const MAX_RECORDS_PER_CONTACT = parseInt(process.env.PURGE_MAX_RECORDS || '20000', 10);
+const TASK_EXPIRATION_DAYS = 60;
+const TARGET_EXPIRATION_MONTHS = 6;
 
 // Parse the purge function from app_settings config stored in PostgreSQL.
+// Settings doc structure: { _id: 'settings', settings: { purge: { fn: '...' } } }
+// Sentinel loads doc.settings into config, then config.get('purge') returns doc.settings.purge.
 const getPurgeFn = async (db) => {
   const result = await db.query(`
-    SELECT doc->'purge'->>'fn' AS fn
+    SELECT doc->'settings'->'purge'->>'fn' AS fn
     FROM couchdb
     WHERE doc_id = 'settings'
       AND doc->>'_id' = 'settings'
@@ -132,6 +136,78 @@ const processUnallocatedRecords = async (purgeFn, rolesByHash, stats) => {
   }
 };
 
+// Auto-purge tasks in terminal state older than TASK_EXPIRATION_DAYS.
+// This mirrors sentinel/src/lib/purging.js purgeTasks() — automatic, not controlled by purge.js.
+// Terminal states: Cancelled, Completed, Failed. Key field: emission.endDate.
+const purgeExpiredTasks = async (rolesByHash, stats) => {
+  const db = require('./db');
+  const cutoffDate = new Date(Date.now() - TASK_EXPIRATION_DAYS * 24 * 60 * 60 * 1000)
+    .toISOString().slice(0, 10); // YYYY-MM-DD format
+
+  const result = await db.query(`
+    SELECT doc_id, doc
+    FROM couchdb
+    WHERE doc->>'type' = 'task'
+      AND doc->>'_deleted' IS DISTINCT FROM 'true'
+      AND doc->>'state' IN ('Cancelled', 'Completed', 'Failed')
+      AND doc->'emission'->>'endDate' IS NOT NULL
+      AND doc->'emission'->>'endDate' <= $1
+  `, [cutoffDate]);
+
+  if (!result.rows.length) {
+    return;
+  }
+
+  const toPurge = {};
+  for (const hash of Object.keys(rolesByHash)) {
+    toPurge[hash] = {};
+    for (const row of result.rows) {
+      toPurge[hash][row.doc_id] = true;
+    }
+  }
+
+  await purgeStatus.writePurgeResults(toPurge);
+  stats.docsEvaluated += result.rows.length;
+  stats.docsPurged += result.rows.length * Object.keys(rolesByHash).length;
+  console.log(`Auto-purged ${result.rows.length} expired tasks`);
+};
+
+// Auto-purge target documents with reporting period older than TARGET_EXPIRATION_MONTHS.
+// This mirrors sentinel/src/lib/purging.js purgeTargets(). Target IDs follow the pattern:
+// target~YYYY-MM~<owner>~<other>. Targets older than 6 months are purged for all roles.
+const purgeExpiredTargets = async (rolesByHash, stats) => {
+  const db = require('./db');
+  const cutoffPeriod = new Date(
+    Date.now() - TARGET_EXPIRATION_MONTHS * 30 * 24 * 60 * 60 * 1000
+  );
+  const cutoffTag = `${cutoffPeriod.getFullYear()}-${String(cutoffPeriod.getMonth() + 1).padStart(2, '0')}`;
+
+  const result = await db.query(`
+    SELECT doc_id
+    FROM couchdb
+    WHERE doc_id LIKE 'target~%'
+      AND doc->>'_deleted' IS DISTINCT FROM 'true'
+      AND doc_id < $1
+  `, [`target~${cutoffTag}~`]);
+
+  if (!result.rows.length) {
+    return;
+  }
+
+  const toPurge = {};
+  for (const hash of Object.keys(rolesByHash)) {
+    toPurge[hash] = {};
+    for (const row of result.rows) {
+      toPurge[hash][row.doc_id] = true;
+    }
+  }
+
+  await purgeStatus.writePurgeResults(toPurge);
+  stats.docsEvaluated += result.rows.length;
+  stats.docsPurged += result.rows.length * Object.keys(rolesByHash).length;
+  console.log(`Auto-purged ${result.rows.length} expired targets`);
+};
+
 // Full purge evaluation run.
 const run = async (options = {}) => {
   const db = require('./db');
@@ -206,6 +282,10 @@ const run = async (options = {}) => {
     // Process unallocated records
     await processUnallocatedRecords(purgeFn, rolesByHash, stats);
 
+    // Auto-purge expired tasks and targets (not controlled by purge.js)
+    await purgeExpiredTasks(rolesByHash, stats);
+    await purgeExpiredTargets(rolesByHash, stats);
+
     await purgeStatus.completeRunLog(runId, stats);
     console.log(`Purge run completed: ${stats.contactsProcessed} contacts, ` +
       `${stats.docsEvaluated} docs evaluated, ${stats.docsPurged} purged, ` +
@@ -255,4 +335,6 @@ module.exports = {
   _buildGroupForContact: buildGroupForContact,
   _evaluateGroup: evaluateGroup,
   _processUnallocatedRecords: processUnallocatedRecords,
+  _purgeExpiredTasks: purgeExpiredTasks,
+  _purgeExpiredTargets: purgeExpiredTargets,
 };

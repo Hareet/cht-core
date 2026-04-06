@@ -49,6 +49,28 @@ describe('Roles', () => {
       const result = await rolesService.getRoles();
       expect(Object.keys(result)).to.have.length(1);
     });
+
+    it('should skip online-only role sets (mm-online)', async () => {
+      sinon.stub(db, 'query').resolves({
+        rows: [
+          { roles: ['chw'] },
+          { roles: ['mm-online', 'national_admin'] },
+          { roles: ['_admin'] },
+          { roles: ['admin', 'gateway'] },
+          { roles: ['chw_supervisor'] },
+        ],
+      });
+
+      const result = await rolesService.getRoles();
+      // Only chw and chw_supervisor should remain; mm-online, _admin, admin are filtered
+      expect(Object.keys(result)).to.have.length(2);
+      const allRoles = Object.values(result).flat();
+      expect(allRoles).to.include('chw');
+      expect(allRoles).to.include('chw_supervisor');
+      expect(allRoles).to.not.include('mm-online');
+      expect(allRoles).to.not.include('_admin');
+      expect(allRoles).to.not.include('admin');
+    });
   });
 
   describe('saveRoles', () => {

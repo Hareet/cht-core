@@ -3,9 +3,19 @@
 const db = require('./db');
 const purgingUtils = require('@medic/purging-utils');
 
+// The 'mm-online' role (and '_admin' / 'admin') marks a user as online-only.
+// Online users access all documents directly and don't need purging.
+// This mirrors shared-libs/user-management/src/roles.js: hasOnlineRole() and isOffline().
+const ONLINE_ROLE = 'mm-online';
+const ADMIN_ROLES = ['_admin', 'admin'];
+
+const hasOnlineRole = (roles) => {
+  return roles.some(role => role === ONLINE_ROLE || ADMIN_ROLES.includes(role));
+};
+
 // Retrieve unique offline role sets from the cht-sync couchdb table.
-// User docs are stored in CouchDB as org.couchdb.user:<name> and replicated
-// to PostgreSQL via cht-sync. We extract distinct role arrays and hash them.
+// User-settings docs (type: 'user-settings') contain roles arrays.
+// We filter out online-only users since purging only applies to offline users.
 const getRoles = async () => {
   const result = await db.query(`
     SELECT DISTINCT doc->'roles' AS roles
@@ -20,6 +30,11 @@ const getRoles = async () => {
   for (const row of result.rows) {
     const roles = row.roles;
     if (!Array.isArray(roles) || !roles.length) {
+      continue;
+    }
+
+    // Skip online-only users — they access all docs and don't need purging
+    if (hasOnlineRole(roles)) {
       continue;
     }
 

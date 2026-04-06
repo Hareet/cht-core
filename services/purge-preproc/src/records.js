@@ -10,13 +10,17 @@ const getSubjectIds = (contact) => {
 
 // Fetch all reports and messages for a set of subject IDs from the couchdb table.
 // Reports are data_records with a form field; messages are data_records without.
+//
+// Subject matching mirrors the getSubject() function in the docs_by_replication_key Nouveau index:
+//   For reports: patient_id → place_id → patient_uuid (fields or top-level) → contact._id
+//   For SMS incoming: contact._id
+//   For SMS outgoing: tasks[0].messages[0].contact._id
+// We also match contact._id to catch reports with error fallbacks and incoming SMS.
 const getRecordsForSubjects = async (subjectIds) => {
   if (!subjectIds.length) {
     return { reports: [], messages: [] };
   }
 
-  // Build a query that finds data_records whose subject matches any of the given IDs.
-  // Subject can be in: patient_id, place_id, patient_uuid, place_uuid (top-level or in fields).
   const result = await db.query(`
     SELECT doc_id, doc
     FROM couchdb
@@ -31,6 +35,7 @@ const getRecordsForSubjects = async (subjectIds) => {
         OR doc->'fields'->>'place_id' = ANY($1)
         OR doc->'fields'->>'patient_uuid' = ANY($1)
         OR doc->'fields'->>'place_uuid' = ANY($1)
+        OR doc->'contact'->>'_id' = ANY($1)
       )
   `, [subjectIds]);
 
@@ -49,8 +54,11 @@ const getRecordsForSubjects = async (subjectIds) => {
   return { reports, messages };
 };
 
-// Fetch unallocated records (data_records that don't belong to any contact).
-// These are records where no subject ID fields are set.
+// Fetch unallocated records (data_records that map to _unassigned in replication key).
+// A record is "unassigned" when getSubject() in the Nouveau index returns falsy.
+// getSubject() checks: patient_id, place_id, patient_uuid (top-level & fields),
+// contact._id (for error fallback reports and SMS messages).
+// A record with contact._id IS assigned (to the contact), so we exclude those too.
 const getUnallocatedRecords = async (limit, offset) => {
   const result = await db.query(`
     SELECT doc_id, doc
@@ -65,6 +73,7 @@ const getUnallocatedRecords = async (limit, offset) => {
       AND COALESCE(doc->'fields'->>'place_id', '') = ''
       AND COALESCE(doc->'fields'->>'patient_uuid', '') = ''
       AND COALESCE(doc->'fields'->>'place_uuid', '') = ''
+      AND COALESCE(doc->'contact'->>'_id', '') = ''
     ORDER BY doc_id
     LIMIT $1 OFFSET $2
   `, [limit, offset]);
@@ -88,7 +97,8 @@ const getContactIdsWithChangedRecords = async (since) => {
         NULLIF(doc->'fields'->>'patient_id', ''),
         NULLIF(doc->'fields'->>'place_id', ''),
         NULLIF(doc->'fields'->>'patient_uuid', ''),
-        NULLIF(doc->'fields'->>'place_uuid', '')
+        NULLIF(doc->'fields'->>'place_uuid', ''),
+        NULLIF(doc->'contact'->>'_id', '')
       ) AS subject_id
     FROM couchdb
     WHERE doc->>'type' = 'data_record'
@@ -104,13 +114,15 @@ const getContactIdsWithChangedRecords = async (since) => {
     return [];
   }
 
-  // Find contacts that have these subject IDs
+  // Find contacts that have these subject IDs.
+  // Match by doc_id (contact._id), patient_id, or place_id — the fields in
+  // registrationUtils CONTACT_SUBJECT_PROPERTIES: ['_id', 'patient_id', 'place_id'].
   const contactResult = await db.query(`
     SELECT doc_id
     FROM couchdb
     WHERE (
       doc->>'type' IN ('district_hospital', 'health_center', 'clinic', 'person')
-      OR doc->>'contact_type' IS NOT NULL
+      OR (doc->>'type' = 'contact' AND doc->>'contact_type' IS NOT NULL)
     )
     AND doc->>'_deleted' IS DISTINCT FROM 'true'
     AND (

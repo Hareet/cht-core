@@ -169,9 +169,74 @@ The current system groups documents as follows:
 | `api/src/services/replication.js` | Replication service that consumes purge decisions |
 | `api/src/services/purged-docs-cache.js` | In-memory cache for purge lookups |
 
+## Deep Verification Findings (MCP + Codebase Audit)
+
+### Edge Cases Identified and Handled
+
+1. **needs_signoff reports**: Reports with `fields.needs_signoff = true` emit in the
+   Nouveau index for every contact in the submitter's parent lineage. The original
+   `isRelevantRecordEmission` filter prevents double-processing. In our PostgreSQL
+   implementation, we match reports to contacts by subject IDs (patient_id, place_id, etc.),
+   which naturally avoids the lineage emission problem — we never have the duplicate
+   emissions that the Nouveau index creates.
+
+2. **Configurable contact types**: The `contacts_by_type` view handles both legacy types
+   (`district_hospital`, `health_center`, `clinic`, `person` via `doc.type`) AND
+   configurable types (`doc.type = 'contact'` with `doc.contact_type` set). Our queries
+   use: `doc->>'type' IN (legacy list) OR (doc->>'type' = 'contact' AND doc->>'contact_type'
+   IS NOT NULL)`.
+
+3. **getSubject() fallback chain**: The Nouveau index `getSubject()` checks:
+   patient_id → place_id → patient_uuid → contact._id (for error fallbacks and SMS).
+   Our record matching now includes `doc->'contact'->>'_id'` in both the subject-matching
+   query and the unallocated-records exclusion.
+
+4. **Task auto-purging**: Tasks in terminal state (Cancelled, Completed, Failed) with
+   `emission.endDate` > 60 days are purged for ALL role hashes. Not controlled by purge.js.
+   View definition: `ddocs/medic-db/medic/views/tasks_in_terminal_state/map.js`.
+
+5. **Target auto-purging**: Targets with ID pattern `target~YYYY-MM~...` where the
+   reporting period is > 6 months old are purged for ALL role hashes. Not via purge.js.
+
+6. **Online role filtering**: Only offline role sets need purging. Users with `mm-online`,
+   `_admin`, or `admin` roles are online-only and skipped. The original uses
+   `roles.isOffline()` from `shared-libs/user-management/src/roles.js`.
+
+7. **Settings document structure**: The settings doc (`_id: 'settings'`) stores config
+   under `doc.settings.purge.fn`, NOT `doc.purge.fn`. Sentinel loads `doc.settings`
+   into `config`, then `config.get('purge')` returns `doc.settings.purge`.
+
+8. **Multiple facility_id**: Users with `can_have_multiple_places` permission can have
+   array facility_id. This does NOT affect purging — same roles = same purge decisions
+   regardless of facility. Facility filtering is handled at the authorization/replication
+   layer, not the purge layer.
+
+9. **Deleted contacts**: The original system passes `{ _deleted: true }` as the contact
+   parameter to purgeFn for deleted contacts. Our system filters out deleted contacts
+   from batch processing, matching the original behavior where deleted contacts are
+   excluded from the `contacts_by_type` view.
+
+10. **Cache invalidation**: When sentinel writes a `purgelog:` doc, the API layer wipes
+    the entire purged-docs cache. In the PostgreSQL world, PowerSync Sync Streams read
+    `purge_status` directly via SQL JOIN — no cache to invalidate.
+
+### Source Files Additionally Analyzed
+
+| File | Purpose |
+|------|---------|
+| `ddocs/medic-db/medic/nouveau/docs_by_replication_key/index.js` | Nouveau index: getSubject(), needs_signoff lineage, _unassigned key |
+| `ddocs/medic-db/medic-client/views/contacts_by_type/map.js` | Contact type view: legacy + configurable types |
+| `ddocs/medic-db/medic/views/tasks_in_terminal_state/map.js` | Task terminal state detection |
+| `shared-libs/user-management/src/roles.js` | isOffline/hasOnlineRole logic |
+| `sentinel/src/config.js` | Settings loading: `doc.settings` → config |
+| `shared-libs/constants/src/index.js` | DOC_IDS.SETTINGS = 'settings' |
+
 ## Verified Against
 
 - CHT official documentation (via Kapa AI MCP): Confirmed purge.js contract, 6 parameters,
   return type, task/target auto-purge rules, schedule configuration
 - `sentinel/tests/unit/lib/purging.spec.js`: Confirmed invocation pattern with test
   assertions showing exact argument shapes passed to purgeFn
+- OpenDeepWiki MCP (cht-core-wiki): Replication architecture, authorization model,
+  database schema, scheduled tasks
+- Codebase audit: All ddocs views, Nouveau index, roles system, settings service
