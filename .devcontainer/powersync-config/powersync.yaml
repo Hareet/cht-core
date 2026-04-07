@@ -1,0 +1,52 @@
+# CHT PowerSync Service Configuration (Self-Hosted)
+# See: https://docs.powersync.com/configuration/powersync-service/self-hosted-instances
+
+# Source database: PostgreSQL with CHT data via cht-sync
+replication:
+  connections:
+    - type: postgresql
+      uri: !env PS_DATABASE_URI
+      sslmode: disable  # Local Docker network only
+      # Publication created by setup.sql
+      # Includes: v1.couchdb, v1.user_settings,
+      #           v1.user_accessible_facilities, v1.purge_status
+
+# Bucket storage: use the same PostgreSQL instance (separate schema)
+# PowerSync auto-creates the 'powersync' schema on first start.
+storage:
+  type: postgresql
+  uri: !env PS_DATABASE_URI
+  sslmode: disable
+
+# API port (matches docker-compose.powersync.yml port mapping)
+port: 8080
+
+# Sync Streams configuration (separate file for maintainability)
+sync_config:
+  path: sync-config.yaml
+
+# Client authentication via JWT
+# For development: static JWKS with a test RSA key pair.
+# For production: replace with JWKS URI from your auth service.
+client_auth:
+  jwks:
+    keys:
+      - kty: RSA
+        n: "xbn-lbZyne3nDbuSUTiImlTT2YbPEl9I81JZw5di-aPsmpHBQYeZDkHGa96i0f-w3ASFynj6UdIFILXU-hcC3NpV-owv1243rUG48xORdXykW_46UXTE7JGpzi-f_RJjZ-frqRR5-fTJteYUAQ96ETwq4uRmLuzrRWbXE9DpTtAkZjZqWBMIbdSGQ6MDc3CGazEkTVqLaBXS9SvpkT7sEq0F0Rllwha5xvvj9UVx0AoXqf2ij71y4LOKVFfjsNVIiDGUm1JXSdcJG32ArcX4S5dJ28mFiBC_IvKafeBFTWqUCukK6DM75RM3v6fy1cZ6dk6gQ_s1nqiA0YhbYhywhQ"
+        e: AQAB
+        alg: RS256
+        kid: cht-dev-key-1
+        use: sig
+  # Audience claim must match what the token generator produces
+  audience:
+    - cht-powersync-dev
+
+# Telemetry (opt out for local development)
+telemetry:
+  disable_telemetry_sharing: true
+
+# Logging
+system:
+  logging:
+    level: info
+    format: text

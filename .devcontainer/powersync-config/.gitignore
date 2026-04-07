@@ -1,0 +1,6 @@
+# Private keys should NOT be committed
+dev-private-key.pem
+*.pem
+
+# Generated tokens
+*.jwt
