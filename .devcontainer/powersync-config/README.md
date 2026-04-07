@@ -149,11 +149,7 @@ as a column. This preserves backward compatibility with code expecting the full 
 
 ## Known Limitations (PoC scope)
 
-1. **`replicate_primary_contacts`** (v4.18+): Not yet implemented in Sync Streams.
-   Requires pre-computing primary contacts of places at max depth and adding them to
-   `user_accessible_facilities`. Deferred to Phase 2.
-
-2. **Full purge.js logic**: Turing-complete JS cannot be expressed in SQL.
+1. **Full purge.js logic**: Turing-complete JS cannot be expressed in SQL.
    Requires Agent 4's purge preprocessing service to populate `purge_status` table.
 
 3. **Sensitivity check simplified**: CHT's full `isSensitive()` checks subject/submitter
@@ -164,3 +160,15 @@ as a column. This preserves backward compatibility with code expecting the full 
 
 5. **`_design/medic-client`**: Client design document not included (not applicable to
    PowerSync architecture — client code bundles handle this).
+
+## Implemented Features
+
+### `replicate_primary_contacts` (v4.18+)
+Implemented in `refresh_user_facilities()` via 4 steps:
+1. **Descendants**: Walk DOWN from user's facility through replication_depth
+2. **Ancestors**: Walk UP from user's facility through parent chain (HC, county, etc.)
+3. **Primary contacts**: For every accessible place, add its `doc.contact._id` person
+4. **User's own contact**: Always include `user_settings.contact_id`
+
+Primary contacts inherit the depth of their parent place (for `report_depth` filtering),
+matching CHT's `addPrimaryContactsSubjects()` behavior in `authorization.js`.

@@ -87,17 +87,24 @@ CREATE MATERIALIZED VIEW IF NOT EXISTS v1.unpurged_contacts AS
 -- 5. Function: Refresh accessible facilities for one user
 -- Uses recursive CTE to walk the contact hierarchy downward
 -- from the user's facility_id to replication_depth levels.
+-- Then adds:
+--   a) Ancestors: places UP from the user's facility (parent chain)
+--   b) Primary contacts: the contact person of every accessible place
+--   c) User's own contact_id from user_settings
+-- This implements CHT's replicate_primary_contacts behavior
+-- (see api/src/services/authorization.js addPrimaryContactsSubjects).
 -- ============================================================
 CREATE OR REPLACE FUNCTION v1.refresh_user_facilities(p_user_id TEXT)
 RETURNS void
 LANGUAGE plpgsql AS $$
 DECLARE
   v_facility_id TEXT;
+  v_contact_id TEXT;
   v_depth INT;
 BEGIN
-  -- Get user's facility and depth config
-  SELECT facility_id, replication_depth
-  INTO v_facility_id, v_depth
+  -- Get user's facility, contact, and depth config
+  SELECT facility_id, contact_id, replication_depth
+  INTO v_facility_id, v_contact_id, v_depth
   FROM v1.user_settings
   WHERE user_id = p_user_id;
 
@@ -113,9 +120,8 @@ BEGIN
     v_depth := 100; -- effectively unlimited
   END IF;
 
-  -- Walk hierarchy downward from user's facility
+  -- Step 1: Walk hierarchy DOWNWARD from user's facility (descendants)
   -- CHT parent field points UP (child.parent._id = parent._id)
-  -- So to find descendants, we find docs whose parent chain includes our facility
   INSERT INTO v1.user_accessible_facilities (user_id, facility_id, depth)
   WITH RECURSIVE descendants AS (
     -- Start: the user's assigned facility
@@ -128,9 +134,7 @@ BEGIN
     SELECT c._id, d.depth + 1
     FROM v1.couchdb c
     JOIN descendants d ON (
-      -- parent is an object with _id
       c.doc -> 'parent' ->> '_id' = d._id
-      -- OR parent is a plain string
       OR (jsonb_typeof(c.doc -> 'parent') = 'string' AND c.doc ->> 'parent' = d._id)
     )
     WHERE d.depth < v_depth
@@ -138,6 +142,69 @@ BEGIN
       AND c.doc ->> 'type' IN ('contact', 'person', 'clinic', 'health_center', 'district_hospital')
   )
   SELECT p_user_id, _id, depth FROM descendants;
+
+  -- Step 2: Walk hierarchy UPWARD from user's facility (ancestors)
+  -- Adds parent places so user can see their HC, county, etc.
+  -- Ancestors get depth 0 (same as facility) since they're structural.
+  INSERT INTO v1.user_accessible_facilities (user_id, facility_id, depth)
+  WITH RECURSIVE ancestors AS (
+    -- Start: parent of user's facility
+    SELECT
+      CASE
+        WHEN jsonb_typeof(c.doc -> 'parent') = 'object' THEN c.doc -> 'parent' ->> '_id'
+        WHEN jsonb_typeof(c.doc -> 'parent') = 'string' THEN c.doc ->> 'parent'
+      END AS _id
+    FROM v1.couchdb c
+    WHERE c._id = v_facility_id
+      AND NOT COALESCE(c._deleted, false)
+
+    UNION ALL
+
+    -- Walk up: each ancestor's parent
+    SELECT
+      CASE
+        WHEN jsonb_typeof(c.doc -> 'parent') = 'object' THEN c.doc -> 'parent' ->> '_id'
+        WHEN jsonb_typeof(c.doc -> 'parent') = 'string' THEN c.doc ->> 'parent'
+      END
+    FROM v1.couchdb c
+    JOIN ancestors a ON c._id = a._id
+    WHERE a._id IS NOT NULL
+      AND NOT COALESCE(c._deleted, false)
+  )
+  SELECT p_user_id, _id, 0
+  FROM ancestors
+  WHERE _id IS NOT NULL
+  ON CONFLICT (user_id, facility_id) DO NOTHING;
+
+  -- Step 3: Add primary contacts of all accessible places
+  -- Each place's doc.contact._id is its primary contact person.
+  -- CHT's addPrimaryContactsSubjects adds these to subjectIds.
+  -- The primary contact inherits the depth of its parent place.
+  INSERT INTO v1.user_accessible_facilities (user_id, facility_id, depth)
+  SELECT DISTINCT p_user_id,
+    CASE
+      WHEN jsonb_typeof(c.doc -> 'contact') = 'object' THEN c.doc -> 'contact' ->> '_id'
+      WHEN jsonb_typeof(c.doc -> 'contact') = 'string' THEN c.doc ->> 'contact'
+    END,
+    uaf.depth  -- inherit depth from the place (for report_depth filtering)
+  FROM v1.couchdb c
+  JOIN v1.user_accessible_facilities uaf ON c._id = uaf.facility_id AND uaf.user_id = p_user_id
+  WHERE c.doc -> 'contact' IS NOT NULL
+    AND NOT COALESCE(c._deleted, false)
+    AND c.doc ->> 'type' IN ('contact', 'clinic', 'health_center', 'district_hospital')
+    AND CASE
+      WHEN jsonb_typeof(c.doc -> 'contact') = 'object' THEN c.doc -> 'contact' ->> '_id'
+      WHEN jsonb_typeof(c.doc -> 'contact') = 'string' THEN c.doc ->> 'contact'
+    END IS NOT NULL
+  ON CONFLICT (user_id, facility_id) DO NOTHING;
+
+  -- Step 4: Always include the user's own contact person
+  -- (from user_settings.contact_id)
+  IF v_contact_id IS NOT NULL THEN
+    INSERT INTO v1.user_accessible_facilities (user_id, facility_id, depth)
+    VALUES (p_user_id, v_contact_id, 0)
+    ON CONFLICT (user_id, facility_id) DO NOTHING;
+  END IF;
 END;
 $$;
 
