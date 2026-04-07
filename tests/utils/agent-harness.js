@@ -40,7 +40,15 @@ const pgDocsTable = () => `"${PG_SCHEMA}"."${PG_TABLE}"`;
 const pgProgressTable = () => `"${PG_SCHEMA}"."${PG_PROGRESS_TABLE}"`;
 
 const getPostgresUrl = () => {
-  return process.env.POSTGRES_URL || 'postgresql://postgres:postgres@localhost:5432/cht_sync';
+  if (process.env.POSTGRES_URL) {
+    return process.env.POSTGRES_URL;
+  }
+  const pgPass = process.env.POSTGRES_PASSWORD || 'pgpass';
+  const pgUser = process.env.POSTGRES_USER || 'cht';
+  const pgHost = process.env.POSTGRES_HOST || 'postgres';
+  const pgPort = process.env.POSTGRES_PORT || '5432';
+  const pgDb = process.env.POSTGRES_DB || 'cht';
+  return `postgresql://${pgUser}:${pgPass}@${pgHost}:${pgPort}/${pgDb}`;
 };
 
 const getPowersyncUrl = () => {

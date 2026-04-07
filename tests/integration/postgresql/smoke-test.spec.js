@@ -98,7 +98,11 @@ describe('Agent harness smoke test', () => {
     before(function () {
       try {
         const { Pool } = require('pg');
-        const pgUrl = process.env.POSTGRES_URL || 'postgresql://postgres:postgres@postgres:5432/cht_sync';
+        const pgPass = process.env.POSTGRES_PASSWORD || 'pgpass';
+        const pgUser = process.env.POSTGRES_USER || 'cht';
+        const pgHost = process.env.POSTGRES_HOST || 'postgres';
+        const pgDb = process.env.POSTGRES_DB || 'cht';
+        const pgUrl = process.env.POSTGRES_URL || `postgresql://${pgUser}:${pgPass}@${pgHost}:5432/${pgDb}`;
         pgPool = new Pool({ connectionString: pgUrl, connectionTimeoutMillis: 5000 });
       } catch (e) {
         console.log('  pg module not available, skipping PostgreSQL tests');
