@@ -19,7 +19,9 @@ CREATE TABLE IF NOT EXISTS v1.user_settings (
   contact_id  TEXT,                -- user's associated contact person doc
   roles       TEXT[] DEFAULT '{}', -- CHT role names (e.g., chw, chw_supervisor)
   role_hash   TEXT,                -- MD5 of sorted roles, used for purge grouping
-  replication_depth INT DEFAULT -1 -- -1 = unlimited depth
+  replication_depth INT DEFAULT -1, -- contact depth: -1 = unlimited
+  report_depth      INT DEFAULT -1, -- report depth: -1 = no restriction (added in CHT 3.10)
+  replicate_primary_contacts BOOLEAN DEFAULT false -- v4.18+: sync primary contacts beyond depth
 );
 
 CREATE INDEX IF NOT EXISTS idx_user_settings_facility
@@ -69,7 +71,7 @@ CREATE INDEX IF NOT EXISTS idx_purge_status_role
 CREATE MATERIALIZED VIEW IF NOT EXISTS v1.unpurged_contacts AS
   SELECT c._id AS doc_id, 'all' AS role_hash
   FROM v1.couchdb c
-  WHERE c.doc ->> 'type' IN ('person', 'clinic', 'health_center', 'district_hospital')
+  WHERE c.doc ->> 'type' IN ('contact', 'person', 'clinic', 'health_center', 'district_hospital')
     AND NOT COALESCE(c._deleted, false)
   EXCEPT
   SELECT ps.doc_id, ps.role_hash
@@ -133,7 +135,7 @@ BEGIN
     )
     WHERE d.depth < v_depth
       AND NOT COALESCE(c._deleted, false)
-      AND c.doc ->> 'type' IN ('person', 'clinic', 'health_center', 'district_hospital')
+      AND c.doc ->> 'type' IN ('contact', 'person', 'clinic', 'health_center', 'district_hospital')
   )
   SELECT p_user_id, _id, depth FROM descendants;
 END;
@@ -171,25 +173,28 @@ CREATE PUBLICATION powersync_pub FOR TABLE
 -- 8. Seed test data: user_settings for development
 -- Maps to the test hierarchy in the couchdb table.
 -- ============================================================
-INSERT INTO v1.user_settings (user_id, username, facility_id, contact_id, roles, role_hash, replication_depth)
+INSERT INTO v1.user_settings (user_id, username, facility_id, contact_id, roles, role_hash,
+                              replication_depth, report_depth, replicate_primary_contacts)
 VALUES
-  -- CHW assigned to Kibera Clinic A, depth 1 (sees clinic + direct patients)
+  -- CHW assigned to Kibera Clinic A
+  -- contact depth 1 (sees clinic + direct patients), report_depth 1
   ('org.couchdb.user:chw_user', 'chw_user',
    '3ec4f112db4527a356e1aa8593002eb1', -- Kibera Clinic A
    '3ec4f112db4527a356e1aa8593002fc0', -- Bob (the CHW)
-   ARRAY['chw'], md5('chw'), 1),
+   ARRAY['chw'], md5('chw'), 1, 1, false),
 
-  -- Supervisor at Kibera Health Center, depth 2 (sees HC + clinics + patients)
+  -- Supervisor at Kibera Health Center
+  -- contact depth 2, report_depth 1, replicate_primary_contacts enabled
   ('org.couchdb.user:supervisor_user', 'supervisor_user',
    '3ec4f112db4527a356e1aa8593001f1e', -- Kibera Health Center
    NULL,
-   ARRAY['chw_supervisor'], md5('chw_supervisor'), 2),
+   ARRAY['chw_supervisor'], md5('chw_supervisor'), 2, 1, true),
 
   -- County admin at Nairobi County, unlimited depth
   ('org.couchdb.user:county_admin', 'county_admin',
    '3ec4f112db4527a356e1aa8593001299', -- Nairobi County
    NULL,
-   ARRAY['national_admin'], md5('national_admin'), -1)
+   ARRAY['national_admin'], md5('national_admin'), -1, -1, false)
 ON CONFLICT (user_id) DO NOTHING;
 
 -- Compute accessible facilities for seed users

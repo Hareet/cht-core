@@ -27,16 +27,19 @@ const USERS = {
     user_id: 'org.couchdb.user:chw_user',
     contact_id: '3ec4f112db4527a356e1aa8593002fc0',
     roles: ['chw'],
+    report_depth: 1,
   },
   supervisor_user: {
     user_id: 'org.couchdb.user:supervisor_user',
     contact_id: null,
     roles: ['chw_supervisor'],
+    report_depth: 1,
   },
   county_admin: {
     user_id: 'org.couchdb.user:county_admin',
     contact_id: null,
     roles: ['national_admin'],
+    report_depth: -1,
   },
 };
 
@@ -82,6 +85,7 @@ function generateToken(username) {
     exp: now + 3600 * 24, // 24 hours
     role_hash: md5(user.roles.sort().join(',')),
     contact_id: user.contact_id,
+    report_depth: user.report_depth,
     roles: user.roles,
   };
 

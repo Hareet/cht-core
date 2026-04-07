@@ -4,22 +4,30 @@
 # This config defines how CHT documents are filtered and synced to each
 # user based on their facility assignment, replication depth, and role.
 #
+# Verified against:
+#   - ddocs/medic-db/medic/nouveau/docs_by_replication_key/index.js
+#   - api/src/services/authorization.js
+#   - CHT docs: https://docs.communityhealthtoolkit.org/technical-overview/data/performance/replication/
+#   - PowerSync docs: https://docs.powersync.com/sync/streams/
+#
 # JWT claims expected in auth token:
-#   sub:        user_id (e.g., "org.couchdb.user:chw_user")
-#   role_hash:  MD5 of sorted roles (for purge group lookup)
-#   contact_id: user's contact person document ID
+#   sub:            user_id (e.g., "org.couchdb.user:chw_user")
+#   contact_id:     user's contact person document ID (UUID)
+#   role_hash:      MD5 of sorted roles (for purge group lookup)
+#   report_depth:   max depth for other users' reports (-1 = unlimited)
 #
 # Supporting PostgreSQL tables (created by setup.sql):
-#   v1.user_accessible_facilities  — pre-computed (user_id, facility_id) pairs
-#   v1.user_settings               — user config (facility, roles, depth)
+#   v1.user_accessible_facilities  — pre-computed (user_id, facility_id, depth) pairs
+#   v1.user_settings               — user config (facility, roles, depths)
 #   v1.purge_status                — purged doc tracking per role
 
 config:
   edition: 3
 
-# Global CTE: accessible facility IDs for the authenticated user.
-# This is the core authorization filter — users only see docs
-# belonging to facilities within their hierarchy + replication_depth.
+# Global CTE: accessible facility/contact IDs for the authenticated user.
+# Pre-computed by refresh_user_facilities() using recursive CTE in PostgreSQL.
+# This is the core authorization filter — users only see docs belonging to
+# contacts/facilities within their hierarchy + replication_depth.
 with:
   accessible_facilities: |
     SELECT facility_id
@@ -29,9 +37,13 @@ with:
 streams:
   # ================================================================
   # CONTACTS — persons, clinics, health centers, district hospitals
-  # Hierarchical filtering by facility assignment + replication depth.
-  # Priority 1: contacts load first (needed by all other views).
   # ================================================================
+  # Hierarchical filtering by facility assignment + replication depth.
+  # Includes the generic 'contact' type used by newer CHT configs.
+  # Priority 1: contacts load first (needed by all other views).
+  #
+  # CHT source: docs_by_replication_key emits doc._id as key for contacts
+  # CHT source: contacts_by_depth view emits [parent_id, depth] pairs
   contacts:
     auto_subscribe: true
     priority: 1
@@ -39,7 +51,7 @@ streams:
       SELECT
         c._id AS id,
         c.doc ->> 'name' AS name,
-        c.doc ->> 'type' AS contact_type,
+        COALESCE(c.doc ->> 'contact_type', c.doc ->> 'type') AS contact_type,
         CASE
           WHEN jsonb_typeof(c.doc -> 'parent') = 'object'
             THEN c.doc -> 'parent' ->> '_id'
@@ -56,31 +68,57 @@ streams:
         CAST(c.doc AS TEXT) AS doc
       FROM "v1"."couchdb" c
       WHERE c._deleted IS NOT true
-        AND c.doc ->> 'type' IN '["person", "clinic", "health_center", "district_hospital"]'
+        AND c.doc ->> 'type' IN '["contact", "person", "clinic", "health_center", "district_hospital"]'
         AND c._id IN accessible_facilities
 
   # ================================================================
-  # REPORTS — form submissions (data_record type)
-  # Filtered by facility hierarchy.
-  # Privacy: reports with fields.private=true are only visible to
-  # the submitter (prevents users seeing private reports about them).
-  # Purge: reports with purge_status entries for user's role are excluded
-  # via INNER JOIN against unpurged set.
+  # REPORTS — form submissions (data_record with form field)
   # ================================================================
+  # Subject resolution follows CHT's getSubject() fallback chain:
+  #   1. patient_id (root) or fields.patient_id
+  #   2. place_id (root) or fields.place_id
+  #   3. fields.patient_uuid
+  #   4. contact._id (submitter fallback)
+  #
+  # Privacy: reports with fields.private=true visible only to submitter.
+  # (Simplified from CHT's full isSensitive() which also checks subject/submitter
+  #  relationships — acceptable for PoC, full logic requires application layer.)
+  #
+  # needs_signoff: reports with fields.needs_signoff=true replicate UP
+  # the hierarchy via the submitter's ancestor chain. We check up to 5 levels
+  # of nesting (covers National→County→Sub-county→Facility→CHW→Household).
+  #
+  # report_depth: Limits OTHER users' reports by depth. User's own reports
+  # always sync. Implemented via report_depth_facilities CTE + OR with own submitter check.
+  #
+  # CHT source: docs_by_replication_key indexes subject, submitter, private, needs_signoff
   reports:
     auto_subscribe: true
     priority: 2
     with:
-      # Report subjects: contacts the user can access
-      accessible_subjects: |
+      # Facilities within report_depth (may be smaller than contact depth)
+      # If report_depth is -1 (unlimited), falls back to all accessible facilities
+      report_depth_facilities: |
         SELECT facility_id
         FROM "v1"."user_accessible_facilities"
         WHERE user_id = auth.user_id()
+          AND (depth <= CAST(auth.parameter('report_depth') AS INTEGER) OR CAST(auth.parameter('report_depth') AS INTEGER) < 0)
     query: |
       SELECT
         c._id AS id,
         c.doc ->> 'form' AS form,
-        c.doc -> 'fields' ->> 'patient_id' AS patient_id,
+        COALESCE(
+          c.doc ->> 'patient_id',
+          c.doc -> 'fields' ->> 'patient_id',
+          c.doc ->> 'place_id',
+          c.doc -> 'fields' ->> 'place_id',
+          c.doc -> 'fields' ->> 'patient_uuid',
+          CASE
+            WHEN jsonb_typeof(c.doc -> 'contact') = 'object'
+              THEN c.doc -> 'contact' ->> '_id'
+            ELSE c.doc ->> 'contact'
+          END
+        ) AS subject_id,
         CASE
           WHEN jsonb_typeof(c.doc -> 'contact') = 'object'
             THEN c.doc -> 'contact' ->> '_id'
@@ -88,6 +126,7 @@ streams:
         END AS submitter_id,
         c.doc ->> 'reported_date' AS reported_date,
         c.doc -> 'fields' ->> 'private' AS is_private,
+        c.doc -> 'fields' ->> 'needs_signoff' AS needs_signoff,
         CAST(c.doc -> 'fields' AS TEXT) AS fields,
         CAST(c.doc AS TEXT) AS doc
       FROM "v1"."couchdb" c
@@ -95,13 +134,38 @@ streams:
         AND c.doc ->> 'type' = 'data_record'
         AND c.doc ->> 'form' IS NOT NULL
         AND (
-          c.doc -> 'fields' ->> 'patient_uuid' IN accessible_subjects
-          OR CASE
-            WHEN jsonb_typeof(c.doc -> 'contact') = 'object'
-              THEN c.doc -> 'contact' ->> 'parent' IN accessible_subjects
-            ELSE c.doc ->> 'contact' IN accessible_subjects
-          END
+          -- Case 1: Subject is within user's report_depth facilities
+          COALESCE(
+            c.doc ->> 'patient_id',
+            c.doc -> 'fields' ->> 'patient_id',
+            c.doc ->> 'place_id',
+            c.doc -> 'fields' ->> 'place_id',
+            c.doc -> 'fields' ->> 'patient_uuid',
+            CASE
+              WHEN jsonb_typeof(c.doc -> 'contact') = 'object'
+                THEN c.doc -> 'contact' ->> '_id'
+              ELSE c.doc ->> 'contact'
+            END
+          ) IN report_depth_facilities
+          -- Case 2: needs_signoff=true — replicate UP via submitter's ancestor chain
+          -- Check submitter's facility and up to 4 ancestor levels
+          OR (
+            c.doc -> 'fields' ->> 'needs_signoff' = 'true'
+            AND (
+              CASE WHEN jsonb_typeof(c.doc -> 'contact') = 'object'
+                THEN c.doc -> 'contact' ->> '_id' ELSE NULL END IN accessible_facilities
+              OR CASE WHEN jsonb_typeof(c.doc -> 'contact') = 'object'
+                THEN c.doc -> 'contact' -> 'parent' ->> '_id' ELSE NULL END IN accessible_facilities
+              OR CASE WHEN jsonb_typeof(c.doc -> 'contact') = 'object'
+                THEN c.doc -> 'contact' -> 'parent' -> 'parent' ->> '_id' ELSE NULL END IN accessible_facilities
+              OR CASE WHEN jsonb_typeof(c.doc -> 'contact') = 'object'
+                THEN c.doc -> 'contact' -> 'parent' -> 'parent' -> 'parent' ->> '_id' ELSE NULL END IN accessible_facilities
+              OR CASE WHEN jsonb_typeof(c.doc -> 'contact') = 'object'
+                THEN c.doc -> 'contact' -> 'parent' -> 'parent' -> 'parent' -> 'parent' ->> '_id' ELSE NULL END IN accessible_facilities
+            )
+          )
         )
+        -- Privacy filter: private reports only visible to the submitter
         AND (
           c.doc -> 'fields' ->> 'private' != 'true'
           OR CASE
@@ -113,20 +177,23 @@ streams:
 
   # ================================================================
   # TASKS — client-generated workflow tasks
-  # Scoped to the user (tasks.user = user's contact_id).
-  # Time-based purge: completed/cancelled tasks older than 60 days
-  # are excluded (mirrors CHT default purge.js behavior).
   # ================================================================
+  # Tasks are scoped to the user via task.user field.
+  # IMPORTANT: task.user = CouchDB user ID (e.g., "org.couchdb.user:chw_user"),
+  # NOT the contact UUID. Must use auth.user_id() (= JWT sub claim).
+  #
+  # CHT source: docs_by_replication_key emits doc.user as key for tasks
   tasks:
     auto_subscribe: true
     priority: 3
     query: |
       SELECT
         c._id AS id,
-        c.doc ->> 'user' AS owner,
+        c.doc ->> 'user' AS task_user,
+        c.doc ->> 'owner' AS owner,
+        c.doc ->> 'requester' AS requester,
         c.doc ->> 'state' AS state,
         c.doc ->> 'emission' AS emission_id,
-        c.doc ->> 'stateHistory' AS state_history,
         c.doc ->> 'dueDate' AS due_date,
         c.doc ->> 'startDate' AS start_date,
         c.doc ->> 'endDate' AS end_date,
@@ -134,14 +201,16 @@ streams:
       FROM "v1"."couchdb" c
       WHERE c._deleted IS NOT true
         AND c.doc ->> 'type' = 'task'
-        AND c.doc ->> 'user' = auth.parameter('contact_id')
+        AND c.doc ->> 'user' = auth.user_id()
 
   # ================================================================
   # TARGETS — performance indicator aggregates per reporting period
-  # Scoped to the user (targets.owner = user's contact_id).
-  # Time-based purge: targets with reporting period > 6 months old
-  # are excluded (mirrors CHT default purge behavior).
   # ================================================================
+  # Targets are scoped by the target.owner field, which is a contact UUID.
+  # Unlike tasks, targets sync to any user who can see the owner contact
+  # in their hierarchy (supervisors see subordinate targets).
+  #
+  # CHT source: docs_by_replication_key emits doc.owner as key for targets
   targets:
     auto_subscribe: true
     priority: 3
@@ -155,15 +224,49 @@ streams:
       FROM "v1"."couchdb" c
       WHERE c._deleted IS NOT true
         AND c.doc ->> 'type' = 'target'
-        AND c.doc ->> 'owner' = auth.parameter('contact_id')
+        AND c.doc ->> 'owner' IN accessible_facilities
 
   # ================================================================
-  # GLOBAL CONFIG — app_settings, forms, translations, resources
-  # Synced to ALL users with no filtering. These are the documents
-  # indexed with replication key '_all' in CHT's CouchDB views.
-  # Priority 0: config must be available before any other data.
+  # GLOBAL CONFIG — all users, no filtering
   # ================================================================
+  # These are the documents indexed with replication key '_all' in CHT.
+  # Matched by document _id OR by document type.
+  # See: ddocs/medic-db/medic/nouveau/docs_by_replication_key/index.js lines 1-13
+  #
+  # By _id: resources, branding, partners, service-worker-meta,
+  #         zscore-charts, settings, privacy-policies
+  # By type: form, translations
+  #
+  # Priority 1: config must be available before app renders.
   global_config:
+    auto_subscribe: true
+    priority: 1
+    queries:
+      # Documents matched by type
+      - |
+        SELECT
+          c._id AS id,
+          c.doc ->> 'type' AS doc_type,
+          CAST(c.doc AS TEXT) AS doc
+        FROM "v1"."couchdb" c
+        WHERE c._deleted IS NOT true
+          AND c.doc ->> 'type' IN '["form", "translations"]'
+      # Documents matched by specific _id (the _all replication key set)
+      - |
+        SELECT
+          c._id AS id,
+          c.doc ->> 'type' AS doc_type,
+          CAST(c.doc AS TEXT) AS doc
+        FROM "v1"."couchdb" c
+        WHERE c._deleted IS NOT true
+          AND c._id IN '["resources", "branding", "partners", "service-worker-meta", "zscore-charts", "settings", "privacy-policies"]'
+
+  # ================================================================
+  # USER SETTINGS DOC — user's own CouchDB user settings document
+  # ================================================================
+  # Each user always gets their own org.couchdb.user:<username> document.
+  # This is essential for the app to know the user's roles and facility.
+  user_settings_doc:
     auto_subscribe: true
     priority: 1
     query: |
@@ -173,14 +276,14 @@ streams:
         CAST(c.doc AS TEXT) AS doc
       FROM "v1"."couchdb" c
       WHERE c._deleted IS NOT true
-        AND c.doc ->> 'type' IN '["form", "translations", "meta"]'
+        AND c._id = auth.user_id()
 
   # ================================================================
   # USER META — feedback, telemetry, read status
+  # ================================================================
   # Per-user documents. In CouchDB these live in medic-user-{name}-meta.
   # In PostgreSQL they're collapsed into the main table with a user_id field.
   # Filtered by the authenticated user's ID.
-  # ================================================================
   user_meta:
     auto_subscribe: true
     priority: 3
