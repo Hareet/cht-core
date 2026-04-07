@@ -284,6 +284,12 @@ const evaluateWhere = (row, where, params, state) => {
     return values.includes(row[field]);
   }
 
+  // Handle IS NULL
+  const isNullMatch = trimmed.match(/^(\w+)\s+IS\s+NULL$/i);
+  if (isNullMatch) {
+    return row[isNullMatch[1]] == null;
+  }
+
   // Handle IS NOT NULL
   const isNotNullMatch = trimmed.match(/^(\w+)\s+IS\s+NOT\s+NULL/i);
   if (isNotNullMatch) {
@@ -397,6 +403,13 @@ describe('powersync-adapter', () => {
   });
 
   describe('allTasks', () => {
+    const taskNoOwnerNoState = {
+      _id: 'taskNoOwnerNoState',
+      type: 'task',
+      requester: 'patient',
+      // owner: undefined, state: undefined — CouchDB treats as '_unassigned' and non-terminal
+    };
+
     beforeEach(() => {
       seedTasks(db, [
         taskOwnedByChtContact,
@@ -406,17 +419,21 @@ describe('powersync-adapter', () => {
         failedTask,
         readyTask,
         draftTask,
+        taskNoOwnerNoState,
       ]);
     });
 
-    it('for owner returns non-terminal tasks with owner', async () => {
+    it('for owner returns non-terminal tasks including NULL state and NULL owner', async () => {
       const result = await powersyncProvider(db).allTasks('owner');
       const ids = result.map(d => d._id);
-      // Owner tasks: taskOwnedByChtContact (no state), readyTask (Ready), draftTask (Draft)
-      // Excluded: cancelledTask, completedTask, failedTask (terminal states)
+      // Non-terminal tasks: taskOwnedByChtContact (no state), readyTask (Ready), draftTask (Draft)
+      // NULL owner/state tasks are included (CouchDB uses doc.owner || '_unassigned', undefined is non-terminal)
       expect(ids).to.include('taskOwnedBy');
       expect(ids).to.include('readyTask');
       expect(ids).to.include('draftTask');
+      expect(ids).to.include('taskRequestedBy'); // no owner, no state — included as '_unassigned'
+      expect(ids).to.include('taskNoOwnerNoState'); // no owner, no state — included
+      // Excluded: cancelledTask, completedTask, failedTask (terminal states)
       expect(ids).to.not.include('cancelledTask');
       expect(ids).to.not.include('completedTask');
       expect(ids).to.not.include('failedTask');
@@ -432,6 +449,7 @@ describe('powersync-adapter', () => {
       expect(ids).to.include('failedTask');
       expect(ids).to.include('readyTask');
       expect(ids).to.include('draftTask');
+      expect(ids).to.include('taskNoOwnerNoState');
     });
   });
 
@@ -578,7 +596,7 @@ describe('powersync-adapter', () => {
   describe('tasksByRelation', () => {
     beforeEach(() => {
       seedTasks(db, [
-        taskOwnedByChtContact,
+        taskOwnedByChtContact, // owner: 'patient', state: undefined (non-terminal)
         taskRequestedByChtContact,
         cancelledTask,
         readyTask,
@@ -595,9 +613,11 @@ describe('powersync-adapter', () => {
       expect(ids).to.include('draftTask');
     });
 
-    it('by owner returns non-terminal tasks for contact', async () => {
+    it('by owner returns non-terminal tasks for contact including NULL state', async () => {
       const result = await powersyncProvider(db).tasksByRelation(['patient'], 'owner');
       const ids = result.map(d => d._id);
+      // taskOwnedByChtContact has owner='patient' but state=undefined — should be included
+      // (CouchDB: undefined state is non-terminal since indexOf(undefined) === -1)
       expect(ids).to.include('taskOwnedBy');
       expect(ids).to.include('readyTask');
       expect(ids).to.include('draftTask');

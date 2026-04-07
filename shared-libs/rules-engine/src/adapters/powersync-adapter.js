@@ -10,6 +10,15 @@
  *   - tasks: id, type, state, owner, requester, emission (JSON text), user, authored_on, state_history (JSON text), doc
  *   - targets: id, type, owner, user, reporting_period, targets (JSON text), updated_date
  *   - rules_state_store: local-only table, id, data (JSON text)
+ *
+ * Notes on CouchDB view parity:
+ *   - The CouchDB reports_by_subject view indexes case_id, but registrationUtils.getSubjectIds()
+ *     does NOT include case_id for contacts. Reports matched solely by case_id would not appear
+ *     in the PouchDB adapter either (subject IDs come from contacts, which lack case_id).
+ *   - For owner-prefix task queries, CouchDB uses `doc.owner || '_unassigned'` — tasks with
+ *     NULL owner are treated as '_unassigned' and included. NULL state is non-terminal.
+ *   - SQLite has a default limit of 999 bound parameters. For contact lists exceeding ~300,
+ *     queries with triple-expanded placeholders (reports query) may need chunking.
  */
 
 /* eslint-disable no-console */
@@ -67,11 +76,13 @@ const powersyncProvider = (db) => {
     allTasks: async (prefix) => {
       let sql;
       if (prefix === 'owner') {
-        // CouchDB view emits 'owner-{id}' only for non-terminal tasks
+        // CouchDB view emits 'owner-{ownerId}' for non-terminal tasks, where ownerId = doc.owner || '_unassigned'.
+        // Tasks with NULL owner become '_unassigned' and are still emitted.
+        // Tasks with NULL/undefined state are NOT terminal (indexOf(undefined) === -1).
+        // SQL NOT IN excludes NULLs, so we explicitly handle NULL state.
         sql = `SELECT doc FROM tasks
                WHERE type = 'task'
-                 AND state NOT IN ('Cancelled', 'Completed', 'Failed')
-                 AND owner IS NOT NULL`;
+                 AND (state IS NULL OR state NOT IN ('Cancelled', 'Completed', 'Failed'))`;
       } else {
         // 'requester' prefix: emitted for all tasks with a requester, regardless of state
         sql = `SELECT doc FROM tasks
@@ -268,9 +279,12 @@ const powersyncProvider = (db) => {
 
       let sql;
       if (prefix === 'owner') {
+        // CouchDB view emits 'owner-{id}' only for non-terminal tasks.
+        // NULL/undefined state is non-terminal in CouchDB (indexOf(undefined) === -1).
+        // SQL NOT IN excludes NULLs, so we explicitly handle NULL state.
         sql = `SELECT doc FROM tasks
                WHERE type = 'task'
-                 AND state NOT IN ('Cancelled', 'Completed', 'Failed')
+                 AND (state IS NULL OR state NOT IN ('Cancelled', 'Completed', 'Failed'))
                  AND owner IN (${placeholders(contactIds)})`;
       } else {
         sql = `SELECT doc FROM tasks
@@ -343,8 +357,11 @@ const powersyncProvider = (db) => {
       const subjectIdArray = Array.from(subjectIds);
 
       // Fetch reports by subject: the CouchDB view indexes by patient_id, place_id, case_id,
-      // fields.patient_id, fields.place_id, fields.case_id, fields.patient_uuid, fields.place_uuid
-      // In SQL we query against denormalized columns or parse the fields JSON
+      // fields.patient_id, fields.place_id, fields.case_id, fields.patient_uuid, fields.place_uuid.
+      // However, registrationUtils.getSubjectIds uses only: _id, patient_id, place_id (contacts)
+      // and patient_id, patient_uuid, place_id, place_uuid (reports). case_id is NOT a subject
+      // property, so contact subject IDs never include case_id values. Reports matched solely
+      // by case_id would not appear in PouchDB either. subject_id column covers patient_uuid/place_uuid.
       const reportSql = `SELECT doc FROM reports
                          WHERE type = 'data_record' AND form IS NOT NULL
                            AND (patient_id IN (${placeholders(subjectIdArray)})
