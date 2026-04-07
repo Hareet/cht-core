@@ -5,6 +5,7 @@
  */
 
 const pouchdbProvider = require('./pouchdb-provider');
+const adapters = require('./adapters');
 const rulesEmitter = require('./rules-emitter');
 const rulesStateStore = require('./rules-state-store');
 const wireupToProvider = require('./provider-wireup');
@@ -12,10 +13,13 @@ const taskStates = require('./task-states');
 
 
 /**
- * @param {Object} db Medic pouchdb database
+ * @param {Object} db Medic pouchdb database or PowerSync database instance
+ * @param {Object} [options] Optional configuration
+ * @param {string} [options.adapter='pouchdb'] The adapter type: 'pouchdb' or 'powersync'
  */
-module.exports = db => {
-  const provider = pouchdbProvider(db);
+module.exports = (db, options = {}) => {
+  const adapterType = options.adapter || 'pouchdb';
+  const provider = adapterType === 'pouchdb' ? pouchdbProvider(db) : adapters.create(adapterType, db);
   return {
     /**
      * @param {Object} settings Settings for the behavior of the rules engine
