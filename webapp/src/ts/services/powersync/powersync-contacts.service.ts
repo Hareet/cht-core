@@ -9,8 +9,13 @@
  * this service instead of (or in addition to) the original.
  *
  * View query translations:
- *   medic-client/contacts_by_type → SELECT FROM contacts WHERE type IN (...)
- *   medic-client/contacts_by_parent → SELECT FROM contacts WHERE parent_id = ? AND type = ?
+ *   medic-client/contacts_by_type → SELECT FROM contacts WHERE contact_type IN (...)
+ *   medic-client/contacts_by_parent → SELECT FROM contacts WHERE parent_id = ? AND contact_type = ?
+ *
+ * Note: We query on `contact_type` (the resolved type) rather than `type`, because
+ * CHT v3.7+ stores 'contact' in the `type` field with the specific type in `contact_type`.
+ * The `contact_type` column uses the cht-sync COALESCE(contact_type, type) pattern,
+ * matching the contacts_by_type view's COALESCE behavior.
  */
 import { Injectable } from '@angular/core';
 import { Observable } from 'rxjs';
@@ -108,7 +113,7 @@ export class PowerSyncContactsService {
    */
   watchByParent(parentId: string, type?: string): Observable<any[]> {
     const sql = type
-      ? 'SELECT * FROM contacts WHERE parent_id = ? AND type = ? ORDER BY name'
+      ? 'SELECT * FROM contacts WHERE parent_id = ? AND contact_type = ? ORDER BY name'
       : 'SELECT * FROM contacts WHERE parent_id = ? ORDER BY name';
     const params = type ? [parentId, type] : [parentId];
 
@@ -128,19 +133,30 @@ export class PowerSyncContactsService {
    *
    * This bridges the gap during migration - existing CHT components expect
    * documents with _id, type, and nested parent objects.
+   *
+   * CHT v3.7+ pattern:
+   *   type='contact', contact_type='person'|'clinic'|etc.
+   * Older pattern:
+   *   type='person'|'clinic'|etc. (no contact_type field)
+   * We normalize to always emit both for maximum compatibility.
    */
   private toDocument(row: ContactRow): any {
+    const resolvedType = row.contact_type || row.type;
+
     const doc: any = {
       _id: (row as any).id,
-      type: row.type || row.doc_type,
+      // Emit both type patterns for compatibility with all CHT components
+      type: row.type || 'contact',
+      contact_type: resolvedType,
       name: row.name,
       phone: row.phone,
+      alternative_phone: row.alternative_phone,
       date_of_birth: row.date_of_birth,
       sex: row.sex,
       reported_date: row.reported_date ? Number(row.reported_date) || row.reported_date : undefined,
       notes: row.notes,
       patient_id: row.patient_id,
-      contact_type: row.type,
+      place_id: row.place_id,
     };
 
     // Parse parent hierarchy from JSON text
@@ -166,6 +182,16 @@ export class PowerSyncContactsService {
     // Handle muted state
     if (row.muted) {
       doc.muted = row.muted;
+    }
+
+    // Active status
+    if (row.active) {
+      doc.is_active = row.active;
+    }
+
+    // Date of death
+    if (row.date_of_death) {
+      doc.date_of_death = row.date_of_death;
     }
 
     // Contact reference (primary contact for places)

@@ -257,6 +257,9 @@ export class PowerSyncService implements OnDestroy {
   /**
    * Get all contacts of the given types.
    * Replacement for PouchDB query('medic-client/contacts_by_type').
+   *
+   * Queries on `contact_type` which holds the resolved type via
+   * COALESCE(contact_type, type), matching CHT v3.7+ and older patterns.
    */
   async getContactsByType(types: string[]): Promise<ContactRow[]> {
     if (!types.length) {
@@ -264,7 +267,7 @@ export class PowerSyncService implements OnDestroy {
     }
     const placeholders = types.map(() => '?').join(', ');
     return this.getAll<ContactRow>(
-      `SELECT * FROM contacts WHERE type IN (${placeholders}) ORDER BY name`,
+      `SELECT * FROM contacts WHERE contact_type IN (${placeholders}) ORDER BY name`,
       types
     );
   }
@@ -278,7 +281,7 @@ export class PowerSyncService implements OnDestroy {
     }
     const placeholders = types.map(() => '?').join(', ');
     return this.watch<ContactRow>(
-      `SELECT * FROM contacts WHERE type IN (${placeholders}) ORDER BY name`,
+      `SELECT * FROM contacts WHERE contact_type IN (${placeholders}) ORDER BY name`,
       types
     );
   }
@@ -290,7 +293,7 @@ export class PowerSyncService implements OnDestroy {
   async getContactsByParent(parentId: string, type?: string): Promise<ContactRow[]> {
     if (type) {
       return this.getAll<ContactRow>(
-        'SELECT * FROM contacts WHERE parent_id = ? AND type = ? ORDER BY name',
+        'SELECT * FROM contacts WHERE parent_id = ? AND contact_type = ? ORDER BY name',
         [parentId, type]
       );
     }

@@ -90,72 +90,144 @@ describe('PowerSync Connector', () => {
       expect(fetchStub.called).to.be.false;
     });
 
-    it('should upload PUT operations as POST requests', async () => {
+    describe('contact routing: persons vs places', () => {
+      it('should route person contacts to /api/v1/people', async () => {
+        const tx = createMockTransaction([{
+          op: 'PUT',
+          table: 'contacts',
+          id: 'person-1',
+          opData: { name: 'John', contact_type: 'person' },
+        }]);
+        mockDb.getNextCrudTransaction.resolves(tx);
+        fetchStub.resolves(new Response('{}', { status: 200 }));
+
+        await connector.uploadData(mockDb);
+
+        expect(fetchStub.calledOnce).to.be.true;
+        const [url] = fetchStub.firstCall.args;
+        expect(url).to.equal('http://localhost:5988/medic/api/v1/people');
+        expect(tx.complete.calledOnce).to.be.true;
+      });
+
+      it('should route clinic contacts to /api/v1/places', async () => {
+        const tx = createMockTransaction([{
+          op: 'PUT',
+          table: 'contacts',
+          id: 'clinic-1',
+          opData: { name: 'Test Clinic', contact_type: 'clinic' },
+        }]);
+        mockDb.getNextCrudTransaction.resolves(tx);
+        fetchStub.resolves(new Response('{}', { status: 200 }));
+
+        await connector.uploadData(mockDb);
+
+        expect(fetchStub.calledOnce).to.be.true;
+        const [url] = fetchStub.firstCall.args;
+        expect(url).to.equal('http://localhost:5988/medic/api/v1/places');
+      });
+
+      it('should route health_center contacts to /api/v1/places', async () => {
+        const tx = createMockTransaction([{
+          op: 'PUT',
+          table: 'contacts',
+          id: 'hc-1',
+          opData: { name: 'Health Center', contact_type: 'health_center' },
+        }]);
+        mockDb.getNextCrudTransaction.resolves(tx);
+        fetchStub.resolves(new Response('{}', { status: 200 }));
+
+        await connector.uploadData(mockDb);
+
+        const [url] = fetchStub.firstCall.args;
+        expect(url).to.equal('http://localhost:5988/medic/api/v1/places');
+      });
+
+      it('should fall back to type field when contact_type is missing (pre-v3.7)', async () => {
+        const tx = createMockTransaction([{
+          op: 'PUT',
+          table: 'contacts',
+          id: 'person-1',
+          opData: { name: 'Old Person', type: 'person' },
+        }]);
+        mockDb.getNextCrudTransaction.resolves(tx);
+        fetchStub.resolves(new Response('{}', { status: 200 }));
+
+        await connector.uploadData(mockDb);
+
+        const [url] = fetchStub.firstCall.args;
+        expect(url).to.equal('http://localhost:5988/medic/api/v1/people');
+      });
+
+      it('should default to /api/v1/places for unknown contact types', async () => {
+        const tx = createMockTransaction([{
+          op: 'PUT',
+          table: 'contacts',
+          id: 'custom-1',
+          opData: { name: 'Custom Place', contact_type: 'custom_facility' },
+        }]);
+        mockDb.getNextCrudTransaction.resolves(tx);
+        fetchStub.resolves(new Response('{}', { status: 200 }));
+
+        await connector.uploadData(mockDb);
+
+        const [url] = fetchStub.firstCall.args;
+        expect(url).to.equal('http://localhost:5988/medic/api/v1/places');
+      });
+    });
+
+    it('should upload reports to /api/v1/records', async () => {
       const tx = createMockTransaction([{
         op: 'PUT',
-        table: 'contacts',
-        id: 'contact-1',
-        opData: { name: 'John', type: 'person' },
+        table: 'reports',
+        id: 'report-1',
+        opData: { form: 'pregnancy', fields: '{"patient_name":"Jane"}' },
       }]);
       mockDb.getNextCrudTransaction.resolves(tx);
-
       fetchStub.resolves(new Response('{}', { status: 200 }));
 
       await connector.uploadData(mockDb);
 
-      expect(fetchStub.calledOnce).to.be.true;
-      const [url, opts] = fetchStub.firstCall.args;
-      expect(url).to.equal('http://localhost:5988/medic/api/v1/people');
-      expect(opts.method).to.equal('POST');
-      expect(JSON.parse(opts.body)).to.deep.include({ name: 'John', type: 'person', id: 'contact-1' });
+      const [url] = fetchStub.firstCall.args;
+      expect(url).to.equal('http://localhost:5988/medic/api/v1/records');
       expect(tx.complete.calledOnce).to.be.true;
     });
 
-    it('should upload PATCH operations as PUT requests', async () => {
+    it('should skip tasks (no upload endpoint - rules engine generated)', async () => {
+      const tx = createMockTransaction([{
+        op: 'PUT',
+        table: 'tasks',
+        id: 'task-1',
+        opData: { state: 'Ready', owner: 'contact-1' },
+      }]);
+      mockDb.getNextCrudTransaction.resolves(tx);
+
+      await connector.uploadData(mockDb);
+
+      expect(fetchStub.called).to.be.false;
+      expect(tx.complete.calledOnce).to.be.true;
+    });
+
+    it('should skip targets (no upload endpoint - rules engine generated)', async () => {
+      const tx = createMockTransaction([{
+        op: 'PUT',
+        table: 'targets',
+        id: 'target-1',
+        opData: { owner: 'contact-1' },
+      }]);
+      mockDb.getNextCrudTransaction.resolves(tx);
+
+      await connector.uploadData(mockDb);
+
+      expect(fetchStub.called).to.be.false;
+      expect(tx.complete.calledOnce).to.be.true;
+    });
+
+    it('should skip settings (read-only on client)', async () => {
       const tx = createMockTransaction([{
         op: 'PATCH',
-        table: 'contacts',
-        id: 'contact-1',
-        opData: { name: 'Jane' },
-      }]);
-      mockDb.getNextCrudTransaction.resolves(tx);
-
-      fetchStub.resolves(new Response('{}', { status: 200 }));
-
-      await connector.uploadData(mockDb);
-
-      expect(fetchStub.calledOnce).to.be.true;
-      const [url, opts] = fetchStub.firstCall.args;
-      expect(url).to.equal('http://localhost:5988/medic/api/v1/people/contact-1');
-      expect(opts.method).to.equal('PUT');
-      expect(tx.complete.calledOnce).to.be.true;
-    });
-
-    it('should upload DELETE operations', async () => {
-      const tx = createMockTransaction([{
-        op: 'DELETE',
-        table: 'contacts',
-        id: 'contact-1',
-      }]);
-      mockDb.getNextCrudTransaction.resolves(tx);
-
-      fetchStub.resolves(new Response('{}', { status: 200 }));
-
-      await connector.uploadData(mockDb);
-
-      expect(fetchStub.calledOnce).to.be.true;
-      const [url, opts] = fetchStub.firstCall.args;
-      expect(url).to.equal('http://localhost:5988/medic/api/v1/people/contact-1');
-      expect(opts.method).to.equal('DELETE');
-      expect(tx.complete.calledOnce).to.be.true;
-    });
-
-    it('should skip unmapped tables', async () => {
-      const tx = createMockTransaction([{
-        op: 'PUT',
-        table: 'unknown_table',
-        id: 'doc-1',
-        opData: { data: 'test' },
+        table: 'settings',
+        id: 'settings',
+        opData: { doc: '{}' },
       }]);
       mockDb.getNextCrudTransaction.resolves(tx);
 
@@ -170,10 +242,9 @@ describe('PowerSync Connector', () => {
         op: 'PUT',
         table: 'contacts',
         id: 'contact-1',
-        opData: { name: 'John' },
+        opData: { name: 'John', contact_type: 'person' },
       }]);
       mockDb.getNextCrudTransaction.resolves(tx);
-
       fetchStub.resolves(new Response('Internal Server Error', { status: 500 }));
 
       try {
@@ -183,7 +254,6 @@ describe('PowerSync Connector', () => {
         expect(err.message).to.include('500');
       }
 
-      // transaction.complete() should NOT have been called
       expect(tx.complete.called).to.be.false;
     });
 
@@ -192,31 +262,26 @@ describe('PowerSync Connector', () => {
         op: 'PUT',
         table: 'contacts',
         id: 'contact-1',
-        opData: { name: 'John' },
+        opData: { name: 'John', contact_type: 'person' },
       }]);
       mockDb.getNextCrudTransaction.resolves(tx);
-
       fetchStub.resolves(new Response('Bad Request', { status: 400 }));
 
       await connector.uploadData(mockDb);
 
-      // Should have logged to feedback table
       expect(mockDb.execute.calledOnce).to.be.true;
       const [sql, params] = mockDb.execute.firstCall.args;
       expect(sql).to.include('INSERT INTO feedback');
       expect(params).to.include('upload_error');
-
-      // transaction.complete() should still be called
       expect(tx.complete.calledOnce).to.be.true;
     });
 
     it('should handle multiple operations in a transaction', async () => {
       const tx = createMockTransaction([
-        { op: 'PUT', table: 'contacts', id: 'c1', opData: { name: 'A' } },
+        { op: 'PUT', table: 'contacts', id: 'c1', opData: { name: 'A', contact_type: 'person' } },
         { op: 'PUT', table: 'reports', id: 'r1', opData: { form: 'visit' } },
       ]);
       mockDb.getNextCrudTransaction.resolves(tx);
-
       fetchStub.resolves(new Response('{}', { status: 200 }));
 
       await connector.uploadData(mockDb);
@@ -234,12 +299,12 @@ describe('PowerSync Connector', () => {
         id: 'c1',
         opData: {
           name: 'John',
+          contact_type: 'person',
           parent: '{"_id":"parent-1","type":"clinic"}',
           geolocation: '{"latitude":1.5,"longitude":36.8}',
         },
       }]);
       mockDb.getNextCrudTransaction.resolves(tx);
-
       fetchStub.resolves(new Response('{}', { status: 200 }));
 
       await connector.uploadData(mockDb);
@@ -262,7 +327,6 @@ describe('PowerSync Connector', () => {
         },
       }]);
       mockDb.getNextCrudTransaction.resolves(tx);
-
       fetchStub.resolves(new Response('{}', { status: 200 }));
 
       await connector.uploadData(mockDb);

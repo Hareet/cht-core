@@ -63,25 +63,33 @@ describe('PowerSync Contacts Service', () => {
       const mockRows = [
         {
           id: 'contact-1',
-          type: 'person',
+          type: 'contact',           // v3.7+ uses 'contact'
+          contact_type: 'person',    // resolved type
           name: 'John Doe',
           phone: '+254712345678',
+          alternative_phone: '+254700000000',
           parent_id: 'clinic-1',
           parent: '{"_id":"clinic-1","type":"clinic"}',
           patient_id: 'P001',
+          place_id: null,
           reported_date: '1680000000000',
-          doc_type: 'person',
+          active: 'true',
+          date_of_death: null,
         },
         {
           id: 'contact-2',
-          type: 'person',
+          type: 'contact',
+          contact_type: 'person',
           name: 'Jane Smith',
           phone: '+254787654321',
+          alternative_phone: null,
           parent_id: 'clinic-1',
           parent: null,
           patient_id: 'P002',
+          place_id: null,
           reported_date: '1680001000000',
-          doc_type: 'person',
+          active: null,
+          date_of_death: null,
         },
       ];
       powerSyncService.getContactsByType.resolves(mockRows);
@@ -92,12 +100,15 @@ describe('PowerSync Contacts Service', () => {
       expect(powerSyncService.getContactsByType.firstCall.args[0]).to.deep.equal(['person']);
       expect(results.length).to.equal(2);
 
-      // Verify CouchDB document shape
+      // Verify CouchDB document shape with v3.7+ fields
       expect(results[0]._id).to.equal('contact-1');
-      expect(results[0].type).to.equal('person');
+      expect(results[0].type).to.equal('contact');
+      expect(results[0].contact_type).to.equal('person');
       expect(results[0].name).to.equal('John Doe');
       expect(results[0].phone).to.equal('+254712345678');
+      expect(results[0].alternative_phone).to.equal('+254700000000');
       expect(results[0].patient_id).to.equal('P001');
+      expect(results[0].is_active).to.equal('true');
       expect(results[0].parent).to.deep.equal({ _id: 'clinic-1', type: 'clinic' });
 
       // Second contact has no parent JSON, should fall back to parent_id
@@ -129,11 +140,11 @@ describe('PowerSync Contacts Service', () => {
     it('should transform rows to documents', (done) => {
       const mockRows = [{
         id: 'c1',
-        type: 'clinic',
+        type: 'contact',
+        contact_type: 'clinic',
         name: 'Test Clinic',
         parent_id: null,
         parent: null,
-        doc_type: 'clinic',
       }];
       powerSyncService.watchContactsByType.returns(of(mockRows));
 
@@ -160,7 +171,7 @@ describe('PowerSync Contacts Service', () => {
       contactTypesService.getTypeId.returns('district_hospital');
       contactTypesService.get.resolves({ id: 'district_hospital', parents: [] });
       powerSyncService.getContactsByType.resolves([
-        { id: 'dh1', type: 'district_hospital', name: 'Hospital A', parent_id: null, parent: null, doc_type: 'district_hospital' },
+        { id: 'dh1', type: 'contact', contact_type: 'district_hospital', name: 'Hospital A', parent_id: null, parent: null },
       ]);
 
       const result = await service.getSiblings({ type: 'district_hospital' });
@@ -183,8 +194,8 @@ describe('PowerSync Contacts Service', () => {
     it('should fetch siblings by parent and type', async () => {
       contactTypesService.getTypeId.returns('person');
       powerSyncService.getContactsByParent.resolves([
-        { id: 'p1', type: 'person', name: 'Sibling 1', parent_id: 'clinic-1', parent: null, doc_type: 'person' },
-        { id: 'p2', type: 'person', name: 'Sibling 2', parent_id: 'clinic-1', parent: null, doc_type: 'person' },
+        { id: 'p1', type: 'contact', contact_type: 'person', name: 'Sibling 1', parent_id: 'clinic-1', parent: null },
+        { id: 'p2', type: 'contact', contact_type: 'person', name: 'Sibling 2', parent_id: 'clinic-1', parent: null },
       ]);
 
       const result = await service.getSiblings({
@@ -201,7 +212,7 @@ describe('PowerSync Contacts Service', () => {
   describe('getByParent', () => {
     it('should fetch contacts by parent ID', async () => {
       powerSyncService.getContactsByParent.resolves([
-        { id: 'c1', type: 'person', name: 'Child', parent_id: 'p1', parent: null, doc_type: 'person' },
+        { id: 'c1', type: 'contact', contact_type: 'person', name: 'Child', parent_id: 'p1', parent: null },
       ]);
 
       const result = await service.getByParent('p1');
@@ -223,8 +234,8 @@ describe('PowerSync Contacts Service', () => {
   describe('watchByParent', () => {
     it('should watch contacts under a parent', (done) => {
       const mockRows = [{
-        id: 'c1', type: 'person', name: 'Child',
-        parent_id: 'p1', parent: null, doc_type: 'person',
+        id: 'c1', type: 'contact', contact_type: 'person', name: 'Child',
+        parent_id: 'p1', parent: null,
       }];
       powerSyncService.watch.returns(of(mockRows));
 
@@ -248,7 +259,7 @@ describe('PowerSync Contacts Service', () => {
       service.watchByParent('p1', 'clinic').subscribe({
         next: () => {
           const [sql, params] = powerSyncService.watch.firstCall.args;
-          expect(sql).to.include('type = ?');
+          expect(sql).to.include('contact_type = ?');
           expect(params).to.deep.equal(['p1', 'clinic']);
           done();
         },
@@ -260,12 +271,12 @@ describe('PowerSync Contacts Service', () => {
     it('should handle contact with geolocation', async () => {
       powerSyncService.getContactsByType.resolves([{
         id: 'c1',
-        type: 'person',
+        type: 'contact',
+        contact_type: 'person',
         name: 'Geo Person',
         geolocation: '{"latitude":1.5,"longitude":36.8}',
         parent_id: null,
         parent: null,
-        doc_type: 'person',
       }]);
 
       const result = await service.get(['person']);
@@ -275,12 +286,12 @@ describe('PowerSync Contacts Service', () => {
     it('should handle contact with muted state', async () => {
       powerSyncService.getContactsByType.resolves([{
         id: 'c1',
-        type: 'person',
+        type: 'contact',
+        contact_type: 'person',
         name: 'Muted Person',
         muted: '2026-01-01T00:00:00Z',
         parent_id: null,
         parent: null,
-        doc_type: 'person',
       }]);
 
       const result = await service.get(['person']);
@@ -290,12 +301,12 @@ describe('PowerSync Contacts Service', () => {
     it('should handle contact with contact_id (primary contact for places)', async () => {
       powerSyncService.getContactsByType.resolves([{
         id: 'clinic-1',
-        type: 'clinic',
+        type: 'contact',
+        contact_type: 'clinic',
         name: 'Test Clinic',
         contact_id: 'person-1',
         parent_id: null,
         parent: null,
-        doc_type: 'clinic',
       }]);
 
       const result = await service.get(['clinic']);
@@ -305,11 +316,11 @@ describe('PowerSync Contacts Service', () => {
     it('should handle invalid parent JSON gracefully', async () => {
       powerSyncService.getContactsByType.resolves([{
         id: 'c1',
-        type: 'person',
+        type: 'contact',
+        contact_type: 'person',
         name: 'Bad JSON',
         parent_id: 'p1',
         parent: 'not-valid-json{',
-        doc_type: 'person',
       }]);
 
       const result = await service.get(['person']);
