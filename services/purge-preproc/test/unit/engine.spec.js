@@ -323,8 +323,8 @@ describe('Purge Engine', () => {
 
       queryStub.resolves({
         rows: [
-          { doc_id: 'task1', doc: { _id: 'task1', type: 'task', state: 'Completed' } },
-          { doc_id: 'task2', doc: { _id: 'task2', type: 'task', state: 'Failed' } },
+          { _id: 'task1', doc: { _id: 'task1', type: 'task', state: 'Completed' } },
+          { _id: 'task2', doc: { _id: 'task2', type: 'task', state: 'Failed' } },
         ],
       });
 
@@ -363,8 +363,8 @@ describe('Purge Engine', () => {
 
       queryStub.resolves({
         rows: [
-          { doc_id: 'target~2024-01~owner1~12345' },
-          { doc_id: 'target~2024-03~owner2~67890' },
+          { _id: 'target~2024-01~owner1~12345' },
+          { _id: 'target~2024-03~owner2~67890' },
         ],
       });
 

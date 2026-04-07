@@ -14,11 +14,11 @@ const TARGET_EXPIRATION_MONTHS = 6;
 // Settings doc structure: { _id: 'settings', settings: { purge: { fn: '...' } } }
 // Sentinel loads doc.settings into config, then config.get('purge') returns doc.settings.purge.
 const getPurgeFn = async (db) => {
+  const tbl = `${db.getSchema()}.couchdb`;
   const result = await db.query(`
     SELECT doc->'settings'->'purge'->>'fn' AS fn
-    FROM couchdb
-    WHERE doc_id = 'settings'
-      AND doc->>'_id' = 'settings'
+    FROM ${tbl}
+    WHERE _id = 'settings'
     LIMIT 1
   `);
 
@@ -141,14 +141,15 @@ const processUnallocatedRecords = async (purgeFn, rolesByHash, stats) => {
 // Terminal states: Cancelled, Completed, Failed. Key field: emission.endDate.
 const purgeExpiredTasks = async (rolesByHash, stats) => {
   const db = require('./db');
+  const tbl = `${db.getSchema()}.couchdb`;
   const cutoffDate = new Date(Date.now() - TASK_EXPIRATION_DAYS * 24 * 60 * 60 * 1000)
     .toISOString().slice(0, 10); // YYYY-MM-DD format
 
   const result = await db.query(`
-    SELECT doc_id, doc
-    FROM couchdb
+    SELECT _id
+    FROM ${tbl}
     WHERE doc->>'type' = 'task'
-      AND doc->>'_deleted' IS DISTINCT FROM 'true'
+      AND (_deleted IS NOT TRUE)
       AND doc->>'state' IN ('Cancelled', 'Completed', 'Failed')
       AND doc->'emission'->>'endDate' IS NOT NULL
       AND doc->'emission'->>'endDate' <= $1
@@ -162,7 +163,7 @@ const purgeExpiredTasks = async (rolesByHash, stats) => {
   for (const hash of Object.keys(rolesByHash)) {
     toPurge[hash] = {};
     for (const row of result.rows) {
-      toPurge[hash][row.doc_id] = true;
+      toPurge[hash][row._id] = true;
     }
   }
 
@@ -177,17 +178,18 @@ const purgeExpiredTasks = async (rolesByHash, stats) => {
 // target~YYYY-MM~<owner>~<other>. Targets older than 6 months are purged for all roles.
 const purgeExpiredTargets = async (rolesByHash, stats) => {
   const db = require('./db');
+  const tbl = `${db.getSchema()}.couchdb`;
   const cutoffPeriod = new Date(
     Date.now() - TARGET_EXPIRATION_MONTHS * 30 * 24 * 60 * 60 * 1000
   );
   const cutoffTag = `${cutoffPeriod.getFullYear()}-${String(cutoffPeriod.getMonth() + 1).padStart(2, '0')}`;
 
   const result = await db.query(`
-    SELECT doc_id
-    FROM couchdb
-    WHERE doc_id LIKE 'target~%'
-      AND doc->>'_deleted' IS DISTINCT FROM 'true'
-      AND doc_id < $1
+    SELECT _id
+    FROM ${tbl}
+    WHERE _id LIKE 'target~%'
+      AND (_deleted IS NOT TRUE)
+      AND _id < $1
   `, [`target~${cutoffTag}~`]);
 
   if (!result.rows.length) {
@@ -198,7 +200,7 @@ const purgeExpiredTargets = async (rolesByHash, stats) => {
   for (const hash of Object.keys(rolesByHash)) {
     toPurge[hash] = {};
     for (const row of result.rows) {
-      toPurge[hash][row.doc_id] = true;
+      toPurge[hash][row._id] = true;
     }
   }
 

@@ -17,9 +17,10 @@ const hasOnlineRole = (roles) => {
 // User-settings docs (type: 'user-settings') contain roles arrays.
 // We filter out online-only users since purging only applies to offline users.
 const getRoles = async () => {
+  const tbl = `${db.getSchema()}.couchdb`;
   const result = await db.query(`
     SELECT DISTINCT doc->'roles' AS roles
-    FROM couchdb
+    FROM ${tbl}
     WHERE doc->>'type' = 'user-settings'
       AND doc->'roles' IS NOT NULL
       AND jsonb_array_length(doc->'roles') > 0

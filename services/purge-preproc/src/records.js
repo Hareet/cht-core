@@ -3,6 +3,8 @@
 const db = require('./db');
 const registrationUtils = require('@medic/registration-utils');
 
+const tbl = () => `${db.getSchema()}.couchdb`;
+
 // Given a contact document, extract its subject IDs for matching reports/messages.
 const getSubjectIds = (contact) => {
   return registrationUtils.getSubjectIds(contact);
@@ -12,7 +14,7 @@ const getSubjectIds = (contact) => {
 // Reports are data_records with a form field; messages are data_records without.
 //
 // Subject matching mirrors the getSubject() function in the docs_by_replication_key Nouveau index:
-//   For reports: patient_id → place_id → patient_uuid (fields or top-level) → contact._id
+//   For reports: patient_id → place_id → patient_uuid → contact._id
 //   For SMS incoming: contact._id
 //   For SMS outgoing: tasks[0].messages[0].contact._id
 // We also match contact._id to catch reports with error fallbacks and incoming SMS.
@@ -22,10 +24,10 @@ const getRecordsForSubjects = async (subjectIds) => {
   }
 
   const result = await db.query(`
-    SELECT doc_id, doc
-    FROM couchdb
+    SELECT _id, doc
+    FROM ${tbl()}
     WHERE doc->>'type' = 'data_record'
-      AND doc->>'_deleted' IS DISTINCT FROM 'true'
+      AND (_deleted IS NOT TRUE)
       AND (
         doc->>'patient_id' = ANY($1)
         OR doc->>'place_id' = ANY($1)
@@ -58,13 +60,12 @@ const getRecordsForSubjects = async (subjectIds) => {
 // A record is "unassigned" when getSubject() in the Nouveau index returns falsy.
 // getSubject() checks: patient_id, place_id, patient_uuid (top-level & fields),
 // contact._id (for error fallback reports and SMS messages).
-// A record with contact._id IS assigned (to the contact), so we exclude those too.
 const getUnallocatedRecords = async (limit, offset) => {
   const result = await db.query(`
-    SELECT doc_id, doc
-    FROM couchdb
+    SELECT _id, doc
+    FROM ${tbl()}
     WHERE doc->>'type' = 'data_record'
-      AND doc->>'_deleted' IS DISTINCT FROM 'true'
+      AND (_deleted IS NOT TRUE)
       AND COALESCE(doc->>'patient_id', '') = ''
       AND COALESCE(doc->>'place_id', '') = ''
       AND COALESCE(doc->>'patient_uuid', '') = ''
@@ -74,18 +75,18 @@ const getUnallocatedRecords = async (limit, offset) => {
       AND COALESCE(doc->'fields'->>'patient_uuid', '') = ''
       AND COALESCE(doc->'fields'->>'place_uuid', '') = ''
       AND COALESCE(doc->'contact'->>'_id', '') = ''
-    ORDER BY doc_id
+    ORDER BY _id
     LIMIT $1 OFFSET $2
   `, [limit, offset]);
 
   return result.rows.map(row => ({
-    id: row.doc_id,
+    id: row._id,
     doc: row.doc,
   }));
 };
 
 // Find contacts whose associated reports/messages have changed since a timestamp.
-// Returns contact doc_ids that need re-evaluation.
+// Returns contact _ids that need re-evaluation.
 const getContactIdsWithChangedRecords = async (since) => {
   const result = await db.query(`
     SELECT DISTINCT
@@ -100,9 +101,9 @@ const getContactIdsWithChangedRecords = async (since) => {
         NULLIF(doc->'fields'->>'place_uuid', ''),
         NULLIF(doc->'contact'->>'_id', '')
       ) AS subject_id
-    FROM couchdb
+    FROM ${tbl()}
     WHERE doc->>'type' = 'data_record'
-      AND doc->>'_deleted' IS DISTINCT FROM 'true'
+      AND (_deleted IS NOT TRUE)
       AND saved_timestamp > $1
   `, [since]);
 
@@ -115,24 +116,24 @@ const getContactIdsWithChangedRecords = async (since) => {
   }
 
   // Find contacts that have these subject IDs.
-  // Match by doc_id (contact._id), patient_id, or place_id — the fields in
+  // Match by _id (contact._id), patient_id, or place_id — the fields in
   // registrationUtils CONTACT_SUBJECT_PROPERTIES: ['_id', 'patient_id', 'place_id'].
   const contactResult = await db.query(`
-    SELECT doc_id
-    FROM couchdb
+    SELECT _id
+    FROM ${tbl()}
     WHERE (
       doc->>'type' IN ('district_hospital', 'health_center', 'clinic', 'person')
       OR (doc->>'type' = 'contact' AND doc->>'contact_type' IS NOT NULL)
     )
-    AND doc->>'_deleted' IS DISTINCT FROM 'true'
+    AND (_deleted IS NOT TRUE)
     AND (
-      doc_id = ANY($1)
+      _id = ANY($1)
       OR doc->>'patient_id' = ANY($1)
       OR doc->>'place_id' = ANY($1)
     )
   `, [subjectIds]);
 
-  return contactResult.rows.map(row => row.doc_id);
+  return contactResult.rows.map(row => row._id);
 };
 
 module.exports = {
