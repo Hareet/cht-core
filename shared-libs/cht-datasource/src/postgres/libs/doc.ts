@@ -83,7 +83,10 @@ export const getDocIdsByIdRange = (ctx: PostgresDataContext) => async (
 
 /**
  * Queries documents by contact type, replicating the `medic-client/contacts_by_type` CouchDB view.
- * The view emits [type] as key with ordering: dead, muted, type index, lowercase name.
+ *
+ * CouchDB view sorting: rows with the same key are sorted by document `_id`, NOT by the
+ * emitted value. The view emits `[type]` as key and an order string as value, but the value
+ * is informational only. Verified against live CouchDB 3.5.0.
  * @internal
  */
 export const queryDocsByType = (ctx: PostgresDataContext) => async (
@@ -95,10 +98,7 @@ export const queryDocsByType = (ctx: PostgresDataContext) => async (
     `SELECT doc FROM ${ctx.qualifiedTable}
      WHERE COALESCE(doc->>'contact_type', doc->>'type') = $1
        AND (_deleted IS NULL OR _deleted = false)
-     ORDER BY
-       (doc->>'date_of_death' IS NOT NULL),
-       (doc->>'muted' IS NOT NULL),
-       LOWER(doc->>'name')
+     ORDER BY _id
      LIMIT $2 OFFSET $3`,
     [contactType, limit, skip]
   );
@@ -118,10 +118,7 @@ export const queryDocIdsByType = (ctx: PostgresDataContext) => async (
     `SELECT _id FROM ${ctx.qualifiedTable}
      WHERE COALESCE(doc->>'contact_type', doc->>'type') = $1
        AND (_deleted IS NULL OR _deleted = false)
-     ORDER BY
-       (doc->>'date_of_death' IS NOT NULL),
-       (doc->>'muted' IS NOT NULL),
-       LOWER(doc->>'name')
+     ORDER BY _id
      LIMIT $2 OFFSET $3`,
     [contactType, limit, skip]
   );
