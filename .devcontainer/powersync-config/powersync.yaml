@@ -7,18 +7,16 @@ replication:
     - type: postgresql
       uri: !env PS_DATABASE_URI
       sslmode: disable  # Local Docker network only
-      # Publication created by setup.sql
-      # Includes: v1.couchdb, v1.user_settings,
-      #           v1.user_accessible_facilities, v1.purge_status
 
 # Bucket storage: use the same PostgreSQL instance (separate schema)
 # PowerSync auto-creates the 'powersync' schema on first start.
+# Requires Postgres 14+ when using same server as source DB.
 storage:
   type: postgresql
   uri: !env PS_DATABASE_URI
   sslmode: disable
 
-# API port (matches docker-compose.powersync.yml port mapping)
+# API port
 port: 8080
 
 # Sync Streams configuration (separate file for maintainability)
@@ -26,8 +24,6 @@ sync_config:
   path: sync-config.yaml
 
 # Client authentication via JWT
-# For development: static JWKS with a test RSA key pair.
-# For production: replace with JWKS URI from your auth service.
 client_auth:
   jwks:
     keys:
@@ -37,15 +33,13 @@ client_auth:
         alg: RS256
         kid: cht-dev-key-1
         use: sig
-  # Audience claim must match what the token generator produces
   audience:
     - cht-powersync-dev
+  # Telemetry must be nested under client_auth per the config schema
+  telemetry:
+    disable_telemetry_sharing: true
 
-# Telemetry (opt out for local development)
-telemetry:
-  disable_telemetry_sharing: true
-
-# Logging
+# System-level configuration
 system:
   logging:
     level: info
