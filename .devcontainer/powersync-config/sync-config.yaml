@@ -67,22 +67,18 @@ streams:
     auto_subscribe: true
     priority: 2
     with:
-      report_depth_facilities: |
+      # Pre-computed report_depth-filtered facilities (simple auth.user_id() lookup)
+      # PowerSync only allows = comparisons with auth params, so depth filtering
+      # is done in PostgreSQL by refresh_user_facilities() -> user_report_facilities
+      report_facilities: |
         SELECT facility_id
-        FROM "v1"."user_accessible_facilities"
+        FROM "v1"."user_report_facilities"
         WHERE user_id = auth.user_id()
-          AND (depth <= CAST(auth.parameter('report_depth') AS integer)
-               OR CAST(auth.parameter('report_depth') AS integer) < 0)
     query: |
       SELECT
         c._id AS id,
         c.doc ->> 'form' AS form,
-        ifnull(c.doc ->> 'patient_id',
-          ifnull(c.doc -> 'fields' ->> 'patient_id',
-            ifnull(c.doc ->> 'place_id',
-              ifnull(c.doc -> 'fields' ->> 'place_id',
-                ifnull(c.doc -> 'fields' ->> 'patient_uuid',
-                  c.doc -> 'contact' ->> '_id'))))) AS subject_id,
+        c.doc ->> 'patient_id' AS patient_id,
         c.doc -> 'contact' ->> '_id' AS submitter_id,
         c.doc ->> 'reported_date' AS reported_date,
         c.doc -> 'fields' ->> 'private' AS is_private,
@@ -94,14 +90,15 @@ streams:
         AND c.doc ->> 'type' = 'data_record'
         AND c.doc ->> 'form' IS NOT NULL
         AND (
-          -- Case 1: Subject within user's report_depth
-          ifnull(c.doc ->> 'patient_id',
-            ifnull(c.doc -> 'fields' ->> 'patient_id',
-              ifnull(c.doc ->> 'place_id',
-                ifnull(c.doc -> 'fields' ->> 'place_id',
-                  ifnull(c.doc -> 'fields' ->> 'patient_uuid',
-                    c.doc -> 'contact' ->> '_id'))))) IN report_depth_facilities
-          -- Case 2: needs_signoff=true — replicate UP via ancestor chain
+          -- Subject matching: each possible subject field checked separately
+          -- (PowerSync requires simple column IN cte, no complex expressions)
+          c.doc ->> 'patient_id' IN report_facilities
+          OR c.doc -> 'fields' ->> 'patient_id' IN report_facilities
+          OR c.doc ->> 'place_id' IN report_facilities
+          OR c.doc -> 'fields' ->> 'place_id' IN report_facilities
+          OR c.doc -> 'fields' ->> 'patient_uuid' IN report_facilities
+          OR c.doc -> 'contact' ->> '_id' IN report_facilities
+          -- needs_signoff=true — replicate UP via submitter ancestor chain
           OR (
             c.doc -> 'fields' ->> 'needs_signoff' = 'true'
             AND (

@@ -46,6 +46,22 @@ CREATE INDEX IF NOT EXISTS idx_uaf_facility
   ON v1.user_accessible_facilities(facility_id);
 
 -- ============================================================
+-- 2b. User Report Facilities
+-- Subset of user_accessible_facilities filtered by report_depth.
+-- Reports from OTHER users are only synced for contacts within
+-- this set. The user's OWN reports always sync (handled in the
+-- Sync Stream query with a submitter = auth check).
+-- ============================================================
+CREATE TABLE IF NOT EXISTS v1.user_report_facilities (
+  user_id     TEXT NOT NULL,
+  facility_id TEXT NOT NULL,
+  PRIMARY KEY (user_id, facility_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_urf_facility
+  ON v1.user_report_facilities(facility_id);
+
+-- ============================================================
 -- 3. Purge Status
 -- Tracks which documents should be excluded from sync per role.
 -- Populated by the purge preprocessing service (Agent 4).
@@ -205,6 +221,20 @@ BEGIN
     VALUES (p_user_id, v_contact_id, 0)
     ON CONFLICT (user_id, facility_id) DO NOTHING;
   END IF;
+
+  -- Step 5: Populate user_report_facilities (report_depth-filtered subset)
+  -- PowerSync only allows = comparisons with auth parameters, so we
+  -- pre-compute the depth filter here instead of in the Sync Stream CTE.
+  DELETE FROM v1.user_report_facilities WHERE user_id = p_user_id;
+
+  INSERT INTO v1.user_report_facilities (user_id, facility_id)
+  SELECT p_user_id, facility_id
+  FROM v1.user_accessible_facilities
+  WHERE user_id = p_user_id
+    AND (
+      depth <= (SELECT report_depth FROM v1.user_settings WHERE user_id = p_user_id)
+      OR (SELECT report_depth FROM v1.user_settings WHERE user_id = p_user_id) < 0
+    );
 END;
 $$;
 
@@ -234,6 +264,7 @@ CREATE PUBLICATION powersync_pub FOR TABLE
   v1.couchdb,
   v1.user_settings,
   v1.user_accessible_facilities,
+  v1.user_report_facilities,
   v1.purge_status;
 
 -- ============================================================
