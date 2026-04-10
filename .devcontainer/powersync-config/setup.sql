@@ -259,8 +259,8 @@ $$;
 -- PowerSync reads changes via the PostgreSQL WAL.
 -- All tables referenced in Sync Streams must be published.
 -- ============================================================
-DROP PUBLICATION IF EXISTS powersync_pub;
-CREATE PUBLICATION powersync_pub FOR TABLE
+DROP PUBLICATION IF EXISTS powersync;
+CREATE PUBLICATION powersync FOR TABLE
   v1.couchdb,
   v1.user_settings,
   v1.user_accessible_facilities,
