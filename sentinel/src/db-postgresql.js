@@ -525,6 +525,7 @@ const createSentinelDb = () => {
   // For now, use a dedicated table in the sentinel schema
   // that mirrors the couchdb table structure for sentinel docs
   const ensureSentinelTable = async () => {
+    await pool.query('CREATE SCHEMA IF NOT EXISTS sentinel');
     await pool.query(`
       CREATE TABLE IF NOT EXISTS sentinel.docs (
         _id TEXT PRIMARY KEY,

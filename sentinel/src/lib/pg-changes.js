@@ -144,6 +144,7 @@ class PgChangesFeed extends EventEmitter {
     this._debounceTimer = null;
     this._running = false;
     this._polling = false;
+    this._pendingPoll = false;
   }
 
   /**
@@ -224,10 +225,18 @@ class PgChangesFeed extends EventEmitter {
   }
 
   async _poll() {
-    if (!this._running || this._polling) {
+    if (!this._running) {
+      return;
+    }
+    if (this._polling) {
+      // A poll is already in progress. Flag that another poll is needed so
+      // changes arriving between the current query and its completion are
+      // not delayed until the next scheduled fallback poll.
+      this._pendingPoll = true;
       return;
     }
     this._polling = true;
+    this._pendingPoll = false;
 
     try {
       const { timestamp, id } = PgChangesFeed.parseCursor(this._since);
@@ -288,6 +297,13 @@ class PgChangesFeed extends EventEmitter {
       this.emit('error', err);
     } finally {
       this._polling = false;
+      if (this._pendingPoll && this._running) {
+        this._pendingPoll = false;
+        // Re-poll immediately for notifications received during the previous poll
+        this._poll().catch(err => {
+          logger.error('pg-changes: Pending re-poll error: %o', err);
+        });
+      }
     }
   }
 
@@ -329,7 +345,30 @@ class PgChangesFeed extends EventEmitter {
  */
 const metadataPool = new Pool(getConnectionConfig());
 
+let metadataInitialized = false;
+
+const ensureMetadataTable = async () => {
+  if (metadataInitialized) {
+    return;
+  }
+  const client = await metadataPool.connect();
+  try {
+    await client.query('CREATE SCHEMA IF NOT EXISTS sentinel');
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS sentinel.metadata (
+        key TEXT PRIMARY KEY,
+        value TEXT,
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `);
+    metadataInitialized = true;
+  } finally {
+    client.release();
+  }
+};
+
 const getMetadataValue = async (key, defaultValue) => {
+  await ensureMetadataTable();
   const client = await metadataPool.connect();
   try {
     const res = await client.query(
@@ -343,6 +382,7 @@ const getMetadataValue = async (key, defaultValue) => {
 };
 
 const setMetadataValue = async (key, value) => {
+  await ensureMetadataTable();
   const client = await metadataPool.connect();
   try {
     await client.query(
@@ -368,4 +408,5 @@ module.exports = {
   // For testing
   _getConnectionConfig: getConnectionConfig,
   _metadataPool: metadataPool,
+  _resetMetadataInit: () => { metadataInitialized = false; },
 };

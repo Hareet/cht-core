@@ -282,6 +282,114 @@ const testMetadata = async () => {
   }
 };
 
+// ─── Test: Pending poll — notifications during active poll are not lost ──
+const testPendingPoll = async () => {
+  console.log('\n--- Pending Poll (notification during active poll) ---');
+
+  // Start a live feed from "now" with a VERY long scheduled poll interval.
+  // This ensures the only way doc B gets detected within 3s is via the
+  // _pendingPoll re-poll mechanism, not the scheduled fallback poll.
+  const feed = new PgChangesFeed({
+    live: true,
+    since: PgChangesFeed.buildCursor(new Date().toISOString(), '\uffff'),
+    batchSize: 100,
+    pollInterval: 120000, // 2 minutes — effectively disabled
+  });
+
+  const changes = [];
+  feed.on('change', c => changes.push(c));
+  await feed.start();
+  await sleep(500);
+
+  // Insert doc A — triggers NOTIFY → debounce → poll
+  const idA = `test:pending-a:${Date.now()}`;
+  await insertTestDoc(idA, 'data_record');
+
+  // Wait just long enough for the debounce to fire and poll to start,
+  // then insert doc B while the poll may still be in progress.
+  // Even if the poll completes before doc B's insert, the debounce for
+  // doc B's NOTIFY will trigger a fresh poll.
+  await sleep(150);
+  const idB = `test:pending-b:${Date.now()}`;
+  await insertTestDoc(idB, 'data_record');
+
+  // Wait for notification + debounce + pending re-poll to complete
+  await sleep(2000);
+  feed.cancel();
+
+  const foundA = changes.some(c => c.id === idA);
+  const foundB = changes.some(c => c.id === idB);
+
+  if (foundA && foundB) {
+    pass(`Both docs detected (${changes.length} total changes)`);
+  } else {
+    fail('pending poll', `foundA=${foundA} foundB=${foundB}, total changes=${changes.length}`);
+  }
+};
+
+// ─── Test: Rapid-fire inserts all detected via NOTIFY ─────────────────
+const testRapidFireNotifications = async () => {
+  console.log('\n--- Rapid-Fire Notifications ---');
+
+  const feed = new PgChangesFeed({
+    live: true,
+    since: PgChangesFeed.buildCursor(new Date().toISOString(), '\uffff'),
+    batchSize: 100,
+    pollInterval: 120000, // effectively disabled
+  });
+
+  const changes = [];
+  feed.on('change', c => changes.push(c));
+  await feed.start();
+  await sleep(500);
+
+  // Insert 5 docs in rapid succession (no sleep between inserts)
+  const ids = [];
+  for (let i = 0; i < 5; i++) {
+    const id = `test:rapid:${i}:${Date.now()}`;
+    ids.push(id);
+    await insertTestDoc(id, 'data_record');
+  }
+
+  // Wait for all notifications to be processed
+  await sleep(3000);
+  feed.cancel();
+
+  const found = ids.filter(id => changes.some(c => c.id === id));
+  if (found.length === 5) {
+    pass(`All 5 rapid-fire docs detected`);
+  } else {
+    fail('rapid-fire', `only ${found.length}/5 detected: missing ${ids.filter(id => !found.includes(id)).join(', ')}`);
+  }
+};
+
+// ─── Test: Metadata auto-creates sentinel schema and table ────────────
+const testMetadataAutoInit = async () => {
+  console.log('\n--- Metadata Auto-Initialization ---');
+  const pgChanges = require('../../src/lib/pg-changes');
+
+  // Reset the initialization flag to force re-creation
+  pgChanges._resetMetadataInit();
+
+  // Verify the table still works after reset (idempotent creation)
+  const testKey = `test_auto_init_${Date.now()}`;
+  await pgChanges.setTransitionSeq(testKey);
+  const val = await pgChanges.getTransitionSeq();
+  if (val === testKey) {
+    pass('Metadata auto-init is idempotent — works after reset');
+  } else {
+    fail('metadata auto-init', `expected "${testKey}", got "${val}"`);
+  }
+
+  // Clean up
+  const client = await pool.connect();
+  try {
+    await client.query("DELETE FROM sentinel.metadata WHERE key = 'transition_seq'");
+  } finally {
+    client.release();
+  }
+};
+
 // ─── Main ──────────────────────────────────────────────────────────────
 const run = async () => {
   console.log('PostgreSQL Changes Detection — Integration Tests\n');
@@ -307,6 +415,9 @@ const run = async () => {
     await testListenNotify();
     await testDeletedDetection();
     await testMetadata();
+    await testPendingPoll();
+    await testRapidFireNotifications();
+    await testMetadataAutoInit();
   } finally {
     await cleanup();
     await pool.end();
