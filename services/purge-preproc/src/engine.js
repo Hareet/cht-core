@@ -1,5 +1,6 @@
 'use strict';
 
+const crypto = require('crypto');
 const contacts = require('./contacts');
 const records = require('./records');
 const purgeStatus = require('./purge-status');
@@ -9,6 +10,11 @@ const CONTACT_BATCH_SIZE = parseInt(process.env.PURGE_CONTACT_BATCH_SIZE || '500
 const MAX_RECORDS_PER_CONTACT = parseInt(process.env.PURGE_MAX_RECORDS || '20000', 10);
 const TASK_EXPIRATION_DAYS = 60;
 const TARGET_EXPIRATION_MONTHS = 6;
+
+// Compute a hash of the purge function source for change detection.
+const hashPurgeFn = (fn) => {
+  return crypto.createHash('sha256').update(fn.toString()).digest('hex');
+};
 
 // Parse the purge function from app_settings config stored in PostgreSQL.
 // Settings doc structure: { _id: 'settings', settings: { purge: { fn: '...' } } }
@@ -213,7 +219,7 @@ const purgeExpiredTargets = async (rolesByHash, stats) => {
 // Full purge evaluation run.
 const run = async (options = {}) => {
   const db = require('./db');
-  const incremental = options.incremental !== false;
+  let incremental = options.incremental !== false;
 
   const purgeFn = await getPurgeFn(db);
   if (!purgeFn) {
@@ -221,10 +227,24 @@ const run = async (options = {}) => {
     return;
   }
 
+  const currentFnHash = hashPurgeFn(purgeFn);
+
   const rolesByHash = await rolesService.getRoles();
   if (!Object.keys(rolesByHash).length) {
     console.log('No offline roles found. Skipping.');
     return;
+  }
+
+  // Detect purge function changes: if the function source has changed since
+  // the last completed run, force a full re-evaluation. Incremental mode would
+  // only process recently-changed documents, leaving all other documents with
+  // stale purge decisions from the old function.
+  if (incremental) {
+    const lastFnHash = await purgeStatus.getLastPurgeFnHash();
+    if (lastFnHash && lastFnHash !== currentFnHash) {
+      console.log('Purge function changed since last run. Forcing full re-evaluation.');
+      incremental = false;
+    }
   }
 
   await rolesService.saveRoles(rolesByHash);
@@ -236,6 +256,7 @@ const run = async (options = {}) => {
     docsPurged: 0,
     docsUnpurged: 0,
     skippedContacts: [],
+    purgeFnHash: currentFnHash,
   };
 
   try {
@@ -343,4 +364,5 @@ module.exports = {
   _processUnallocatedRecords: processUnallocatedRecords,
   _purgeExpiredTasks: purgeExpiredTasks,
   _purgeExpiredTargets: purgeExpiredTargets,
+  _hashPurgeFn: hashPurgeFn,
 };

@@ -59,6 +59,20 @@ const getLastRunTimestamp = async () => {
   return result.rows.length ? result.rows[0].completed_at : null;
 };
 
+// Get the purge function hash from the last completed run.
+// Used to detect when purge.js changes between runs, forcing a full re-evaluation.
+const getLastPurgeFnHash = async () => {
+  const result = await db.query(`
+    SELECT purge_fn_hash
+    FROM purge_run_log
+    WHERE status = 'completed'
+    ORDER BY completed_at DESC
+    LIMIT 1
+  `);
+
+  return result.rows.length ? result.rows[0].purge_fn_hash : null;
+};
+
 // Create a new run log entry.
 const startRunLog = async () => {
   const result = await db.query(`
@@ -79,7 +93,8 @@ const completeRunLog = async (runId, stats) => {
       docs_evaluated = $3,
       docs_purged = $4,
       docs_unpurged = $5,
-      skipped_contacts = $6::jsonb
+      skipped_contacts = $6::jsonb,
+      purge_fn_hash = $7
     WHERE id = $1
   `, [
     runId,
@@ -88,6 +103,7 @@ const completeRunLog = async (runId, stats) => {
     stats.docsPurged,
     stats.docsUnpurged,
     JSON.stringify(stats.skippedContacts || []),
+    stats.purgeFnHash || null,
   ]);
 };
 
@@ -128,6 +144,7 @@ const failRunLog = async (runId, error) => {
 module.exports = {
   writePurgeResults,
   getLastRunTimestamp,
+  getLastPurgeFnHash,
   startRunLog,
   completeRunLog,
   failRunLog,

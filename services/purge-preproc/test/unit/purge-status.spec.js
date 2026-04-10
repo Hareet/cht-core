@@ -56,6 +56,26 @@ describe('Purge Status', () => {
     });
   });
 
+  describe('getLastPurgeFnHash', () => {
+    it('should return null when no completed runs', async () => {
+      sinon.stub(db, 'query').resolves({ rows: [] });
+      const result = await purgeStatus.getLastPurgeFnHash();
+      expect(result).to.be.null;
+    });
+
+    it('should return the hash from the latest completed run', async () => {
+      sinon.stub(db, 'query').resolves({ rows: [{ purge_fn_hash: 'abc123' }] });
+      const result = await purgeStatus.getLastPurgeFnHash();
+      expect(result).to.equal('abc123');
+    });
+
+    it('should return null when last run had no hash stored', async () => {
+      sinon.stub(db, 'query').resolves({ rows: [{ purge_fn_hash: null }] });
+      const result = await purgeStatus.getLastPurgeFnHash();
+      expect(result).to.be.null;
+    });
+  });
+
   describe('startRunLog', () => {
     it('should create a run log entry and return id', async () => {
       sinon.stub(db, 'query').resolves({ rows: [{ id: 42 }] });
@@ -65,7 +85,7 @@ describe('Purge Status', () => {
   });
 
   describe('completeRunLog', () => {
-    it('should update run log with stats', async () => {
+    it('should update run log with stats and purge function hash', async () => {
       const queryStub = sinon.stub(db, 'query').resolves();
 
       await purgeStatus.completeRunLog(1, {
@@ -74,15 +94,33 @@ describe('Purge Status', () => {
         docsPurged: 200,
         docsUnpurged: 4800,
         skippedContacts: ['c1'],
+        purgeFnHash: 'abc123hash',
       });
 
       expect(queryStub.calledOnce).to.be.true;
-      const params = queryStub.args[0][1];
+      const [sql, params] = queryStub.args[0];
+      expect(sql).to.include('purge_fn_hash');
       expect(params[0]).to.equal(1);
       expect(params[1]).to.equal(100);
       expect(params[2]).to.equal(5000);
       expect(params[3]).to.equal(200);
       expect(params[4]).to.equal(4800);
+      expect(params[6]).to.equal('abc123hash');
+    });
+
+    it('should store null hash when not provided', async () => {
+      const queryStub = sinon.stub(db, 'query').resolves();
+
+      await purgeStatus.completeRunLog(1, {
+        contactsProcessed: 0,
+        docsEvaluated: 0,
+        docsPurged: 0,
+        docsUnpurged: 0,
+        skippedContacts: [],
+      });
+
+      const params = queryStub.args[0][1];
+      expect(params[6]).to.be.null;
     });
   });
 
