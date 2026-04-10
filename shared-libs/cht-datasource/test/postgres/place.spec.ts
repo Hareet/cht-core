@@ -559,7 +559,58 @@ describe('postgres place', () => {
         expect(updateDocInner.notCalled).to.be.true;
       });
 
+      it('throws an error when parent lineage _id changes', async () => {
+        const updatedPlace = {
+          ...originalDoc,
+          parent: { _id: 'different-parent' }
+        };
+        const originalWithParent = {
+          ...originalDoc,
+          parent: { _id: 'original-parent' }
+        };
+        getDocsByIdsInner.resolves([originalWithParent]);
+
+        await expect(Place.v1.update(ctx)(updatedPlace))
+          .to.be.rejectedWith(InvalidArgumentError, 'Parent lineage does not match.');
+
+        expect(updateDocInner.notCalled).to.be.true;
+      });
+
+      it('throws an error when parent is removed', async () => {
+        const updatedPlace = {
+          ...originalDoc,
+          parent: undefined
+        };
+        const originalWithParent = {
+          ...originalDoc,
+          parent: { _id: 'original-parent' }
+        };
+        getDocsByIdsInner.resolves([originalWithParent]);
+
+        await expect(Place.v1.update(ctx)(updatedPlace))
+          .to.be.rejectedWith(InvalidArgumentError, 'Parent lineage does not match.');
+
+        expect(updateDocInner.notCalled).to.be.true;
+      });
+
+      it('throws an error when parent is added to a doc that had none', async () => {
+        const updatedPlace = {
+          ...originalDoc,
+          parent: { _id: 'new-parent' }
+        };
+        getDocsByIdsInner.resolves([originalDoc]);
+
+        await expect(Place.v1.update(ctx)(updatedPlace))
+          .to.be.rejectedWith(InvalidArgumentError, 'Parent lineage does not match.');
+
+        expect(updateDocInner.notCalled).to.be.true;
+      });
+
       it('minifies hydrated parent and contact lineage before storing', async () => {
+        const originalWithParent = {
+          ...originalDoc,
+          parent: { _id: 'district-1' },
+        };
         const updatedPlace = {
           ...originalDoc,
           name: 'Updated HC',
@@ -580,7 +631,7 @@ describe('postgres place', () => {
             }
           }
         };
-        getDocsByIdsInner.resolves([originalDoc]);
+        getDocsByIdsInner.resolves([originalWithParent]);
         updateDocInner.resolves({ ...updatedPlace, _rev: '2-pg456' });
 
         const result = await Place.v1.update(ctx)(updatedPlace);

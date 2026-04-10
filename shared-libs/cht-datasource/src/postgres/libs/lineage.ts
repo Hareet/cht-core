@@ -8,6 +8,7 @@ import {
   isIdentifiable,
   isNonEmptyArray,
   isNotNull,
+  isRecord,
   NonEmptyArray,
   NormalizedParent,
   Nullable
@@ -15,7 +16,36 @@ import {
 import { Doc, isDoc } from '../../libs/doc';
 import { getDocsByIds } from './doc';
 import logger from '@medic/logger';
+import { InvalidArgumentError } from '../../libs/error';
 import { PostgresDataContext } from './data-context';
+
+/**
+ * Recursively compares two parent lineage chains by `_id` at each level.
+ * Returns true if the chains are structurally identical (same `_id` at each depth).
+ * Replicates `isSameLineage` from local/libs/lineage.ts.
+ * @internal
+ */
+const isSameLineage = (a: unknown, b: unknown): boolean => {
+  if (!isRecord(a) || !isRecord(b)) {
+    return a === b;
+  }
+  if (a._id !== b._id) {
+    return false;
+  }
+  return isSameLineage(a.parent, b.parent);
+};
+
+/**
+ * Asserts that two documents share the same parent lineage chain.
+ * Throws InvalidArgumentError if any `_id` in the parent chain differs.
+ * Replicates `assertSameParentLineage` from local/libs/lineage.ts.
+ * @internal
+ */
+export const assertSameParentLineage = (a: DataObject, b: DataObject): void => {
+  if (!isSameLineage(a.parent, b.parent)) {
+    throw new InvalidArgumentError('Parent lineage does not match.');
+  }
+};
 
 /**
  * Returns the identified document along with the parent documents recorded for its lineage.

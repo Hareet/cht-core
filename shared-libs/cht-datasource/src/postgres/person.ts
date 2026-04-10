@@ -9,7 +9,7 @@ import { PostgresDataContext } from './libs/data-context';
 import { SettingsService } from '../local/libs/data-context';
 import logger from '@medic/logger';
 import { InvalidArgumentError, ResourceNotFoundError } from '../libs/error';
-import { fetchHydratedDoc } from './libs/lineage';
+import { assertSameParentLineage, fetchHydratedDoc } from './libs/lineage';
 import * as Input from '../input';
 
 const validateCursor = (cursor: Nullable<string>): number => {
@@ -151,6 +151,7 @@ export namespace v1 {
       if (originalPerson.name) {
         assertHasRequiredField(updatedPerson, { name: 'name', type: 'string' }, InvalidArgumentError);
       }
+      assertSameParentLineage(originalPerson, updatedPerson);
 
       const minified = minifyDoc(updatedPerson);
       const { _rev } = await updatePgDoc(minified);

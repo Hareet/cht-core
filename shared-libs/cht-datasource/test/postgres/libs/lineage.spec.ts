@@ -3,6 +3,7 @@ import logger from '@medic/logger';
 import { expect } from 'chai';
 import * as PgDoc from '../../../src/postgres/libs/doc';
 import {
+  assertSameParentLineage,
   getLineageDocsById,
   getPrimaryContactIds,
   hydratePrimaryContact,
@@ -14,6 +15,7 @@ import {
   getPlaceId,
   hydrateReportSubjects,
 } from '../../../src/postgres/libs/lineage';
+import { InvalidArgumentError } from '../../../src/libs/error';
 import { PostgresDataContext, DatabasePool } from '../../../src/postgres/libs/data-context';
 import { Doc } from '../../../src/libs/doc';
 import { NonEmptyArray, Nullable } from '../../../src/libs/core';
@@ -35,6 +37,60 @@ describe('postgres lineage lib', () => {
   });
 
   afterEach(() => sinon.restore());
+
+  describe('assertSameParentLineage', () => {
+    it('passes when both docs have no parent', () => {
+      const a = { _id: 'a' };
+      const b = { _id: 'b' };
+      expect(() => assertSameParentLineage(a, b)).to.not.throw();
+    });
+
+    it('passes when both docs have identical single-level parent', () => {
+      const a = { _id: 'a', parent: { _id: 'p1' } };
+      const b = { _id: 'b', parent: { _id: 'p1' } };
+      expect(() => assertSameParentLineage(a, b)).to.not.throw();
+    });
+
+    it('passes when both docs have identical multi-level parent chain', () => {
+      const a = { _id: 'a', parent: { _id: 'p1', parent: { _id: 'p2', parent: { _id: 'p3' } } } };
+      const b = { _id: 'b', parent: { _id: 'p1', parent: { _id: 'p2', parent: { _id: 'p3' } } } };
+      expect(() => assertSameParentLineage(a, b)).to.not.throw();
+    });
+
+    it('throws when parent _id differs', () => {
+      const a = { _id: 'a', parent: { _id: 'p1' } };
+      const b = { _id: 'b', parent: { _id: 'different' } };
+      expect(() => assertSameParentLineage(a, b))
+        .to.throw(InvalidArgumentError, 'Parent lineage does not match.');
+    });
+
+    it('throws when one doc has a parent and the other does not', () => {
+      const a = { _id: 'a', parent: { _id: 'p1' } };
+      const b = { _id: 'b' };
+      expect(() => assertSameParentLineage(a, b))
+        .to.throw(InvalidArgumentError, 'Parent lineage does not match.');
+    });
+
+    it('throws when grandparent _id differs', () => {
+      const a = { _id: 'a', parent: { _id: 'p1', parent: { _id: 'gp1' } } };
+      const b = { _id: 'b', parent: { _id: 'p1', parent: { _id: 'different' } } };
+      expect(() => assertSameParentLineage(a, b))
+        .to.throw(InvalidArgumentError, 'Parent lineage does not match.');
+    });
+
+    it('throws when lineage depth differs', () => {
+      const a = { _id: 'a', parent: { _id: 'p1', parent: { _id: 'gp1' } } };
+      const b = { _id: 'b', parent: { _id: 'p1' } };
+      expect(() => assertSameParentLineage(a, b))
+        .to.throw(InvalidArgumentError, 'Parent lineage does not match.');
+    });
+
+    it('passes when both parents are hydrated with same _id chain', () => {
+      const a = { _id: 'a', parent: { _id: 'p1', name: 'Parent', type: 'clinic' } };
+      const b = { _id: 'b', parent: { _id: 'p1', name: 'Different Name', type: 'health_center' } };
+      expect(() => assertSameParentLineage(a, b)).to.not.throw();
+    });
+  });
 
   describe('getLineageDocsById', () => {
     it('returns lineage docs ordered by depth', async () => {

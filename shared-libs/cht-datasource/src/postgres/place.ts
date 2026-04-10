@@ -8,7 +8,7 @@ import { PostgresDataContext } from './libs/data-context';
 import { SettingsService } from '../local/libs/data-context';
 import logger from '@medic/logger';
 import { InvalidArgumentError, ResourceNotFoundError } from '../libs/error';
-import { fetchHydratedDoc } from './libs/lineage';
+import { assertSameParentLineage, fetchHydratedDoc } from './libs/lineage';
 import * as Input from '../input';
 import * as LocalContact from './contact';
 
@@ -159,6 +159,7 @@ export namespace v1 {
       if (originalPlace.name !== updatedPlace.name) {
         assertHasRequiredField(updatedPlace, { name: 'name', type: 'string' }, InvalidArgumentError);
       }
+      assertSameParentLineage(originalPlace, updatedPlace);
 
       const minified = minifyDoc(updatedPlace as unknown as Doc);
       const { _rev } = await updatePgDoc(minified);
