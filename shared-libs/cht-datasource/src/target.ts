@@ -12,6 +12,7 @@ import {
   IdQualifier
 } from './qualifier';
 import * as Local from './local';
+import * as Postgres from './postgres';
 import * as Remote from './remote';
 import { InvalidArgumentError } from './libs/error';
 import { DEFAULT_DOCS_PAGE_LIMIT } from './libs/constants';
@@ -82,7 +83,7 @@ export namespace v1 {
     context: DataContext
   ): typeof curredFn => {
     assertDataContext(context);
-    const fn = adapt(context, Local.Target.v1.get, Remote.Target.v1.get);
+    const fn = adapt(context, Local.Target.v1.get, Remote.Target.v1.get, Postgres.Target.v1.get);
 
     /**
      * Returns the target identified by the given qualifier.
@@ -108,7 +109,7 @@ export namespace v1 {
    */
   export const getPage = (context: DataContext): typeof curriedFn => {
     assertDataContext(context);
-    const fn = adapt(context, Local.Target.v1.getPage, Remote.Target.v1.getPage);
+    const fn = adapt(context, Local.Target.v1.getPage, Remote.Target.v1.getPage, Postgres.Target.v1.getPage);
 
     /**
      * Returns an array of targets for the provided page specifications.

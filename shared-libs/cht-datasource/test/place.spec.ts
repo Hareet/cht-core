@@ -1,5 +1,6 @@
 import * as Place from '../src/place';
 import * as Local from '../src/local';
+import * as Postgres from '../src/postgres';
 import * as Remote from '../src/remote';
 import * as Qualifier from '../src/qualifier';
 import * as Input from '../src/input';
@@ -45,7 +46,7 @@ describe('place', () => {
 
         expect(result).to.equal(place);
         expect(assertDataContext.calledOnceWithExactly(dataContext)).to.be.true;
-        expect(adapt.calledOnceWithExactly(dataContext, Local.Place.v1.get, Remote.Place.v1.get)).to.be.true;
+        expect(adapt.calledOnceWithExactly(dataContext, Local.Place.v1.get, Remote.Place.v1.get, Postgres.Place.v1.get)).to.be.true;
         expect(isUuidQualifier.calledOnceWithExactly(qualifier)).to.be.true;
         expect(getPlace.calledOnceWithExactly(qualifier)).to.be.true;
       });
@@ -57,7 +58,7 @@ describe('place', () => {
           .to.be.rejectedWith(`Invalid identifier [${JSON.stringify(qualifier)}].`);
 
         expect(assertDataContext.calledOnceWithExactly(dataContext)).to.be.true;
-        expect(adapt.calledOnceWithExactly(dataContext, Local.Place.v1.get, Remote.Place.v1.get)).to.be.true;
+        expect(adapt.calledOnceWithExactly(dataContext, Local.Place.v1.get, Remote.Place.v1.get, Postgres.Place.v1.get)).to.be.true;
         expect(isUuidQualifier.calledOnceWithExactly(qualifier)).to.be.true;
         expect(getPlace.notCalled).to.be.true;
       });
@@ -95,7 +96,8 @@ describe('place', () => {
         expect(adapt.calledOnceWithExactly(
           dataContext,
           Local.Place.v1.getWithLineage,
-          Remote.Place.v1.getWithLineage
+          Remote.Place.v1.getWithLineage,
+          Postgres.Place.v1.getWithLineage
         )).to.be.true;
         expect(isUuidQualifier.calledOnceWithExactly(qualifier)).to.be.true;
         expect(getPlaceWithLineage.calledOnceWithExactly(qualifier)).to.be.true;
@@ -111,7 +113,8 @@ describe('place', () => {
         expect(adapt.calledOnceWithExactly(
           dataContext,
           Local.Place.v1.getWithLineage,
-          Remote.Place.v1.getWithLineage
+          Remote.Place.v1.getWithLineage,
+          Postgres.Place.v1.getWithLineage
         )).to.be.true;
         expect(isUuidQualifier.calledOnceWithExactly(qualifier)).to.be.true;
         expect(getPlaceWithLineage.notCalled).to.be.true;
@@ -152,7 +155,7 @@ describe('place', () => {
 
         expect(result).to.equal(pageData);
         expect(assertDataContext.calledOnceWithExactly(dataContext)).to.be.true;
-        expect(adapt.calledOnceWithExactly(dataContext, Local.Place.v1.getPage, Remote.Place.v1.getPage)).to.be.true;
+        expect(adapt.calledOnceWithExactly(dataContext, Local.Place.v1.getPage, Remote.Place.v1.getPage, Postgres.Place.v1.getPage)).to.be.true;
         expect(getPage.calledOnceWithExactly(placeTypeQualifier, null, limit)).to.be.true;
         expect(isContactTypeQualifier.calledOnceWithExactly((placeTypeQualifier))).to.be.true;
       });
@@ -175,7 +178,7 @@ describe('place', () => {
 
         expect(result).to.equal(pageData);
         expect(assertDataContext.calledOnceWithExactly(dataContext)).to.be.true;
-        expect(adapt.calledOnceWithExactly(dataContext, Local.Place.v1.getPage, Remote.Place.v1.getPage)).to.be.true;
+        expect(adapt.calledOnceWithExactly(dataContext, Local.Place.v1.getPage, Remote.Place.v1.getPage, Postgres.Place.v1.getPage)).to.be.true;
         expect(getPage.calledOnceWithExactly(placeTypeQualifier, cursor, limit)).to.be.true;
         expect(isContactTypeQualifier.calledOnceWithExactly((placeTypeQualifier))).to.be.true;
       });
@@ -189,7 +192,7 @@ describe('place', () => {
 
         expect(result).to.equal(pageData);
         expect(assertDataContext.calledOnceWithExactly(dataContext)).to.be.true;
-        expect(adapt.calledOnceWithExactly(dataContext, Local.Place.v1.getPage, Remote.Place.v1.getPage)).to.be.true;
+        expect(adapt.calledOnceWithExactly(dataContext, Local.Place.v1.getPage, Remote.Place.v1.getPage, Postgres.Place.v1.getPage)).to.be.true;
         expect(getPage.calledOnceWithExactly(placeTypeQualifier, cursor, limit)).to.be.true;
         expect(isContactTypeQualifier.calledOnceWithExactly((placeTypeQualifier))).to.be.true;
       });
@@ -213,7 +216,7 @@ describe('place', () => {
           .to.be.rejectedWith(`Invalid contact type [${JSON.stringify(invalidQualifier)}].`);
 
         expect(assertDataContext.calledOnceWithExactly(dataContext)).to.be.true;
-        expect(adapt.calledOnceWithExactly(dataContext, Local.Place.v1.getPage, Remote.Place.v1.getPage)).to.be.true;
+        expect(adapt.calledOnceWithExactly(dataContext, Local.Place.v1.getPage, Remote.Place.v1.getPage, Postgres.Place.v1.getPage)).to.be.true;
         expect(isContactTypeQualifier.calledOnceWithExactly(invalidQualifier)).to.be.true;
         expect(getPage.notCalled).to.be.true;
       });
@@ -235,7 +238,7 @@ describe('place', () => {
             .to.be.rejectedWith(`The limit must be a positive integer: [${JSON.stringify(limitValue)}]`);
 
           expect(assertDataContext.calledOnceWithExactly(dataContext)).to.be.true;
-          expect(adapt.calledOnceWithExactly(dataContext, Local.Place.v1.getPage, Remote.Place.v1.getPage))
+          expect(adapt.calledOnceWithExactly(dataContext, Local.Place.v1.getPage, Remote.Place.v1.getPage, Postgres.Place.v1.getPage))
             .to.be.true;
           expect(isContactTypeQualifier.calledOnceWithExactly((placeTypeQualifier))).to.be.true;
           expect(getPage.notCalled).to.be.true;
@@ -258,7 +261,7 @@ describe('place', () => {
             );
 
           expect(assertDataContext.calledOnceWithExactly(dataContext)).to.be.true;
-          expect(adapt.calledOnceWithExactly(dataContext, Local.Place.v1.getPage, Remote.Place.v1.getPage))
+          expect(adapt.calledOnceWithExactly(dataContext, Local.Place.v1.getPage, Remote.Place.v1.getPage, Postgres.Place.v1.getPage))
             .to.be.true;
           expect(isContactTypeQualifier.calledOnceWithExactly((placeTypeQualifier))).to.be.true;
           expect(getPage.notCalled).to.be.true;
@@ -342,7 +345,7 @@ describe('place', () => {
 
         expect(result).to.equal(doc);
         expect(assertDataContext.calledOnceWithExactly(dataContext)).to.be.true;
-        expect(adapt.calledOnceWithExactly(dataContext, Local.Place.v1.create, Remote.Place.v1.create))
+        expect(adapt.calledOnceWithExactly(dataContext, Local.Place.v1.create, Remote.Place.v1.create, Postgres.Place.v1.create))
           .to.be.true;
         expect(createPlaceDoc.calledOnceWithExactly(input)).to.be.true;
       });
@@ -353,7 +356,7 @@ describe('place', () => {
           .to.be.rejectedWith(`Place data not provided.`);
 
         expect(assertDataContext.calledOnceWithExactly(dataContext)).to.be.true;
-        expect(adapt.calledOnceWithExactly(dataContext, Local.Place.v1.create, Remote.Place.v1.create))
+        expect(adapt.calledOnceWithExactly(dataContext, Local.Place.v1.create, Remote.Place.v1.create, Postgres.Place.v1.create))
           .to.be.true;
         expect(createPlaceDoc.notCalled).to.be.true;
       });
@@ -385,7 +388,7 @@ describe('place', () => {
 
         expect(result).to.equal(expectedDoc);
         expect(assertDataContext.calledOnceWithExactly(dataContext)).to.be.true;
-        expect(adapt.calledOnceWithExactly(dataContext, Local.Place.v1.update, Remote.Place.v1.update))
+        expect(adapt.calledOnceWithExactly(dataContext, Local.Place.v1.update, Remote.Place.v1.update, Postgres.Place.v1.update))
           .to.be.true;
         expect(updatePlaceDoc.calledOnceWithExactly(updateInput)).to.be.true;
       });
@@ -397,7 +400,7 @@ describe('place', () => {
           .to.be.rejectedWith('Updated place data not provided.');
 
         expect(assertDataContext.calledOnceWithExactly(dataContext)).to.be.true;
-        expect(adapt.calledOnceWithExactly(dataContext, Local.Place.v1.update, Remote.Place.v1.update))
+        expect(adapt.calledOnceWithExactly(dataContext, Local.Place.v1.update, Remote.Place.v1.update, Postgres.Place.v1.update))
           .to.be.true;
         expect(updatePlaceDoc.notCalled).to.be.true;
       });

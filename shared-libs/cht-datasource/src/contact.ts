@@ -11,7 +11,9 @@ import {
 import { adapt, assertDataContext, DataContext } from './libs/data-context';
 import { LocalDataContext } from './local/libs/data-context';
 import { RemoteDataContext } from './remote/libs/data-context';
+import { PostgresDataContext } from './postgres/libs/data-context';
 import * as Local from './local';
+import * as Postgres from './postgres';
 import * as Remote from './remote';
 import { DEFAULT_IDS_PAGE_LIMIT } from './libs/constants';
 import {
@@ -44,10 +46,11 @@ export namespace v1 {
   const getContact =
     <T>(
       localFn: (c: LocalDataContext) => (qualifier: UuidQualifier) => Promise<T>,
-      remoteFn: (c: RemoteDataContext) => (qualifier: UuidQualifier) => Promise<T>
+      remoteFn: (c: RemoteDataContext) => (qualifier: UuidQualifier) => Promise<T>,
+      postgresFn?: (c: PostgresDataContext) => (qualifier: UuidQualifier) => Promise<T>
     ) => (context: DataContext): typeof curriedFn => {
       assertDataContext(context);
-      const fn = adapt(context, localFn, remoteFn);
+      const fn = adapt(context, localFn, remoteFn, postgresFn);
 
       /**
        * Returns the contact with the given identifier.
@@ -68,7 +71,7 @@ export namespace v1 {
    * @returns a function for retrieving a contact
    * @throws Error if a data context is not provided
    */
-  export const get = getContact(Local.Contact.v1.get, Remote.Contact.v1.get);
+  export const get = getContact(Local.Contact.v1.get, Remote.Contact.v1.get, Postgres.Contact.v1.get);
 
   /**
    * Returns a function for retrieving a contact from the given data context with the contact's parent lineage.
@@ -76,7 +79,7 @@ export namespace v1 {
    * @returns a function for retrieving a contact with the contact's parent lineage
    * @throws Error if a data context is not provided
    */
-  export const getWithLineage = getContact(Local.Contact.v1.getWithLineage, Remote.Contact.v1.getWithLineage);
+  export const getWithLineage = getContact(Local.Contact.v1.getWithLineage, Remote.Contact.v1.getWithLineage, Postgres.Contact.v1.getWithLineage);
 
   /**
    * Returns a function for retrieving a paged array of contact identifiers from the given data context.
@@ -87,7 +90,7 @@ export namespace v1 {
    */
   export const getUuidsPage = (context: DataContext): typeof curriedFn => {
     assertDataContext(context);
-    const fn = adapt(context, Local.Contact.v1.getUuidsPage, Remote.Contact.v1.getUuidsPage);
+    const fn = adapt(context, Local.Contact.v1.getUuidsPage, Remote.Contact.v1.getUuidsPage, Postgres.Contact.v1.getUuidsPage);
 
     /**
      * Returns an array of contact identifiers for the provided page specifications.
