@@ -1,6 +1,7 @@
 'use strict';
 
 const crypto = require('crypto');
+const vm = require('vm');
 const contacts = require('./contacts');
 const records = require('./records');
 const purgeStatus = require('./purge-status');
@@ -8,6 +9,7 @@ const rolesService = require('./roles');
 
 const CONTACT_BATCH_SIZE = parseInt(process.env.PURGE_CONTACT_BATCH_SIZE || '500', 10);
 const MAX_RECORDS_PER_CONTACT = parseInt(process.env.PURGE_MAX_RECORDS || '20000', 10);
+const PURGE_FN_TIMEOUT_MS = parseInt(process.env.PURGE_FN_TIMEOUT_MS || '5000', 10);
 const TASK_EXPIRATION_DAYS = 60;
 const TARGET_EXPIRATION_MONTHS = 6;
 
@@ -69,14 +71,26 @@ const evaluateGroup = (purgeFn, group, rolesByHash) => {
 
     let idsToPurge;
     try {
-      idsToPurge = purgeFn(
-        { roles: rolesList },
-        group.contact,
-        group.reports,
-        group.messages
+      // Run the purge function inside a vm context with a timeout to prevent
+      // infinite loops or excessively slow purge.js from hanging the service.
+      const sandbox = vm.createContext({
+        purgeFn,
+        userCtx: { roles: rolesList },
+        contact: group.contact,
+        reports: group.reports,
+        messages: group.messages,
+      });
+      idsToPurge = vm.runInNewContext(
+        'purgeFn(userCtx, contact, reports, messages)',
+        sandbox,
+        { timeout: PURGE_FN_TIMEOUT_MS }
       );
-    } catch {
-      // Purge function errors are non-fatal; treat as "purge nothing"
+    } catch (err) {
+      // Purge function errors (including timeouts) are non-fatal; treat as "purge nothing".
+      // vm timeout throws an ERR_SCRIPT_EXECUTION_TIMEOUT error.
+      if (err.code === 'ERR_SCRIPT_EXECUTION_TIMEOUT') {
+        console.warn(`Purge function timed out after ${PURGE_FN_TIMEOUT_MS}ms for role ${rolesList.join(',')}`);
+      }
       continue;
     }
 

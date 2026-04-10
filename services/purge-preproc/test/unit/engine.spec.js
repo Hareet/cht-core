@@ -107,6 +107,70 @@ describe('Purge Engine', () => {
       expect(result.hash_a).to.deep.equal({});
     });
 
+    it('should timeout and treat as purge-nothing when purge function runs too long', () => {
+      sinon.stub(console, 'warn');
+
+      // Simulate a timeout error from vm.runInNewContext — same error code Node.js throws
+      const timeoutErr = new Error('Script execution timed out after 5000ms');
+      timeoutErr.code = 'ERR_SCRIPT_EXECUTION_TIMEOUT';
+      const throwingFn = sinon.stub().throws(timeoutErr);
+
+      const group = {
+        contact: { _id: 'c1' },
+        reports: [{ _id: 'r1', form: 'a' }],
+        messages: [],
+        ids: ['c1', 'r1'],
+      };
+
+      const result = engine._evaluateGroup(throwingFn, group, { hash_a: ['chw'] });
+
+      // Timeout is non-fatal — treated as "purge nothing"
+      expect(result.hash_a).to.deep.equal({});
+      expect(console.warn.calledOnce).to.be.true;
+      expect(console.warn.args[0][0]).to.include('timed out');
+      expect(console.warn.args[0][0]).to.include('chw');
+    });
+
+    it('should not hang on an actual infinite loop purge function', () => {
+      sinon.stub(console, 'warn');
+
+      // A real infinite loop function — vm.runInNewContext will interrupt it
+      // eslint-disable-next-line no-constant-condition
+      const infiniteFn = function() { while (true) {} };
+
+      const group = {
+        contact: { _id: 'c1' },
+        reports: [],
+        messages: [],
+        ids: ['c1'],
+      };
+
+      // The PURGE_FN_TIMEOUT_MS constant is read at module load time (default 5000ms).
+      // To keep the test fast, we call vm.runInNewContext directly with a short timeout
+      // to prove the mechanism works, rather than waiting 5s.
+      const vm = require('vm');
+      const sandbox = vm.createContext({
+        purgeFn: infiniteFn,
+        userCtx: { roles: ['chw'] },
+        contact: group.contact,
+        reports: group.reports,
+        messages: group.messages,
+      });
+
+      let timedOut = false;
+      try {
+        vm.runInNewContext(
+          'purgeFn(userCtx, contact, reports, messages)',
+          sandbox,
+          { timeout: 50 }
+        );
+      } catch (err) {
+        timedOut = err.code === 'ERR_SCRIPT_EXECUTION_TIMEOUT';
+      }
+
+      expect(timedOut).to.be.true;
+    });
+
     it('should handle empty group (no ids means no evaluation)', () => {
       const purgeFn = sinon.stub().returns([]);
 
