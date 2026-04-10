@@ -327,6 +327,34 @@ describe('Purge Engine', () => {
       expect(contacts.getChangedContactIds.calledWith(new Date('2025-01-01'))).to.be.true;
       expect(contacts.getContact.callCount).to.equal(2);
       expect(purgeStatus.completeRunLog.calledOnce).to.be.true;
+
+      // Unallocated records should also be filtered by lastRun timestamp
+      expect(records.getUnallocatedRecords.args[0][2]).to.deep.equal(new Date('2025-01-01'));
+    });
+
+    it('should pass null as since for unallocated records in full mode', async () => {
+      const purgeFn = function() { return []; };
+
+      queryStub.onFirstCall().resolves({
+        rows: [{ fn: purgeFn.toString() }],
+      });
+
+      sinon.stub(rolesService, 'getRoles').resolves({ hash_chw: ['chw'] });
+      sinon.stub(rolesService, 'saveRoles').resolves();
+      sinon.stub(purgeStatus, 'startRunLog').resolves(1);
+      sinon.stub(purgeStatus, 'completeRunLog').resolves();
+      sinon.stub(purgeStatus, 'writePurgeResults').resolves();
+      sinon.stub(purgeStatus, 'cleanupDeletedDocs').resolves(0);
+      sinon.stub(purgeStatus, 'cleanupOrphanedRoles').resolves(0);
+      sinon.stub(contacts, 'getContactsBatch').resolves([]);
+      sinon.stub(records, 'getUnallocatedRecords').resolves([]);
+
+      sinon.stub(console, 'log');
+
+      await engine.run({ incremental: false });
+
+      // Full mode: since should be null (scan all unallocated records)
+      expect(records.getUnallocatedRecords.args[0][2]).to.be.null;
     });
 
     it('should re-evaluate contacts when their records are deleted (incremental)', async () => {

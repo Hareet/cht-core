@@ -60,7 +60,15 @@ const getRecordsForSubjects = async (subjectIds) => {
 // A record is "unassigned" when getSubject() in the Nouveau index returns falsy.
 // getSubject() checks: patient_id, place_id, patient_uuid (top-level & fields),
 // contact._id (for error fallback reports and SMS messages).
-const getUnallocatedRecords = async (limit, offset) => {
+// When `since` is provided, only returns records changed after that timestamp (incremental mode).
+const getUnallocatedRecords = async (limit, offset, since) => {
+  const params = [limit, offset];
+  let sinceClause = '';
+  if (since) {
+    sinceClause = `AND saved_timestamp > $3`;
+    params.push(since);
+  }
+
   const result = await db.query(`
     SELECT _id, doc
     FROM ${tbl()}
@@ -75,9 +83,10 @@ const getUnallocatedRecords = async (limit, offset) => {
       AND COALESCE(doc->'fields'->>'patient_uuid', '') = ''
       AND COALESCE(doc->'fields'->>'place_uuid', '') = ''
       AND COALESCE(doc->'contact'->>'_id', '') = ''
+      ${sinceClause}
     ORDER BY _id
     LIMIT $1 OFFSET $2
-  `, [limit, offset]);
+  `, params);
 
   return result.rows.map(row => ({
     id: row._id,

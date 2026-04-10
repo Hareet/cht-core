@@ -131,5 +131,28 @@ describe('Records', () => {
       expect(result).to.have.length(1);
       expect(result[0]).to.deep.equal({ id: 'r1', doc: { _id: 'r1', type: 'data_record' } });
     });
+
+    it('should not include saved_timestamp filter when since is not provided', async () => {
+      const queryStub = sinon.stub(db, 'query').resolves({ rows: [] });
+      sinon.stub(db, 'getSchema').returns('v1');
+
+      await records.getUnallocatedRecords(100, 0);
+
+      const sql = queryStub.args[0][0];
+      expect(sql).to.not.include('saved_timestamp');
+      expect(queryStub.args[0][1]).to.deep.equal([100, 0]);
+    });
+
+    it('should filter by saved_timestamp when since is provided', async () => {
+      const queryStub = sinon.stub(db, 'query').resolves({ rows: [] });
+      sinon.stub(db, 'getSchema').returns('v1');
+
+      const since = new Date('2025-06-01');
+      await records.getUnallocatedRecords(100, 0, since);
+
+      const sql = queryStub.args[0][0];
+      expect(sql).to.include('saved_timestamp > $3');
+      expect(queryStub.args[0][1]).to.deep.equal([100, 0, since]);
+    });
   });
 });

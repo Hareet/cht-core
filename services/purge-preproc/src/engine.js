@@ -103,12 +103,13 @@ const evaluateGroup = (purgeFn, group, rolesByHash) => {
 };
 
 // Process unallocated records (reports/messages not tied to any contact).
-const processUnallocatedRecords = async (purgeFn, rolesByHash, stats) => {
+// When `since` is provided, only processes records changed after that timestamp (incremental mode).
+const processUnallocatedRecords = async (purgeFn, rolesByHash, stats, since) => {
   let offset = 0;
   const batchSize = CONTACT_BATCH_SIZE;
 
   while (true) {
-    const batch = await records.getUnallocatedRecords(batchSize, offset);
+    const batch = await records.getUnallocatedRecords(batchSize, offset, since);
     if (!batch.length) {
       break;
     }
@@ -296,10 +297,11 @@ const _runWithLock = async (options, db) => {
 
   try {
     let contactIds = null;
+    let lastRun = null;
 
     // Incremental: only process contacts that changed since last run
     if (incremental) {
-      const lastRun = await purgeStatus.getLastRunTimestamp();
+      lastRun = await purgeStatus.getLastRunTimestamp();
       if (lastRun) {
         const changedContacts = await contacts.getChangedContactIds(lastRun);
         const contactsWithChangedRecords = await records.getContactIdsWithChangedRecords(lastRun);
@@ -337,8 +339,8 @@ const _runWithLock = async (options, db) => {
       }
     }
 
-    // Process unallocated records
-    await processUnallocatedRecords(purgeFn, rolesByHash, stats);
+    // Process unallocated records — in incremental mode, only those changed since last run
+    await processUnallocatedRecords(purgeFn, rolesByHash, stats, lastRun);
 
     // Auto-purge expired tasks and targets (not controlled by purge.js)
     await purgeExpiredTasks(rolesByHash, stats);
