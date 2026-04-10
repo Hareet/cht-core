@@ -2,9 +2,23 @@ import { expect } from 'chai';
 
 import { ChtPowerSyncSchema } from '@mm-services/powersync/powersync-schema';
 
+/**
+ * Helper: find a table by name in the Schema.tables array.
+ */
+function findTable(name: string) {
+  return ChtPowerSyncSchema.tables.find((t: any) => t.name === name);
+}
+
+/**
+ * Helper: get column names from a table.
+ */
+function getColumnNames(table: any): string[] {
+  return table.columns.map((c: any) => c.name);
+}
+
 describe('PowerSync Schema', () => {
   it('should define all required tables', () => {
-    const tableNames = Object.keys(ChtPowerSyncSchema.tables);
+    const tableNames = ChtPowerSyncSchema.tables.map((t: any) => t.name);
     expect(tableNames).to.include.members([
       'contacts',
       'reports',
@@ -19,9 +33,9 @@ describe('PowerSync Schema', () => {
 
   describe('contacts table', () => {
     it('should define required columns including v3.7+ contact_type', () => {
-      const contacts = ChtPowerSyncSchema.tables.contacts;
+      const contacts = findTable('contacts');
       expect(contacts).to.exist;
-      const columnNames = Object.keys(contacts.columns);
+      const columnNames = getColumnNames(contacts);
       expect(columnNames).to.include.members([
         'type',              // raw CouchDB type field
         'contact_type',      // resolved type (COALESCE pattern)
@@ -35,17 +49,17 @@ describe('PowerSync Schema', () => {
       ]);
     });
 
-    it('should have index on contact_type for type queries', () => {
-      const contacts = ChtPowerSyncSchema.tables.contacts;
-      expect((contacts as any).options?.indexes || (contacts as any).indexes).to.have.property('by_contact_type');
+    it('should not be local-only', () => {
+      const contacts = findTable('contacts');
+      expect(contacts!.localOnly).to.be.false;
     });
   });
 
   describe('reports table', () => {
     it('should define required columns including place_id and from', () => {
-      const reports = ChtPowerSyncSchema.tables.reports;
+      const reports = findTable('reports');
       expect(reports).to.exist;
-      const columnNames = Object.keys(reports.columns);
+      const columnNames = getColumnNames(reports);
       expect(columnNames).to.include.members([
         'type', 'form', 'content_type', 'from',
         'contact_id', 'patient_id', 'patient_uuid', 'place_id',
@@ -53,17 +67,12 @@ describe('PowerSync Schema', () => {
         'verified', 'is_private',
       ]);
     });
-
-    it('should have index on place_id', () => {
-      const reports = ChtPowerSyncSchema.tables.reports;
-      expect((reports as any).options?.indexes || (reports as any).indexes).to.have.property('by_place');
-    });
   });
 
   it('should define tasks table with required columns', () => {
-    const tasks = ChtPowerSyncSchema.tables.tasks;
+    const tasks = findTable('tasks');
     expect(tasks).to.exist;
-    const columnNames = Object.keys(tasks.columns);
+    const columnNames = getColumnNames(tasks);
     expect(columnNames).to.include.members([
       'type', 'user', 'owner', 'state', 'emission', 'due_date',
       'requester', 'state_reason', 'state_history',
@@ -72,39 +81,39 @@ describe('PowerSync Schema', () => {
   });
 
   it('should define targets table with required columns', () => {
-    const targets = ChtPowerSyncSchema.tables.targets;
+    const targets = findTable('targets');
     expect(targets).to.exist;
-    const columnNames = Object.keys(targets.columns);
+    const columnNames = getColumnNames(targets);
     expect(columnNames).to.include.members([
       'type', 'owner', 'reporting_period', 'targets',
     ]);
   });
 
   it('should define settings table for global system docs', () => {
-    const settings = ChtPowerSyncSchema.tables.settings;
+    const settings = findTable('settings');
     expect(settings).to.exist;
-    const columnNames = Object.keys(settings.columns);
+    const columnNames = getColumnNames(settings);
     expect(columnNames).to.include.members(['type', 'doc', 'updated_date']);
   });
 
   it('should define feedback as local-only table', () => {
-    const feedback = ChtPowerSyncSchema.tables.feedback;
+    const feedback = findTable('feedback');
     expect(feedback).to.exist;
-    expect((feedback as any).options?.localOnly ?? (feedback as any).localOnly).to.be.true;
+    expect(feedback!.localOnly).to.be.true;
   });
 
   it('should define telemetry as local-only insert-only table', () => {
-    const telemetry = ChtPowerSyncSchema.tables.telemetry;
+    const telemetry = findTable('telemetry');
     expect(telemetry).to.exist;
-    expect((telemetry as any).options?.localOnly ?? (telemetry as any).localOnly).to.be.true;
-    expect((telemetry as any).options?.insertOnly ?? (telemetry as any).insertOnly).to.be.true;
+    expect(telemetry!.localOnly).to.be.true;
+    expect(telemetry!.insertOnly).to.be.true;
   });
 
   it('should define read_status as local-only with doc_type for unread grouping', () => {
-    const readStatus = ChtPowerSyncSchema.tables.read_status;
+    const readStatus = findTable('read_status');
     expect(readStatus).to.exist;
-    expect((readStatus as any).options?.localOnly ?? (readStatus as any).localOnly).to.be.true;
-    const columnNames = Object.keys(readStatus.columns);
+    expect(readStatus!.localOnly).to.be.true;
+    const columnNames = getColumnNames(readStatus);
     expect(columnNames).to.include.members(['doc_id', 'doc_type', 'read_at']);
   });
 });

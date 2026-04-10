@@ -221,16 +221,18 @@ export class PowerSyncService implements OnDestroy {
         return;
       }
 
-      // Use the WatchedQuery API with registerListener
+      // Use the WatchedQuery API with registerListener.
+      // The SDK types the data as ReadonlyArray<Readonly<unknown>> since db.query()
+      // doesn't carry our generic T. We cast in the callback.
       const watchedQuery = this.db!.query({ sql, parameters: params }).watch();
 
       const dispose = watchedQuery.registerListener({
-        onData: (data: T[]) => {
+        onData: (data) => {
           this.ngZone.run(() => {
-            subscriber.next(data);
+            subscriber.next(data as unknown as T[]);
           });
         },
-        onError: (error: Error) => {
+        onError: (error) => {
           this.ngZone.run(() => {
             subscriber.error(error);
           });
