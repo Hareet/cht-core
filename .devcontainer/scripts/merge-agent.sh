@@ -3,7 +3,7 @@
 # Run on HOST by the human operator.
 #
 # Usage:
-#   ./merge-agent.sh <agent-id>           # Rebase + fast-forward merge
+#   ./merge-agent.sh <agent-id>           # Direct merge (safe with active worktrees)
 #   ./merge-agent.sh <agent-id> --squash  # Squash merge
 #
 # Merge order (based on dependencies):
@@ -24,13 +24,13 @@ BASE_BRANCH="playtime"
 
 cd "$REPO"
 
-# Find the agent's branch
-BRANCH=$(git worktree list | grep "agent-${AGENT_ID}" | awk '{print $3}' | tr -d '[]')
+# Find the agent's branch — handle both normal and relative-path worktree listings
+BRANCH=$(git branch --list "playtime-agent-${AGENT_ID}-*" | head -1 | sed 's/^[* +]*//')
 
 if [ -z "$BRANCH" ]; then
-  echo "ERROR: No worktree found for agent-${AGENT_ID}"
-  echo "Available worktrees:"
-  git worktree list
+  echo "ERROR: No branch found matching playtime-agent-${AGENT_ID}-*"
+  echo "Available branches:"
+  git branch --list "playtime-agent-*"
   exit 1
 fi
 
@@ -62,23 +62,19 @@ if [ "$SQUASH" = "--squash" ]; then
 
 Squash merge of all commits from agent-${AGENT_ID} worktree."
 else
-  # Rebase agent branch onto latest base
-  echo "Rebasing $BRANCH onto $BASE_BRANCH..."
-  if ! git rebase "$BASE_BRANCH" "$BRANCH"; then
+  # Direct merge — works even with active worktrees (rebase does not).
+  echo "Merging $BRANCH into $BASE_BRANCH..."
+  if ! git merge "$BRANCH" --no-edit; then
     echo ""
-    echo "Rebase conflicts detected. Resolve manually, then:"
-    echo "  git rebase --continue"
-    echo "  git checkout $BASE_BRANCH && git merge --ff-only $BRANCH"
+    echo "Merge conflicts detected. Resolve manually, then:"
+    echo "  git add <resolved files>"
+    echo "  git commit"
     exit 1
   fi
-
-  # Fast-forward merge
-  git checkout "$BASE_BRANCH"
-  git merge --ff-only "$BRANCH"
 fi
 
 echo ""
 echo "Agent $AGENT_ID ($BRANCH) merged to $BASE_BRANCH."
 echo ""
-echo "Consider removing the worktree if done:"
-echo "  ./scripts/teardown-worktrees.sh $AGENT_ID"
+echo "Update other agent worktrees to pick up the merge:"
+echo "  for i in 2 3 4 5 6 7; do git -C .agents/worktrees/agent-\$i merge playtime --ff-only 2>/dev/null; done"

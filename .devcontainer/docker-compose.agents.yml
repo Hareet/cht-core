@@ -9,7 +9,7 @@
 #   1. CouchDB running on cht-net (~/cht-docker)
 #   2. Worktrees created via scripts/setup-worktrees.sh
 #   3. .env file populated (copy from .env.example)
-#   4. Claude Code logged in on host: claude login
+#   4. First run: docker exec -it cht-agent-1 claude  (OAuth login once, shared across all agents)
 
 x-agent-base: &agent-base
   build:
@@ -26,14 +26,17 @@ x-agent-base: &agent-base
   #   3. .git/config: hardened by setup-worktrees.sh on host (remotes → /dev/null)
   #   4. init-agent-git.sh: pre-push hook, env-based identity, verification
   #   5. CLAUDE.md: explicit "no push/fetch/pull" instructions
-  # See also: init-firewall.sh (optional network-level block if NET_ADMIN granted)
-  entrypoint: ["/bin/bash", "-c", "cd /workspace/cht-core/.agents/worktrees/agent-$$AGENT_ID && bash /workspace/cht-core/.devcontainer/scripts/init-agent-git.sh; exec sleep infinity"]
-  # Claude Code auth: OAuth credentials from host login shared read-only.
-  # Log in once on host (claude login), then all agents share the token.
-  # Only .credentials.json is mounted — runtime state stays per-container.
+  #
+  # Claude Code auth: single shared named volume (claude-config) stores OAuth
+  # credentials. Log in once on any agent, all agents share the token.
+  # Entrypoint runs as root to fix named volume ownership (Docker creates them as root),
+  # then drops to agent user for git safety init and sleep.
+  user: root
+  entrypoint: ["/bin/bash", "-c", "chown -R 1000:1000 /home/agent/.npm /home/agent/.claude /workspace/cht-core/.agents/worktrees/agent-$$AGENT_ID/node_modules 2>/dev/null; exec su agent -c 'cd /workspace/cht-core/.agents/worktrees/agent-'$$AGENT_ID' && bash /workspace/cht-core/.devcontainer/scripts/init-agent-git.sh; exec sleep infinity'"]
   environment: &agent-env
     CHT_NETWORK: ${CHT_NETWORK:-cht-net}
     COUCH_URL: http://${COUCHDB_USER:-admin}:${COUCHDB_PASSWORD}@couchdb:5984/medic
+    CLAUDE_CONFIG_DIR: /home/agent/.claude
     NODE_ENV: development
     LOG_LEVEL: debug
   deploy:
@@ -53,8 +56,8 @@ services:
       AGENT_NAME: cht-datasource
     volumes:
       - ${CHT_CORE_PATH:-./../}:/workspace/cht-core:rw
-      - ${CLAUDE_CONFIG_PATH:-~/.claude}/.credentials.json:/home/agent/.claude/.credentials.json:ro
       - ${CHT_AI_TOOLS_PATH:-/home/h4reet/ai_medic/cht-ai-tools}:/workspace/cht-ai-tools:ro
+      - claude-config:/home/agent/.claude
       - agent-1-node-modules:/workspace/cht-core/.agents/worktrees/agent-1/node_modules
       - shared-npm-cache:/home/agent/.npm
     working_dir: /workspace/cht-core/.agents/worktrees/agent-1
@@ -69,8 +72,8 @@ services:
       AGENT_NAME: sentinel
     volumes:
       - ${CHT_CORE_PATH:-./../}:/workspace/cht-core:rw
-      - ${CLAUDE_CONFIG_PATH:-~/.claude}/.credentials.json:/home/agent/.claude/.credentials.json:ro
       - ${CHT_AI_TOOLS_PATH:-/home/h4reet/ai_medic/cht-ai-tools}:/workspace/cht-ai-tools:ro
+      - claude-config:/home/agent/.claude
       - agent-2-node-modules:/workspace/cht-core/.agents/worktrees/agent-2/node_modules
       - shared-npm-cache:/home/agent/.npm
     working_dir: /workspace/cht-core/.agents/worktrees/agent-2
@@ -85,8 +88,8 @@ services:
       AGENT_NAME: sync-streams
     volumes:
       - ${CHT_CORE_PATH:-./../}:/workspace/cht-core:rw
-      - ${CLAUDE_CONFIG_PATH:-~/.claude}/.credentials.json:/home/agent/.claude/.credentials.json:ro
       - ${CHT_AI_TOOLS_PATH:-/home/h4reet/ai_medic/cht-ai-tools}:/workspace/cht-ai-tools:ro
+      - claude-config:/home/agent/.claude
       - agent-3-node-modules:/workspace/cht-core/.agents/worktrees/agent-3/node_modules
       - shared-npm-cache:/home/agent/.npm
     working_dir: /workspace/cht-core/.agents/worktrees/agent-3
@@ -101,8 +104,8 @@ services:
       AGENT_NAME: purge-preproc
     volumes:
       - ${CHT_CORE_PATH:-./../}:/workspace/cht-core:rw
-      - ${CLAUDE_CONFIG_PATH:-~/.claude}/.credentials.json:/home/agent/.claude/.credentials.json:ro
       - ${CHT_AI_TOOLS_PATH:-/home/h4reet/ai_medic/cht-ai-tools}:/workspace/cht-ai-tools:ro
+      - claude-config:/home/agent/.claude
       - agent-4-node-modules:/workspace/cht-core/.agents/worktrees/agent-4/node_modules
       - shared-npm-cache:/home/agent/.npm
     working_dir: /workspace/cht-core/.agents/worktrees/agent-4
@@ -117,8 +120,8 @@ services:
       AGENT_NAME: powersync-sdk
     volumes:
       - ${CHT_CORE_PATH:-./../}:/workspace/cht-core:rw
-      - ${CLAUDE_CONFIG_PATH:-~/.claude}/.credentials.json:/home/agent/.claude/.credentials.json:ro
       - ${CHT_AI_TOOLS_PATH:-/home/h4reet/ai_medic/cht-ai-tools}:/workspace/cht-ai-tools:ro
+      - claude-config:/home/agent/.claude
       - agent-5-node-modules:/workspace/cht-core/.agents/worktrees/agent-5/node_modules
       - shared-npm-cache:/home/agent/.npm
     working_dir: /workspace/cht-core/.agents/worktrees/agent-5
@@ -133,8 +136,8 @@ services:
       AGENT_NAME: rules-engine
     volumes:
       - ${CHT_CORE_PATH:-./../}:/workspace/cht-core:rw
-      - ${CLAUDE_CONFIG_PATH:-~/.claude}/.credentials.json:/home/agent/.claude/.credentials.json:ro
       - ${CHT_AI_TOOLS_PATH:-/home/h4reet/ai_medic/cht-ai-tools}:/workspace/cht-ai-tools:ro
+      - claude-config:/home/agent/.claude
       - agent-6-node-modules:/workspace/cht-core/.agents/worktrees/agent-6/node_modules
       - shared-npm-cache:/home/agent/.npm
     working_dir: /workspace/cht-core/.agents/worktrees/agent-6
@@ -149,14 +152,15 @@ services:
       AGENT_NAME: integration
     volumes:
       - ${CHT_CORE_PATH:-./../}:/workspace/cht-core:rw
-      - ${CLAUDE_CONFIG_PATH:-~/.claude}/.credentials.json:/home/agent/.claude/.credentials.json:ro
       - ${CHT_AI_TOOLS_PATH:-/home/h4reet/ai_medic/cht-ai-tools}:/workspace/cht-ai-tools:ro
+      - claude-config:/home/agent/.claude
       - agent-7-node-modules:/workspace/cht-core/.agents/worktrees/agent-7/node_modules
       - shared-npm-cache:/home/agent/.npm
     working_dir: /workspace/cht-core/.agents/worktrees/agent-7
 
 volumes:
   shared-npm-cache:
+  claude-config:
   agent-1-node-modules:
   agent-2-node-modules:
   agent-3-node-modules:

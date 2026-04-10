@@ -19,16 +19,16 @@ services:
     container_name: cht-powersync
     hostname: powersync
     restart: always
-    depends_on:
-      - postgres
+    # postgres must already be running (Phase 2)
     ports:
       - "8080:8080"
     volumes:
-      - ./powersync-config:/config:ro
+      # Mounts from Agent-3's worktree where the real config is developed.
+      # Switch to ./powersync-config/powersync.yaml after merging Agent-3.
+      - ${CHT_CORE_PATH:-./../}/.agents/worktrees/agent-3/.devcontainer/powersync-config/powersync.yaml:/app/powersync.yaml:ro
     environment:
       - PS_DATABASE_URI=postgresql://${POSTGRES_USER:-cht}:${POSTGRES_PASSWORD}@postgres:5432/cht
       - PS_ADMIN_TOKEN=${POWERSYNC_ADMIN_TOKEN:?POWERSYNC_ADMIN_TOKEN must be set}
-      - PS_CONFIG_PATH=/config/powersync.yaml
     logging:
       driver: "local"
       options:

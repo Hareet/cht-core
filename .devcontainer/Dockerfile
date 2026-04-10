@@ -16,7 +16,6 @@ RUN apt-get update && apt-get install -y \
 # --- Git/GitHub security hardening ---
 
 # Block SSH to GitHub at the network level (iptables)
-# This script runs at container start with NET_ADMIN capability
 COPY scripts/init-firewall.sh /usr/local/bin/init-firewall.sh
 RUN chmod +x /usr/local/bin/init-firewall.sh
 
@@ -42,24 +41,23 @@ RUN mkdir -p /home/agent/.ssh && \
     chmod 444 /home/agent/.ssh/config && \
     chown root:root /home/agent/.ssh /home/agent/.ssh/config
 
-# Set up workspace structure
+# --- Install Claude Code CLI (as root, before switching to agent user) ---
+RUN npm install -g @anthropic-ai/claude-code
+
+# Set up workspace and claude config directories
 RUN mkdir -p /workspace/cht-core /workspace/worktree /workspace/cht-ai-tools \
-    && chown -R agent:agent /workspace
+    /home/agent/.claude \
+    && chown -R agent:agent /workspace /home/agent/.claude
 
 USER agent
 
-# --- Install Claude Code CLI ---
-# Install as agent user so it goes to ~/.local/bin/claude
-WORKDIR /tmp
-RUN curl -fsSL https://claude.ai/install.sh | bash
-ENV PATH="/home/agent/.local/bin:$PATH"
+ENV CLAUDE_CONFIG_DIR=/home/agent/.claude
+ENV NODE_OPTIONS="--max-old-space-size=4096"
 
 WORKDIR /workspace/worktree
 
 # Agent-level git config: dummy identity, no credential helpers
-# safe.directory entries are required because bind-mounted files are owned
-# by the host user's uid, not the container's agent uid. We enumerate the
-# exact paths rather than using '*' wildcard.
+# safe.directory entries required for bind-mounted files owned by host uid.
 RUN git config --global user.name "CHT Migration Agent" && \
     git config --global user.email "agent@cht-migration.local" && \
     git config --global credential.helper "" && \
