@@ -1,5 +1,5 @@
 import logger from '@medic/logger';
-import { DataObject, Nullable, Page } from '../../libs/core';
+import { DataObject, isIdentifiable, isRecord, Nullable, Page } from '../../libs/core';
 import { Doc, isDoc } from '../../libs/doc';
 import { ResourceNotFoundError, RevisionConflictError } from '../../libs/error';
 import { PostgresDataContext } from './data-context';
@@ -223,4 +223,80 @@ export const fetchAndFilterIds = (
   };
 
   return fetchAndFilter(getFunction, filterFn, limit);
+};
+
+const RECURSION_LIMIT = 50;
+
+/** Mutable record used internally during lineage minification. */
+type MutableRecord = { [key: string]: unknown };
+
+/**
+ * Strips a hydrated parent chain down to nested `{ _id }` references.
+ * Replicates `@medic/lineage`'s `minifyLineage` behavior.
+ * @internal
+ */
+export const minifyLineage = (parent: unknown): DataObject | undefined => {
+  if (!isIdentifiable(parent)) {
+    return undefined;
+  }
+
+  const result: MutableRecord = { _id: parent._id };
+  let minified = result;
+  let current = parent as DataObject;
+  for (let guard = RECURSION_LIMIT; isIdentifiable(current.parent); --guard) {
+    if (guard === 0) {
+      throw new Error(`Could not minify ${result._id as string}, possible parent recursion.`);
+    }
+    const next: MutableRecord = { _id: (current.parent as DataObject)._id };
+    minified.parent = next;
+    minified = next;
+    current = current.parent as DataObject;
+  }
+
+  return result as DataObject;
+};
+
+const CONTACT_TYPES = new Set(['contact', 'clinic', 'district_hospital', 'health_center', 'person']);
+
+/**
+ * Strips hydrated lineage from a document before storing, replicating `@medic/lineage`'s `minify`.
+ *
+ * - Reduces `parent` chains to nested `{ _id }` objects
+ * - Reduces `contact` to `{ _id }` with minified parent chain
+ * - For `data_record` (reports): removes hydrated `patient` and `place` fields
+ * - For contacts with `linked_docs`: extracts just the IDs
+ *
+ * Returns a new object; the input is not mutated.
+ * @internal
+ */
+export const minifyDoc = (doc: Doc): Doc => {
+  const result: MutableRecord = { ...doc };
+
+  if (doc.parent) {
+    result.parent = minifyLineage(doc.parent);
+  }
+
+  if (isIdentifiable(doc.contact)) {
+    const miniContact: MutableRecord = { _id: doc.contact._id };
+    if (isIdentifiable((doc.contact as DataObject).parent)) {
+      miniContact.parent = minifyLineage((doc.contact as DataObject).parent);
+    }
+    result.contact = miniContact;
+  }
+
+  if (doc.type === 'data_record') {
+    delete result.patient;
+    delete result.place;
+  }
+
+  if (CONTACT_TYPES.has(doc.type as string) && isRecord(doc.linked_docs) && !Array.isArray(doc.linked_docs)) {
+    const minifiedLinkedDocs: MutableRecord = {};
+    for (const key of Object.keys(doc.linked_docs as Record<string, unknown>)) {
+      const item = (doc.linked_docs as Record<string, unknown>)[key];
+      minifiedLinkedDocs[key] = (typeof item === 'string') ? item : isIdentifiable(item) ? item._id : item;
+    }
+    result.linked_docs = minifiedLinkedDocs;
+  }
+
+  return result as Doc;
 };

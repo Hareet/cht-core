@@ -3,7 +3,7 @@ import contactTypeUtils from '@medic/contact-types-utils';
 import { assertHasRequiredField, Nullable, Page } from '../libs/core';
 import { ContactTypeQualifier, UuidQualifier } from '../qualifier';
 import * as Place from '../place';
-import { createDoc, fetchAndFilter, getDocById, getDocsByIds, queryDocsByType, updateDoc } from './libs/doc';
+import { createDoc, fetchAndFilter, getDocById, getDocsByIds, minifyDoc, queryDocsByType, updateDoc } from './libs/doc';
 import { PostgresDataContext } from './libs/data-context';
 import { SettingsService } from '../local/libs/data-context';
 import logger from '@medic/logger';
@@ -160,7 +160,8 @@ export namespace v1 {
         assertHasRequiredField(updatedPlace, { name: 'name', type: 'string' }, InvalidArgumentError);
       }
 
-      const { _rev } = await updatePgDoc(updatedPlace as unknown as Doc);
+      const minified = minifyDoc(updatedPlace as unknown as Doc);
+      const { _rev } = await updatePgDoc(minified);
       return { ...updatedPlace, _rev };
     };
   };

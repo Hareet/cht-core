@@ -558,6 +558,41 @@ describe('postgres place', () => {
 
         expect(updateDocInner.notCalled).to.be.true;
       });
+
+      it('minifies hydrated parent and contact lineage before storing', async () => {
+        const updatedPlace = {
+          ...originalDoc,
+          name: 'Updated HC',
+          parent: {
+            _id: 'district-1',
+            name: 'District Full',
+            type: 'district_hospital',
+            contact: { _id: 'admin-1', name: 'Admin' }
+          },
+          contact: {
+            _id: 'nurse-1',
+            name: 'Nurse Jane',
+            type: 'person',
+            parent: {
+              _id: 'place-1',
+              name: 'HC Full',
+              parent: { _id: 'district-1', name: 'District Full' }
+            }
+          }
+        };
+        getDocsByIdsInner.resolves([originalDoc]);
+        updateDocInner.resolves({ ...updatedPlace, _rev: '2-pg456' });
+
+        const result = await Place.v1.update(ctx)(updatedPlace);
+
+        expect(result._rev).to.equal('2-pg456');
+        const storedDoc = updateDocInner.firstCall.args[0];
+        expect(storedDoc.parent).to.deep.equal({ _id: 'district-1' });
+        expect(storedDoc.contact).to.deep.equal({
+          _id: 'nurse-1',
+          parent: { _id: 'place-1', parent: { _id: 'district-1' } }
+        });
+      });
     });
   });
 });

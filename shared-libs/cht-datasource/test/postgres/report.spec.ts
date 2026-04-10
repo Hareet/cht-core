@@ -412,6 +412,46 @@ describe('postgres report', () => {
         expect(getDocIdsByIdRangeInner.calledOnceWithExactly('form:', 'form:\ufff0')).to.be.true;
         expect(updateDocInner.notCalled).to.be.true;
       });
+
+      it('minifies hydrated lineage and removes patient/place before storing', async () => {
+        const updateInput = {
+          ...originalReport,
+          fields: { hello: 'updated' },
+          contact: {
+            _id: 'contact-1',
+            name: 'Full Contact Name',
+            type: 'person',
+            parent: {
+              _id: 'clinic-1',
+              name: 'Full Clinic Name',
+              parent: { _id: 'district-1', name: 'Full District' }
+            }
+          },
+          patient: {
+            _id: 'patient-1',
+            name: 'Patient Bob',
+            parent: { _id: 'clinic-1', name: 'Clinic' }
+          },
+          place: {
+            _id: 'place-1',
+            name: 'Health Center',
+            parent: { _id: 'district-1' }
+          }
+        };
+
+        const result = await Report.v1.update(ctx)(updateInput);
+
+        expect(result._rev).to.equal('2-pgxyz');
+        const storedDoc = updateDocInner.firstCall.args[0];
+        // contact should be minified
+        expect(storedDoc.contact).to.deep.equal({
+          _id: 'contact-1',
+          parent: { _id: 'clinic-1', parent: { _id: 'district-1' } }
+        });
+        // patient and place should be removed from stored doc
+        expect(storedDoc).to.not.have.property('patient');
+        expect(storedDoc).to.not.have.property('place');
+      });
     });
   });
 });

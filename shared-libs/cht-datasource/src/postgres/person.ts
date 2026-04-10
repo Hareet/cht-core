@@ -4,7 +4,7 @@ import { assertHasRequiredField, Nullable, Page } from '../libs/core';
 import * as Qualifier from '../qualifier';
 import { ContactTypeQualifier, UuidQualifier } from '../qualifier';
 import * as Person from '../person';
-import { createDoc, fetchAndFilter, getDocById, queryDocsByType, updateDoc } from './libs/doc';
+import { createDoc, fetchAndFilter, getDocById, minifyDoc, queryDocsByType, updateDoc } from './libs/doc';
 import { PostgresDataContext } from './libs/data-context';
 import { SettingsService } from '../local/libs/data-context';
 import logger from '@medic/logger';
@@ -152,7 +152,8 @@ export namespace v1 {
         assertHasRequiredField(updatedPerson, { name: 'name', type: 'string' }, InvalidArgumentError);
       }
 
-      const { _rev } = await updatePgDoc(updatedPerson);
+      const minified = minifyDoc(updatedPerson);
+      const { _rev } = await updatePgDoc(minified);
       return { ...updatedPerson, _rev };
     };
   };
