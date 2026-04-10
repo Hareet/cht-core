@@ -2,6 +2,7 @@ import sinon, { SinonStub } from 'sinon';
 import { expect } from 'chai';
 import { queryByFreetext } from '../../../src/postgres/libs/freetext';
 import { PostgresDataContext, DatabasePool } from '../../../src/postgres/libs/data-context';
+import { InvalidArgumentError } from '../../../src/libs/error';
 
 describe('postgres freetext lib', () => {
   let poolQuery: SinonStub;
@@ -97,6 +98,80 @@ describe('postgres freetext lib', () => {
 
       const params = poolQuery.firstCall.args[1];
       expect(params).to.include(20);
+    });
+
+    it('allows valid keyed freetext with alphanumeric keys', async () => {
+      poolQuery.resolves({ rows: [{ _id: 'c1' }], rowCount: 1 });
+
+      const result = await queryByFreetext(ctx, 'contacts')(
+        { freetext: 'patient_id:12345' }, null, 10
+      );
+
+      expect(result.data).to.deep.equal(['c1']);
+      const sql = poolQuery.firstCall.args[0];
+      expect(sql).to.include("'patient_id'");
+    });
+
+    it('allows keyed freetext with hyphens in key', async () => {
+      poolQuery.resolves({ rows: [{ _id: 'c1' }], rowCount: 1 });
+
+      const result = await queryByFreetext(ctx, 'contacts')(
+        { freetext: 'rc-code:ABC' }, null, 10
+      );
+
+      expect(result.data).to.deep.equal(['c1']);
+      const sql = poolQuery.firstCall.args[0];
+      expect(sql).to.include("'rc-code'");
+    });
+
+    it('rejects keyed freetext with SQL injection in key', async () => {
+      await expect(
+        queryByFreetext(ctx, 'contacts')(
+          { freetext: "name' OR 1=1 --:anything" }, null, 10
+        )
+      ).to.be.rejectedWith(InvalidArgumentError, 'Invalid freetext search key');
+
+      expect(poolQuery.notCalled).to.be.true;
+    });
+
+    it('rejects keyed freetext with semicolons in key', async () => {
+      await expect(
+        queryByFreetext(ctx, 'contacts')(
+          { freetext: 'name; DROP TABLE couchdb; --:val' }, null, 10
+        )
+      ).to.be.rejectedWith(InvalidArgumentError, 'Invalid freetext search key');
+
+      expect(poolQuery.notCalled).to.be.true;
+    });
+
+    it('rejects keyed freetext with parentheses in key', async () => {
+      await expect(
+        queryByFreetext(ctx, 'contacts')(
+          { freetext: 'name):val' }, null, 10
+        )
+      ).to.be.rejectedWith(InvalidArgumentError, 'Invalid freetext search key');
+
+      expect(poolQuery.notCalled).to.be.true;
+    });
+
+    it('rejects keyed freetext with empty key', async () => {
+      await expect(
+        queryByFreetext(ctx, 'contacts')(
+          { freetext: ':value' }, null, 10
+        )
+      ).to.be.rejectedWith(InvalidArgumentError, 'Invalid freetext search key');
+
+      expect(poolQuery.notCalled).to.be.true;
+    });
+
+    it('rejects keyed freetext with spaces in key', async () => {
+      await expect(
+        queryByFreetext(ctx, 'contacts')(
+          { freetext: 'my field:value' }, null, 10
+        )
+      ).to.be.rejectedWith(InvalidArgumentError, 'Invalid freetext search key');
+
+      expect(poolQuery.notCalled).to.be.true;
     });
   });
 
