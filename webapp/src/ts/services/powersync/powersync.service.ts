@@ -423,6 +423,43 @@ export class PowerSyncService implements OnDestroy {
     return this.initialized && (this.statusSubject.value.hasSynced || false);
   }
 
+  // ---------------------------------------------------------------------------
+  // Error recovery & queue visibility
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Reconnect to the PowerSync service.
+   * Use when sync appears stuck or after recovering from a network outage.
+   * Tears down the current sync stream and re-establishes it with fresh credentials.
+   */
+  async reconnect(): Promise<void> {
+    if (!this.db || !this.connector) {
+      return;
+    }
+    await this.db.disconnect();
+    // connect() is fire-and-forget; sync resumes in the background
+    this.db.connect(this.connector);
+  }
+
+  /**
+   * Get the number of pending upload operations in the offline queue.
+   * Returns 0 if not initialized.
+   */
+  async getPendingUploadCount(): Promise<number> {
+    if (!this.db) {
+      return 0;
+    }
+    const stats = await this.db.getUploadQueueStats();
+    return stats.count;
+  }
+
+  /**
+   * Check if there are any pending writes waiting to be uploaded.
+   */
+  async hasPendingWrites(): Promise<boolean> {
+    return (await this.getPendingUploadCount()) > 0;
+  }
+
   /**
    * Derive the PowerSync service URL from the current browser location.
    * In the dev container, PowerSync is proxied at /powersync.

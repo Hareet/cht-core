@@ -16,6 +16,7 @@
   ],
   "include": [
     "tests/karma/**/*.spec.ts",
-    "tests/karma/**/*.d.ts"
+    "tests/karma/**/*.d.ts",
+    "src/ts/services/powersync/**/*.ts"
   ]
 }
