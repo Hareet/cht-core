@@ -363,6 +363,99 @@ const testRapidFireNotifications = async () => {
   }
 };
 
+// ─── Test: Reconnection catch-up poll after LISTEN connection drop ────
+const testReconnectionCatchUp = async () => {
+  console.log('\n--- Reconnection Catch-Up Poll ---');
+
+  // Use a very long poll interval — the ONLY way changes get detected
+  // promptly is via the reconnection catch-up poll, not the fallback timer.
+  const feed = new PgChangesFeed({
+    live: true,
+    since: PgChangesFeed.buildCursor(new Date().toISOString(), '\uffff'),
+    batchSize: 100,
+    pollInterval: 120000, // 2 minutes — effectively disabled
+  });
+
+  const changes = [];
+  feed.on('change', c => changes.push(c));
+  await feed.start();
+  await sleep(500);
+
+  // Find the LISTEN connection's PID so we can terminate it.
+  // The LISTEN connection is the one in 'idle' state that has executed LISTEN.
+  const pidClient = await pool.connect();
+  let listenPid;
+  try {
+    const { rows } = await pidClient.query(
+      `SELECT pid FROM pg_stat_activity
+       WHERE datname = $1 AND usename = $2 AND state = 'idle'
+         AND query LIKE '%LISTEN%'
+       ORDER BY backend_start DESC
+       LIMIT 1`,
+      [config.database, config.user]
+    );
+    if (rows.length === 0) {
+      fail('reconnection catch-up', 'could not find LISTEN connection PID');
+      feed.cancel();
+      pidClient.release();
+      return;
+    }
+    listenPid = rows[0].pid;
+  } finally {
+    pidClient.release();
+  }
+
+  pass(`Found LISTEN connection PID: ${listenPid}`);
+
+  // Kill the LISTEN connection — simulates network drop / PG restart
+  const killClient = await pool.connect();
+  try {
+    await killClient.query('SELECT pg_terminate_backend($1)', [listenPid]);
+  } finally {
+    killClient.release();
+  }
+
+  // While the listener is reconnecting (RECONNECT_DELAY_MS = 5s),
+  // insert a document. Its NOTIFY will be lost since there's no listener.
+  await sleep(1000); // Give time for disconnect to register
+  const gapDocId = `test:reconnect-gap:${Date.now()}`;
+  await insertTestDoc(gapDocId, 'data_record');
+  log(`Inserted ${gapDocId} during LISTEN gap`);
+
+  // Wait for reconnection (5s delay) + catch-up poll to complete.
+  // Total wait: ~5s reconnect + 1s buffer = ~7s from the kill.
+  // We already waited 1s above, so wait another 7s.
+  await sleep(7000);
+  feed.cancel();
+
+  if (changes.some(c => c.id === gapDocId)) {
+    pass(`Reconnection catch-up poll detected doc inserted during LISTEN gap`);
+  } else {
+    fail('reconnection catch-up',
+      `doc ${gapDocId} not found among ${changes.length} changes: ` +
+      `${changes.map(c => c.id).join(', ')}`);
+  }
+};
+
+// ─── Test: NotifyListener emits 'reconnected' only on re-connections ──
+const testReconnectedEventNotOnFirstConnect = async () => {
+  console.log('\n--- Reconnected Event Not Fired on First Connect ---');
+
+  const listener = new NotifyListener(config);
+  let reconnectedCount = 0;
+  listener.on('reconnected', () => reconnectedCount++);
+
+  await listener.start();
+  await sleep(500);
+  listener.stop();
+
+  if (reconnectedCount === 0) {
+    pass('No reconnected event on initial connection');
+  } else {
+    fail('first connect', `reconnected fired ${reconnectedCount} times`);
+  }
+};
+
 // ─── Test: Metadata auto-creates sentinel schema and table ────────────
 const testMetadataAutoInit = async () => {
   console.log('\n--- Metadata Auto-Initialization ---');
@@ -417,6 +510,8 @@ const run = async () => {
     await testMetadata();
     await testPendingPoll();
     await testRapidFireNotifications();
+    await testReconnectionCatchUp();
+    await testReconnectedEventNotOnFirstConnect();
     await testMetadataAutoInit();
   } finally {
     await cleanup();

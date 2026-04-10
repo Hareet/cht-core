@@ -44,6 +44,7 @@ class NotifyListener extends EventEmitter {
     this._config = config;
     this._client = null;
     this._running = false;
+    this._wasConnected = false;
   }
 
   async start() {
@@ -85,7 +86,14 @@ class NotifyListener extends EventEmitter {
 
       await this._client.connect();
       await this._client.query('LISTEN couchdb_changes');
-      logger.info('pg-changes: LISTEN connection established on couchdb_changes');
+
+      if (this._wasConnected) {
+        logger.info('pg-changes: LISTEN connection re-established — triggering catch-up poll');
+        this.emit('reconnected');
+      } else {
+        logger.info('pg-changes: LISTEN connection established on couchdb_changes');
+      }
+      this._wasConnected = true;
     } catch (err) {
       logger.error('pg-changes: Failed to establish LISTEN connection: %o', err);
       this._reconnect();
@@ -184,6 +192,7 @@ class PgChangesFeed extends EventEmitter {
     if (this._live) {
       this._listener = new NotifyListener(this._config);
       this._listener.on('notification', () => this._onNotification());
+      this._listener.on('reconnected', () => this._onReconnected());
       await this._listener.start();
     }
 
@@ -208,6 +217,24 @@ class PgChangesFeed extends EventEmitter {
         logger.error('pg-changes: Notification-triggered poll error: %o', err);
       });
     }, NOTIFY_DEBOUNCE_MS);
+  }
+
+  /**
+   * Called when the LISTEN connection drops and is re-established.
+   * NOTIFY payloads are transient — any fired while the connection was down
+   * are permanently lost. An immediate poll (bypassing debounce) ensures
+   * changes during the gap are picked up without waiting for the next
+   * scheduled fallback poll.
+   */
+  _onReconnected() {
+    // Cancel any pending debounce — we want an immediate full poll
+    if (this._debounceTimer) {
+      clearTimeout(this._debounceTimer);
+      this._debounceTimer = null;
+    }
+    this._poll().catch(err => {
+      logger.error('pg-changes: Reconnection catch-up poll error: %o', err);
+    });
   }
 
   _schedulePoll() {
