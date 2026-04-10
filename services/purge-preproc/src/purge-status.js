@@ -181,25 +181,27 @@ const completeRunLog = async (runId, stats) => {
   ]);
 };
 
-// Remove purge_status entries for documents that have been deleted from couchdb.
-// Deleted docs have _deleted = true in the couchdb table. Their purge_status rows
-// become stale since the engine skips deleted docs during evaluation.
+// Remove purge_status entries for documents that are no longer active in couchdb.
+// This handles two cases:
+//   1. Soft-deleted docs: _deleted = true in the couchdb table
+//   2. Physically removed docs: no row exists in couchdb at all (e.g., CouchDB
+//      compaction removed the doc, or a migration script cleaned up the row)
 // Without cleanup, purge_status grows unboundedly as docs are deleted over time.
 const cleanupDeletedDocs = async () => {
   const tbl = `${db.getSchema()}.couchdb`;
 
   const result = await db.query(`
     DELETE FROM purge_status ps
-    WHERE EXISTS (
+    WHERE NOT EXISTS (
       SELECT 1 FROM ${tbl} c
       WHERE c._id = ps.doc_id
-      AND c._deleted IS TRUE
+      AND (c._deleted IS NOT TRUE)
     )
   `);
 
   const deleted = result.rowCount || 0;
   if (deleted > 0) {
-    console.log(`Cleaned up ${deleted} purge_status entries for deleted documents`);
+    console.log(`Cleaned up ${deleted} purge_status entries for deleted/missing documents`);
   }
   return deleted;
 };

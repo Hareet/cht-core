@@ -218,7 +218,7 @@ describe('Purge Status', () => {
   });
 
   describe('cleanupDeletedDocs', () => {
-    it('should delete purge_status entries for deleted couchdb documents', async () => {
+    it('should delete purge_status entries for deleted or missing couchdb documents', async () => {
       const queryStub = sinon.stub(db, 'query').resolves({ rowCount: 5 });
       sinon.stub(console, 'log');
 
@@ -228,8 +228,11 @@ describe('Purge Status', () => {
       expect(queryStub.calledOnce).to.be.true;
       const sql = queryStub.args[0][0];
       expect(sql).to.include('DELETE FROM purge_status');
-      expect(sql).to.include('_deleted IS TRUE');
-      expect(console.log.calledWith('Cleaned up 5 purge_status entries for deleted documents')).to.be.true;
+      // The query uses NOT EXISTS with _deleted IS NOT TRUE to catch both
+      // soft-deleted docs and docs physically removed from the couchdb table
+      expect(sql).to.include('NOT EXISTS');
+      expect(sql).to.include('_deleted IS NOT TRUE');
+      expect(console.log.calledWith('Cleaned up 5 purge_status entries for deleted/missing documents')).to.be.true;
     });
 
     it('should return 0 and not log when no entries to clean', async () => {
