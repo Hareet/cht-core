@@ -2,6 +2,7 @@ import { DataContext } from '../src';
 import sinon, { SinonStub } from 'sinon';
 import * as Context from '../src/libs/data-context';
 import * as Local from '../src/local';
+import * as Postgres from '../src/postgres';
 import * as Remote from '../src/remote';
 import * as Qualifier from '../src/qualifier';
 import * as Contact from '../src/contact';
@@ -45,7 +46,7 @@ describe('contact', () => {
 
         expect(result).to.equal(contact);
         expect(assertDataContext.calledOnceWithExactly(dataContext)).to.be.true;
-        expect(adapt.calledOnceWithExactly(dataContext, Local.Contact.v1.get, Remote.Contact.v1.get)).to.be.true;
+        expect(adapt.calledOnceWithExactly(dataContext, Local.Contact.v1.get, Remote.Contact.v1.get, Postgres.Contact.v1.get)).to.be.true;
         expect(isUuidQualifier.calledOnceWithExactly(qualifier)).to.be.true;
         expect(getContact.calledOnceWithExactly(qualifier)).to.be.true;
       });
@@ -57,7 +58,7 @@ describe('contact', () => {
           .to.be.rejectedWith(`Invalid identifier [${JSON.stringify(qualifier)}].`);
 
         expect(assertDataContext.calledOnceWithExactly(dataContext)).to.be.true;
-        expect(adapt.calledOnceWithExactly(dataContext, Local.Contact.v1.get, Remote.Contact.v1.get)).to.be.true;
+        expect(adapt.calledOnceWithExactly(dataContext, Local.Contact.v1.get, Remote.Contact.v1.get, Postgres.Contact.v1.get)).to.be.true;
         expect(isUuidQualifier.calledOnceWithExactly(qualifier)).to.be.true;
         expect(getContact.notCalled).to.be.true;
       });
@@ -95,7 +96,8 @@ describe('contact', () => {
         expect(adapt.calledOnceWithExactly(
           dataContext,
           Local.Contact.v1.getWithLineage,
-          Remote.Contact.v1.getWithLineage
+          Remote.Contact.v1.getWithLineage,
+          Postgres.Contact.v1.getWithLineage
         )).to.be.true;
         expect(isUuidQualifier.calledOnceWithExactly(qualifier)).to.be.true;
         expect(getContactWithLineage.calledOnceWithExactly(qualifier)).to.be.true;
@@ -111,7 +113,8 @@ describe('contact', () => {
         expect(adapt.calledOnceWithExactly(
           dataContext,
           Local.Contact.v1.getWithLineage,
-          Remote.Contact.v1.getWithLineage
+          Remote.Contact.v1.getWithLineage,
+          Postgres.Contact.v1.getWithLineage
         )).to.be.true;
         expect(isUuidQualifier.calledOnceWithExactly(qualifier)).to.be.true;
         expect(getContactWithLineage.notCalled).to.be.true;
@@ -164,7 +167,7 @@ describe('contact', () => {
         expect(result).to.equal(pageData);
         expect(assertDataContext.calledOnceWithExactly(dataContext)).to.be.true;
         expect(
-          adapt.calledOnceWithExactly(dataContext, Local.Contact.v1.getUuidsPage, Remote.Contact.v1.getUuidsPage)
+          adapt.calledOnceWithExactly(dataContext, Local.Contact.v1.getUuidsPage, Remote.Contact.v1.getUuidsPage, Postgres.Contact.v1.getUuidsPage)
         ).to.be.true;
         expect(getIdsPage.calledOnceWithExactly(qualifier, null, limit)).to.be.true;
         expect(isContactTypeQualifier.calledOnceWithExactly(qualifier)).to.be.true;
@@ -192,7 +195,7 @@ describe('contact', () => {
         expect(result).to.equal(pageData);
         expect(assertDataContext.calledOnceWithExactly(dataContext)).to.be.true;
         expect(
-          adapt.calledOnceWithExactly(dataContext, Local.Contact.v1.getUuidsPage, Remote.Contact.v1.getUuidsPage)
+          adapt.calledOnceWithExactly(dataContext, Local.Contact.v1.getUuidsPage, Remote.Contact.v1.getUuidsPage, Postgres.Contact.v1.getUuidsPage)
         ).to.be.true;
         expect(getIdsPage.calledOnceWithExactly(qualifier, cursor, limit)).to.be.true;
         expect(isContactTypeQualifier.calledOnceWithExactly(qualifier)).to.be.true;
@@ -210,7 +213,7 @@ describe('contact', () => {
         expect(result).to.equal(pageData);
         expect(assertDataContext.calledOnceWithExactly(dataContext)).to.be.true;
         expect(
-          adapt.calledOnceWithExactly(dataContext, Local.Contact.v1.getUuidsPage, Remote.Contact.v1.getUuidsPage)
+          adapt.calledOnceWithExactly(dataContext, Local.Contact.v1.getUuidsPage, Remote.Contact.v1.getUuidsPage, Postgres.Contact.v1.getUuidsPage)
         ).to.be.true;
         expect(getIdsPage.calledOnceWithExactly(qualifier, cursor, limit)).to.be.true;
         expect(isContactTypeQualifier.calledOnceWithExactly(qualifier)).to.be.true;
@@ -239,7 +242,7 @@ describe('contact', () => {
             `Must be a contact type and/or freetext qualifier.`);
         expect(assertDataContext.calledOnceWithExactly(dataContext)).to.be.true;
         expect(
-          adapt.calledOnceWithExactly(dataContext, Local.Contact.v1.getUuidsPage, Remote.Contact.v1.getUuidsPage)
+          adapt.calledOnceWithExactly(dataContext, Local.Contact.v1.getUuidsPage, Remote.Contact.v1.getUuidsPage, Postgres.Contact.v1.getUuidsPage)
         ).to.be.true;
         expect(isContactTypeQualifier.calledOnceWithExactly(invalidContactTypeQualifier)).to.be.true;
         expect(isFreetextQualifier.calledOnceWithExactly(invalidContactTypeQualifier)).to.be.true;
@@ -254,7 +257,7 @@ describe('contact', () => {
             `Must be a contact type and/or freetext qualifier.`);
         expect(assertDataContext.calledOnceWithExactly(dataContext)).to.be.true;
         expect(
-          adapt.calledOnceWithExactly(dataContext, Local.Contact.v1.getUuidsPage, Remote.Contact.v1.getUuidsPage)
+          adapt.calledOnceWithExactly(dataContext, Local.Contact.v1.getUuidsPage, Remote.Contact.v1.getUuidsPage, Postgres.Contact.v1.getUuidsPage)
         ).to.be.true;
         expect(isContactTypeQualifier.calledOnceWithExactly(invalidFreetextQualifier)).to.be.true;
         expect(isFreetextQualifier.calledOnceWithExactly(invalidFreetextQualifier)).to.be.true;
@@ -271,7 +274,7 @@ describe('contact', () => {
 
         expect(assertDataContext.calledOnceWithExactly(dataContext)).to.be.true;
         expect(
-          adapt.calledOnceWithExactly(dataContext, Local.Contact.v1.getUuidsPage, Remote.Contact.v1.getUuidsPage)
+          adapt.calledOnceWithExactly(dataContext, Local.Contact.v1.getUuidsPage, Remote.Contact.v1.getUuidsPage, Postgres.Contact.v1.getUuidsPage)
         ).to.be.true;
         expect(isContactTypeQualifier.calledOnceWithExactly(invalidQualifier)).to.be.true;
         expect(isFreetextQualifier.calledOnceWithExactly(invalidQualifier)).to.be.true;
@@ -296,7 +299,7 @@ describe('contact', () => {
 
           expect(assertDataContext.calledOnceWithExactly(dataContext)).to.be.true;
           expect(
-            adapt.calledOnceWithExactly(dataContext, Local.Contact.v1.getUuidsPage, Remote.Contact.v1.getUuidsPage)
+            adapt.calledOnceWithExactly(dataContext, Local.Contact.v1.getUuidsPage, Remote.Contact.v1.getUuidsPage, Postgres.Contact.v1.getUuidsPage)
           ).to.be.true;
           expect(isContactTypeQualifier.notCalled).to.be.true;
           expect(isFreetextQualifier.notCalled).to.be.true;
@@ -319,7 +322,7 @@ describe('contact', () => {
 
           expect(assertDataContext.calledOnceWithExactly(dataContext)).to.be.true;
           expect(
-            adapt.calledOnceWithExactly(dataContext, Local.Contact.v1.getUuidsPage, Remote.Contact.v1.getUuidsPage)
+            adapt.calledOnceWithExactly(dataContext, Local.Contact.v1.getUuidsPage, Remote.Contact.v1.getUuidsPage, Postgres.Contact.v1.getUuidsPage)
           ).to.be.true;
           expect(isContactTypeQualifier.notCalled).to.be.true;
           expect(isFreetextQualifier.notCalled).to.be.true;

@@ -6,6 +6,7 @@ import * as Report from '../src/report';
 import { expect } from 'chai';
 import * as Local from '../src/local';
 import * as Remote from '../src/remote';
+import * as Postgres from '../src/postgres';
 import * as Core from '../src/libs/core';
 import { fakeGenerator } from './utils';
 import * as Input from '../src/input';
@@ -45,7 +46,7 @@ describe('report', () => {
 
         expect(result).to.equal(report);
         expect(assertDataContext.calledOnceWithExactly(dataContext)).to.be.true;
-        expect(adapt.calledOnceWithExactly(dataContext, Local.Report.v1.get, Remote.Report.v1.get)).to.be.true;
+        expect(adapt.calledOnceWithExactly(dataContext, Local.Report.v1.get, Remote.Report.v1.get, Postgres.Report.v1.get)).to.be.true;
         expect(isUuidQualifier.calledOnceWithExactly(qualifier)).to.be.true;
         expect(getReport.calledOnceWithExactly(qualifier)).to.be.true;
       });
@@ -57,7 +58,7 @@ describe('report', () => {
           .to.be.rejectedWith(`Invalid identifier [${JSON.stringify(qualifier)}].`);
 
         expect(assertDataContext.calledOnceWithExactly(dataContext)).to.be.true;
-        expect(adapt.calledOnceWithExactly(dataContext, Local.Report.v1.get, Remote.Report.v1.get)).to.be.true;
+        expect(adapt.calledOnceWithExactly(dataContext, Local.Report.v1.get, Remote.Report.v1.get, Postgres.Report.v1.get)).to.be.true;
         expect(isUuidQualifier.calledOnceWithExactly(qualifier)).to.be.true;
         expect(getReport.notCalled).to.be.true;
       });
@@ -105,7 +106,8 @@ describe('report', () => {
         expect(adapt.calledOnceWithExactly(
           dataContext,
           Local.Report.v1.getWithLineage,
-          Remote.Report.v1.getWithLineage
+          Remote.Report.v1.getWithLineage,
+          Postgres.Report.v1.getWithLineage
         )).to.be.true;
         expect(isUuidQualifier.calledOnceWithExactly(qualifier)).to.be.true;
         expect(getReportWithLineage.calledOnceWithExactly(qualifier)).to.be.true;
@@ -121,7 +123,8 @@ describe('report', () => {
         expect(adapt.calledOnceWithExactly(
           dataContext,
           Local.Report.v1.getWithLineage,
-          Remote.Report.v1.getWithLineage
+          Remote.Report.v1.getWithLineage,
+          Postgres.Report.v1.getWithLineage
         )).to.be.true;
         expect(isUuidQualifier.calledOnceWithExactly(qualifier)).to.be.true;
         expect(getReportWithLineage.notCalled).to.be.true;
@@ -164,7 +167,7 @@ describe('report', () => {
         expect(result).to.equal(pageData);
         expect(assertDataContext.calledOnceWithExactly(dataContext)).to.be.true;
         expect(
-          adapt.calledOnceWithExactly(dataContext, Local.Report.v1.getUuidsPage, Remote.Report.v1.getUuidsPage)
+          adapt.calledOnceWithExactly(dataContext, Local.Report.v1.getUuidsPage, Remote.Report.v1.getUuidsPage, Postgres.Report.v1.getUuidsPage)
         ).to.be.true;
         expect(getIdsPage.calledOnceWithExactly(freetextQualifier, null, limit)).to.be.true;
         expect(isFreetextQualifier.calledOnceWithExactly(freetextQualifier)).to.be.true;
@@ -189,7 +192,7 @@ describe('report', () => {
         expect(result).to.equal(pageData);
         expect(assertDataContext.calledOnceWithExactly(dataContext)).to.be.true;
         expect(
-          adapt.calledOnceWithExactly(dataContext, Local.Report.v1.getUuidsPage, Remote.Report.v1.getUuidsPage)
+          adapt.calledOnceWithExactly(dataContext, Local.Report.v1.getUuidsPage, Remote.Report.v1.getUuidsPage, Postgres.Report.v1.getUuidsPage)
         ).to.be.true;
         expect(getIdsPage.calledOnceWithExactly(freetextQualifier, cursor, limit)).to.be.true;
         expect(isFreetextQualifier.calledOnceWithExactly(freetextQualifier)).to.be.true;
@@ -205,7 +208,7 @@ describe('report', () => {
         expect(result).to.equal(pageData);
         expect(assertDataContext.calledOnceWithExactly(dataContext)).to.be.true;
         expect(
-          adapt.calledOnceWithExactly(dataContext, Local.Report.v1.getUuidsPage, Remote.Report.v1.getUuidsPage)
+          adapt.calledOnceWithExactly(dataContext, Local.Report.v1.getUuidsPage, Remote.Report.v1.getUuidsPage, Postgres.Report.v1.getUuidsPage)
         ).to.be.true;
         expect(getIdsPage.calledOnceWithExactly(freetextQualifier, cursor, limit)).to.be.true;
         expect(isFreetextQualifier.calledOnceWithExactly(freetextQualifier)).to.be.true;
@@ -231,7 +234,7 @@ describe('report', () => {
 
         expect(assertDataContext.calledOnceWithExactly(dataContext)).to.be.true;
         expect(
-          adapt.calledOnceWithExactly(dataContext, Local.Report.v1.getUuidsPage, Remote.Report.v1.getUuidsPage)
+          adapt.calledOnceWithExactly(dataContext, Local.Report.v1.getUuidsPage, Remote.Report.v1.getUuidsPage, Postgres.Report.v1.getUuidsPage)
         ).to.be.true;
         expect(isFreetextQualifier.calledOnceWithExactly(invalidFreetextQualifier)).to.be.true;
         expect(getIdsPage.notCalled).to.be.true;
@@ -254,7 +257,7 @@ describe('report', () => {
             .to.be.rejectedWith(`The limit must be a positive integer: [${JSON.stringify(limitValue)}]`);
 
           expect(assertDataContext.calledOnceWithExactly(dataContext)).to.be.true;
-          expect(adapt.calledOnceWithExactly(dataContext, Local.Report.v1.getUuidsPage, Remote.Report.v1.getUuidsPage))
+          expect(adapt.calledOnceWithExactly(dataContext, Local.Report.v1.getUuidsPage, Remote.Report.v1.getUuidsPage, Postgres.Report.v1.getUuidsPage))
             .to.be.true;
           expect(isFreetextQualifier.calledOnceWithExactly(freetextQualifier)).to.be.true;
           expect(getIdsPage.notCalled).to.be.true;
@@ -275,7 +278,7 @@ describe('report', () => {
             .to.be.rejectedWith(`The cursor must be a string or null for first page: [${JSON.stringify(skipValue)}]`);
 
           expect(assertDataContext.calledOnceWithExactly(dataContext)).to.be.true;
-          expect(adapt.calledOnceWithExactly(dataContext, Local.Report.v1.getUuidsPage, Remote.Report.v1.getUuidsPage))
+          expect(adapt.calledOnceWithExactly(dataContext, Local.Report.v1.getUuidsPage, Remote.Report.v1.getUuidsPage, Postgres.Report.v1.getUuidsPage))
             .to.be.true;
           expect(isFreetextQualifier.calledOnceWithExactly(freetextQualifier)).to.be.true;
           expect(getIdsPage.notCalled).to.be.true;
@@ -357,7 +360,7 @@ describe('report', () => {
 
         expect(result).to.equal(doc);
         expect(assertDataContext.calledOnceWithExactly(dataContext)).to.be.true;
-        expect(adapt.calledOnceWithExactly(dataContext, Local.Report.v1.create, Remote.Report.v1.create))
+        expect(adapt.calledOnceWithExactly(dataContext, Local.Report.v1.create, Remote.Report.v1.create, Postgres.Report.v1.create))
           .to.be.true;
         expect(createReportDoc.calledOnceWithExactly(input)).to.be.true;
       });
@@ -368,7 +371,7 @@ describe('report', () => {
           .to.be.rejectedWith(`Report data not provided.`);
 
         expect(assertDataContext.calledOnceWithExactly(dataContext)).to.be.true;
-        expect(adapt.calledOnceWithExactly(dataContext, Local.Report.v1.create, Remote.Report.v1.create))
+        expect(adapt.calledOnceWithExactly(dataContext, Local.Report.v1.create, Remote.Report.v1.create, Postgres.Report.v1.create))
           .to.be.true;
         expect(createReportDoc.notCalled).to.be.true;
       });
@@ -389,7 +392,7 @@ describe('report', () => {
           .to.be.rejectedWith(`Updated report data not provided.`);
 
         expect(assertDataContext.calledOnceWithExactly(dataContext)).to.be.true;
-        expect(adapt.calledOnceWithExactly(dataContext, Local.Report.v1.update, Remote.Report.v1.update))
+        expect(adapt.calledOnceWithExactly(dataContext, Local.Report.v1.update, Remote.Report.v1.update, Postgres.Report.v1.update))
           .to.be.true;
         expect(updateReportDoc.notCalled).to.be.true;
       });
@@ -414,7 +417,7 @@ describe('report', () => {
 
         expect(result).to.equal(doc);
         expect(assertDataContext.calledOnceWithExactly(dataContext)).to.be.true;
-        expect(adapt.calledOnceWithExactly(dataContext, Local.Report.v1.update, Remote.Report.v1.update))
+        expect(adapt.calledOnceWithExactly(dataContext, Local.Report.v1.update, Remote.Report.v1.update, Postgres.Report.v1.update))
           .to.be.true;
         expect(updateReportDoc.calledOnceWithExactly(input)).to.be.true;
       });
