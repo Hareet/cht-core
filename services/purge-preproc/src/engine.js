@@ -288,6 +288,10 @@ const run = async (options = {}) => {
     await purgeExpiredTasks(rolesByHash, stats);
     await purgeExpiredTargets(rolesByHash, stats);
 
+    // Clean up stale purge_status entries for deleted documents
+    const cleanedUp = await purgeStatus.cleanupDeletedDocs();
+    stats.deletedDocsCleaned = cleanedUp;
+
     await purgeStatus.completeRunLog(runId, stats);
     console.log(`Purge run completed: ${stats.contactsProcessed} contacts, ` +
       `${stats.docsEvaluated} docs evaluated, ${stats.docsPurged} purged, ` +

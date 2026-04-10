@@ -273,6 +273,35 @@ describe('Purge Engine', () => {
       expect(purgeStatus.completeRunLog.calledOnce).to.be.true;
     });
 
+    it('should call cleanupDeletedDocs during run', async () => {
+      const purgeFn = function() { return []; };
+
+      queryStub.onFirstCall().resolves({
+        rows: [{ fn: purgeFn.toString() }],
+      });
+
+      sinon.stub(rolesService, 'getRoles').resolves({ hash_chw: ['chw'] });
+      sinon.stub(rolesService, 'saveRoles').resolves();
+      sinon.stub(purgeStatus, 'startRunLog').resolves(1);
+      sinon.stub(purgeStatus, 'completeRunLog').resolves();
+      sinon.stub(purgeStatus, 'writePurgeResults').resolves();
+      sinon.stub(purgeStatus, 'cleanupDeletedDocs').resolves(3);
+
+      sinon.stub(contacts, 'getContactsBatch')
+        .onFirstCall().resolves([])
+        ;
+
+      sinon.stub(records, 'getUnallocatedRecords').resolves([]);
+
+      sinon.stub(console, 'log');
+
+      await engine.run({ incremental: false });
+
+      expect(purgeStatus.cleanupDeletedDocs.calledOnce).to.be.true;
+      const stats = purgeStatus.completeRunLog.args[0][1];
+      expect(stats.deletedDocsCleaned).to.equal(3);
+    });
+
     it('should skip contacts with too many records', async () => {
       const purgeFn = function() { return []; };
 

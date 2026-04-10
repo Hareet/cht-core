@@ -59,7 +59,7 @@ const SKIP = !process.env.POSTGRESQL_URL;
 
     await insertDoc('settings', {
       _id: 'settings',
-      purge: { fn: purgeFn },
+      settings: { purge: { fn: purgeFn } },
     });
 
     // Insert a user-settings doc with roles
@@ -154,6 +154,55 @@ const SKIP = !process.env.POSTGRESQL_URL;
     const values = Object.values(purgedByRole);
     expect(values).to.include(true);
     expect(values).to.include(false);
+  });
+
+  it('should clean up purge_status entries when documents are deleted', async () => {
+    const purgeFn = `function(userCtx, contact, reports) { return []; }`;
+
+    await insertDoc('settings', {
+      _id: 'settings',
+      settings: { purge: { fn: purgeFn } },
+    });
+    await insertDoc('user-chw', { _id: 'user-chw', type: 'user-settings', roles: ['chw'] });
+    await insertDoc('contact1', { _id: 'contact1', type: 'person' });
+    await insertDoc('report1', {
+      _id: 'report1',
+      type: 'data_record',
+      form: 'a',
+      patient_id: 'contact1',
+      reported_date: Date.now(),
+    });
+
+    // Full run — both contact1 and report1 get purge_status entries
+    await engine.run({ incremental: false });
+
+    const before = await db.query(
+      'SELECT doc_id FROM purge_status WHERE doc_id IN ($1, $2)',
+      ['contact1', 'report1']
+    );
+    expect(before.rows.length).to.be.greaterThan(0);
+
+    // Mark report1 as deleted in couchdb
+    await db.query(
+      `UPDATE ${db.getSchema()}.couchdb SET _deleted = true WHERE _id = $1`,
+      ['report1']
+    );
+
+    // Run again — cleanup should remove purge_status for report1
+    await engine.run({ incremental: false });
+
+    const after = await db.query(
+      'SELECT doc_id, purged FROM purge_status WHERE doc_id = $1',
+      ['report1']
+    );
+    expect(after.rows).to.have.length(0);
+
+    // contact1 should still have entries
+    const contact = await db.query(
+      'SELECT doc_id FROM purge_status WHERE doc_id = $1',
+      ['contact1']
+    );
+    expect(contact.rows.length).to.be.greaterThan(0);
   });
 
   it('should run incrementally after initial full run', async () => {

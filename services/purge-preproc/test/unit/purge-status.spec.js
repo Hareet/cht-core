@@ -86,6 +86,40 @@ describe('Purge Status', () => {
     });
   });
 
+  describe('cleanupDeletedDocs', () => {
+    it('should delete purge_status entries for deleted couchdb documents', async () => {
+      const queryStub = sinon.stub(db, 'query').resolves({ rowCount: 5 });
+      sinon.stub(console, 'log');
+
+      const result = await purgeStatus.cleanupDeletedDocs();
+
+      expect(result).to.equal(5);
+      expect(queryStub.calledOnce).to.be.true;
+      const sql = queryStub.args[0][0];
+      expect(sql).to.include('DELETE FROM purge_status');
+      expect(sql).to.include('_deleted IS TRUE');
+      expect(console.log.calledWith('Cleaned up 5 purge_status entries for deleted documents')).to.be.true;
+    });
+
+    it('should return 0 and not log when no entries to clean', async () => {
+      sinon.stub(db, 'query').resolves({ rowCount: 0 });
+      sinon.stub(console, 'log');
+
+      const result = await purgeStatus.cleanupDeletedDocs();
+
+      expect(result).to.equal(0);
+      expect(console.log.callCount).to.equal(0);
+    });
+
+    it('should handle undefined rowCount gracefully', async () => {
+      sinon.stub(db, 'query').resolves({});
+
+      const result = await purgeStatus.cleanupDeletedDocs();
+
+      expect(result).to.equal(0);
+    });
+  });
+
   describe('failRunLog', () => {
     it('should mark run as failed', async () => {
       const queryStub = sinon.stub(db, 'query').resolves();

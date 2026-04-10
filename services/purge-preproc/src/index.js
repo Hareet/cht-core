@@ -33,9 +33,9 @@ const main = async () => {
     console.log(`Checking for changes every ${checkInterval / 1000}s`);
 
     const tick = async () => {
-      const changedIds = changes.drain();
-      if (changedIds.size > 0) {
-        console.log(`${changedIds.size} documents changed since last run`);
+      const { changed, deleted } = changes.drain();
+      if (changed.size > 0 || deleted.size > 0) {
+        console.log(`${changed.size} documents changed, ${deleted.size} deleted since last run`);
         await runOnce();
       }
       setTimeout(tick, checkInterval);

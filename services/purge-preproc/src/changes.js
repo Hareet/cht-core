@@ -12,6 +12,7 @@ const db = require('./db');
 
 let client = null;
 let changedIds = new Set();
+let deletedIds = new Set();
 let listening = false;
 
 const start = async () => {
@@ -28,8 +29,12 @@ const start = async () => {
 
     try {
       const payload = JSON.parse(msg.payload);
-      if (payload.id && !payload.deleted) {
-        changedIds.add(payload.id);
+      if (payload.id) {
+        if (payload.deleted) {
+          deletedIds.add(payload.id);
+        } else {
+          changedIds.add(payload.id);
+        }
       }
     } catch {
       // Ignore malformed payloads
@@ -48,11 +53,13 @@ const start = async () => {
   console.log('Listening for couchdb_changes notifications');
 };
 
-// Drain accumulated changed IDs. Returns the set and clears it.
+// Drain accumulated changed IDs. Returns changed and deleted sets, then clears them.
 const drain = () => {
-  const ids = changedIds;
+  const changed = changedIds;
+  const deleted = deletedIds;
   changedIds = new Set();
-  return ids;
+  deletedIds = new Set();
+  return { changed, deleted };
 };
 
 const stop = async () => {

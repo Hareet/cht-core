@@ -91,6 +91,29 @@ const completeRunLog = async (runId, stats) => {
   ]);
 };
 
+// Remove purge_status entries for documents that have been deleted from couchdb.
+// Deleted docs have _deleted = true in the couchdb table. Their purge_status rows
+// become stale since the engine skips deleted docs during evaluation.
+// Without cleanup, purge_status grows unboundedly as docs are deleted over time.
+const cleanupDeletedDocs = async () => {
+  const tbl = `${db.getSchema()}.couchdb`;
+
+  const result = await db.query(`
+    DELETE FROM purge_status ps
+    WHERE EXISTS (
+      SELECT 1 FROM ${tbl} c
+      WHERE c._id = ps.doc_id
+      AND c._deleted IS TRUE
+    )
+  `);
+
+  const deleted = result.rowCount || 0;
+  if (deleted > 0) {
+    console.log(`Cleaned up ${deleted} purge_status entries for deleted documents`);
+  }
+  return deleted;
+};
+
 // Mark a run as failed.
 const failRunLog = async (runId, error) => {
   await db.query(`
@@ -108,4 +131,5 @@ module.exports = {
   startRunLog,
   completeRunLog,
   failRunLog,
+  cleanupDeletedDocs,
 };
