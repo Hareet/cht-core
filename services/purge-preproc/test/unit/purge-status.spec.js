@@ -331,6 +331,48 @@ describe('Purge Status', () => {
     });
   });
 
+  describe('getLastRunSkippedContacts', () => {
+    it('should return empty array when no completed runs', async () => {
+      sinon.stub(db, 'query').resolves({ rows: [] });
+      const result = await purgeStatus.getLastRunSkippedContacts();
+      expect(result).to.deep.equal([]);
+    });
+
+    it('should return skipped contacts from last completed run', async () => {
+      sinon.stub(db, 'query').resolves({
+        rows: [{ skipped_contacts: ['c1', 'c2', 'c3'] }],
+      });
+      const result = await purgeStatus.getLastRunSkippedContacts();
+      expect(result).to.deep.equal(['c1', 'c2', 'c3']);
+    });
+
+    it('should return empty array when skipped_contacts is not an array', async () => {
+      sinon.stub(db, 'query').resolves({
+        rows: [{ skipped_contacts: 'invalid' }],
+      });
+      const result = await purgeStatus.getLastRunSkippedContacts();
+      expect(result).to.deep.equal([]);
+    });
+
+    it('should return empty array when skipped_contacts is empty', async () => {
+      sinon.stub(db, 'query').resolves({
+        rows: [{ skipped_contacts: [] }],
+      });
+      const result = await purgeStatus.getLastRunSkippedContacts();
+      expect(result).to.deep.equal([]);
+    });
+
+    it('should query only completed runs with non-null skipped_contacts', async () => {
+      const queryStub = sinon.stub(db, 'query').resolves({ rows: [] });
+      await purgeStatus.getLastRunSkippedContacts();
+      const sql = queryStub.args[0][0];
+      expect(sql).to.include('status = \'completed\'');
+      expect(sql).to.include('skipped_contacts IS NOT NULL');
+      expect(sql).to.include('ORDER BY completed_at DESC');
+      expect(sql).to.include('LIMIT 1');
+    });
+  });
+
   describe('failRunLog', () => {
     it('should mark run as failed', async () => {
       const queryStub = sinon.stub(db, 'query').resolves();

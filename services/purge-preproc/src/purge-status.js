@@ -206,6 +206,29 @@ const cleanupDeletedDocs = async () => {
   return deleted;
 };
 
+// Get skipped contact IDs from the last completed run.
+// When a contact is skipped due to a transient error (e.g., DB timeout), it won't
+// appear in the next incremental run's changed set (its saved_timestamp hasn't changed).
+// By including previously-skipped contacts in the incremental set, we ensure they are
+// retried rather than permanently left with stale/missing purge decisions.
+const getLastRunSkippedContacts = async () => {
+  const result = await db.query(`
+    SELECT skipped_contacts
+    FROM purge_run_log
+    WHERE status = 'completed'
+      AND skipped_contacts IS NOT NULL
+    ORDER BY completed_at DESC
+    LIMIT 1
+  `);
+
+  if (!result.rows.length) {
+    return [];
+  }
+
+  const skipped = result.rows[0].skipped_contacts;
+  return Array.isArray(skipped) ? skipped : [];
+};
+
 // Mark a run as failed.
 const failRunLog = async (runId, error) => {
   await db.query(`
@@ -222,6 +245,7 @@ module.exports = {
   getLastRunTimestamp,
   getLastPurgeFnHash,
   getLastRoleHashes,
+  getLastRunSkippedContacts,
   cleanupOrphanedRoles,
   startRunLog,
   completeRunLog,

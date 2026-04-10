@@ -307,6 +307,7 @@ describe('Purge Engine', () => {
       sinon.stub(purgeStatus, 'startRunLog').resolves(1);
       sinon.stub(purgeStatus, 'completeRunLog').resolves();
       sinon.stub(purgeStatus, 'getLastRunTimestamp').resolves(new Date('2025-01-01'));
+      sinon.stub(purgeStatus, 'getLastRunSkippedContacts').resolves([]);
       sinon.stub(purgeStatus, 'writePurgeResults').resolves();
 
       sinon.stub(contacts, 'getChangedContactIds').resolves(['c1']);
@@ -330,6 +331,85 @@ describe('Purge Engine', () => {
 
       // Unallocated records should also be filtered by lastRun timestamp
       expect(records.getUnallocatedRecords.args[0][2]).to.deep.equal(new Date('2025-01-01'));
+    });
+
+    it('should retry previously skipped contacts in incremental mode', async () => {
+      const purgeFn = function() { return []; };
+
+      queryStub.onFirstCall().resolves({
+        rows: [{ fn: purgeFn.toString() }],
+      });
+
+      sinon.stub(rolesService, 'getRoles').resolves({ hash_chw: ['chw'] });
+      sinon.stub(rolesService, 'saveRoles').resolves();
+      sinon.stub(purgeStatus, 'startRunLog').resolves(1);
+      sinon.stub(purgeStatus, 'completeRunLog').resolves();
+      sinon.stub(purgeStatus, 'getLastRunTimestamp').resolves(new Date('2025-01-01'));
+      sinon.stub(purgeStatus, 'writePurgeResults').resolves();
+      sinon.stub(purgeStatus, 'cleanupDeletedDocs').resolves(0);
+      sinon.stub(purgeStatus, 'cleanupOrphanedRoles').resolves(0);
+
+      // No changed contacts or records, but two contacts were skipped in previous run
+      sinon.stub(contacts, 'getChangedContactIds').resolves([]);
+      sinon.stub(records, 'getContactIdsWithChangedRecords').resolves([]);
+      sinon.stub(purgeStatus, 'getLastRunSkippedContacts').resolves(['skipped1', 'skipped2']);
+
+      sinon.stub(contacts, 'getContact')
+        .withArgs('skipped1').resolves({ id: 'skipped1', doc: { _id: 'skipped1', type: 'person' } })
+        .withArgs('skipped2').resolves({ id: 'skipped2', doc: { _id: 'skipped2', type: 'person' } });
+
+      sinon.stub(records, 'getSubjectIds').returns([]);
+      sinon.stub(records, 'getRecordsForSubjects').resolves({ reports: [], messages: [] });
+      sinon.stub(records, 'getUnallocatedRecords').resolves([]);
+
+      sinon.stub(console, 'log');
+
+      await engine.run({ incremental: true });
+
+      // Both previously skipped contacts should be re-evaluated
+      expect(contacts.getContact.callCount).to.equal(2);
+      expect(contacts.getContact.calledWith('skipped1')).to.be.true;
+      expect(contacts.getContact.calledWith('skipped2')).to.be.true;
+      expect(purgeStatus.completeRunLog.calledOnce).to.be.true;
+      expect(console.log.calledWith('Retrying 2 previously skipped contacts')).to.be.true;
+    });
+
+    it('should deduplicate skipped contacts with changed contacts', async () => {
+      const purgeFn = function() { return []; };
+
+      queryStub.onFirstCall().resolves({
+        rows: [{ fn: purgeFn.toString() }],
+      });
+
+      sinon.stub(rolesService, 'getRoles').resolves({ hash_chw: ['chw'] });
+      sinon.stub(rolesService, 'saveRoles').resolves();
+      sinon.stub(purgeStatus, 'startRunLog').resolves(1);
+      sinon.stub(purgeStatus, 'completeRunLog').resolves();
+      sinon.stub(purgeStatus, 'getLastRunTimestamp').resolves(new Date('2025-01-01'));
+      sinon.stub(purgeStatus, 'writePurgeResults').resolves();
+      sinon.stub(purgeStatus, 'cleanupDeletedDocs').resolves(0);
+      sinon.stub(purgeStatus, 'cleanupOrphanedRoles').resolves(0);
+
+      // c1 is both changed AND was previously skipped — should only be processed once
+      sinon.stub(contacts, 'getChangedContactIds').resolves(['c1']);
+      sinon.stub(records, 'getContactIdsWithChangedRecords').resolves([]);
+      sinon.stub(purgeStatus, 'getLastRunSkippedContacts').resolves(['c1', 'c2']);
+
+      sinon.stub(contacts, 'getContact')
+        .withArgs('c1').resolves({ id: 'c1', doc: { _id: 'c1', type: 'person' } })
+        .withArgs('c2').resolves({ id: 'c2', doc: { _id: 'c2', type: 'person' } });
+
+      sinon.stub(records, 'getSubjectIds').returns([]);
+      sinon.stub(records, 'getRecordsForSubjects').resolves({ reports: [], messages: [] });
+      sinon.stub(records, 'getUnallocatedRecords').resolves([]);
+
+      sinon.stub(console, 'log');
+
+      await engine.run({ incremental: true });
+
+      // c1 should be processed once (deduplicated), c2 also processed
+      expect(contacts.getContact.callCount).to.equal(2);
+      expect(purgeStatus.completeRunLog.calledOnce).to.be.true;
     });
 
     it('should pass null as since for unallocated records in full mode', async () => {
@@ -376,6 +456,7 @@ describe('Purge Engine', () => {
       sinon.stub(purgeStatus, 'cleanupDeletedDocs').resolves(1);
       sinon.stub(purgeStatus, 'cleanupOrphanedRoles').resolves(0);
       sinon.stub(purgeStatus, 'getLastRunTimestamp').resolves(new Date('2025-01-01'));
+      sinon.stub(purgeStatus, 'getLastRunSkippedContacts').resolves([]);
 
       // Simulate: no contacts changed, but a record was deleted (its contact needs re-eval)
       sinon.stub(contacts, 'getChangedContactIds').resolves([]);

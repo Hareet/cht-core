@@ -305,7 +305,20 @@ const _runWithLock = async (options, db) => {
       if (lastRun) {
         const changedContacts = await contacts.getChangedContactIds(lastRun);
         const contactsWithChangedRecords = await records.getContactIdsWithChangedRecords(lastRun);
-        contactIds = [...new Set([...changedContacts, ...contactsWithChangedRecords])];
+
+        // Retry contacts that were skipped in the previous run due to transient errors.
+        // Without this, skipped contacts would never be re-evaluated in incremental mode
+        // because their saved_timestamp hasn't changed.
+        const previouslySkipped = await purgeStatus.getLastRunSkippedContacts();
+
+        contactIds = [...new Set([
+          ...changedContacts,
+          ...contactsWithChangedRecords,
+          ...previouslySkipped,
+        ])];
+        if (previouslySkipped.length) {
+          console.log(`Retrying ${previouslySkipped.length} previously skipped contacts`);
+        }
         console.log(`Incremental mode: ${contactIds.length} contacts to re-evaluate`);
       }
     }
