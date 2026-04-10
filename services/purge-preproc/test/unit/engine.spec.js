@@ -107,6 +107,70 @@ describe('Purge Engine', () => {
       expect(result.hash_a).to.deep.equal({});
     });
 
+    it('should timeout and treat as purge-nothing when purge function runs too long', () => {
+      sinon.stub(console, 'warn');
+
+      // Simulate a timeout error from vm.runInNewContext — same error code Node.js throws
+      const timeoutErr = new Error('Script execution timed out after 5000ms');
+      timeoutErr.code = 'ERR_SCRIPT_EXECUTION_TIMEOUT';
+      const throwingFn = sinon.stub().throws(timeoutErr);
+
+      const group = {
+        contact: { _id: 'c1' },
+        reports: [{ _id: 'r1', form: 'a' }],
+        messages: [],
+        ids: ['c1', 'r1'],
+      };
+
+      const result = engine._evaluateGroup(throwingFn, group, { hash_a: ['chw'] });
+
+      // Timeout is non-fatal — treated as "purge nothing"
+      expect(result.hash_a).to.deep.equal({});
+      expect(console.warn.calledOnce).to.be.true;
+      expect(console.warn.args[0][0]).to.include('timed out');
+      expect(console.warn.args[0][0]).to.include('chw');
+    });
+
+    it('should not hang on an actual infinite loop purge function', () => {
+      sinon.stub(console, 'warn');
+
+      // A real infinite loop function — vm.runInNewContext will interrupt it
+      // eslint-disable-next-line no-constant-condition
+      const infiniteFn = function() { while (true) {} };
+
+      const group = {
+        contact: { _id: 'c1' },
+        reports: [],
+        messages: [],
+        ids: ['c1'],
+      };
+
+      // The PURGE_FN_TIMEOUT_MS constant is read at module load time (default 5000ms).
+      // To keep the test fast, we call vm.runInNewContext directly with a short timeout
+      // to prove the mechanism works, rather than waiting 5s.
+      const vm = require('vm');
+      const sandbox = vm.createContext({
+        purgeFn: infiniteFn,
+        userCtx: { roles: ['chw'] },
+        contact: group.contact,
+        reports: group.reports,
+        messages: group.messages,
+      });
+
+      let timedOut = false;
+      try {
+        vm.runInNewContext(
+          'purgeFn(userCtx, contact, reports, messages)',
+          sandbox,
+          { timeout: 50 }
+        );
+      } catch (err) {
+        timedOut = err.code === 'ERR_SCRIPT_EXECUTION_TIMEOUT';
+      }
+
+      expect(timedOut).to.be.true;
+    });
+
     it('should handle empty group (no ids means no evaluation)', () => {
       const purgeFn = sinon.stub().returns([]);
 
@@ -151,11 +215,67 @@ describe('Purge Engine', () => {
 
   describe('run', () => {
     let queryStub;
+    let mockLockClient;
 
     beforeEach(() => {
       queryStub = sinon.stub(db, 'query');
       // Default: return empty rows for any unmatched query (task/target auto-purge)
       queryStub.resolves({ rows: [] });
+
+      // Default: lock always succeeds
+      mockLockClient = { query: sinon.stub().resolves(), release: sinon.stub() };
+      sinon.stub(purgeStatus, 'tryAcquireRunLock').resolves({ acquired: true, client: mockLockClient });
+      sinon.stub(purgeStatus, 'releaseRunLock').resolves();
+    });
+
+    it('should skip when another run is already in progress', async () => {
+      purgeStatus.tryAcquireRunLock.resolves({ acquired: false });
+      sinon.stub(console, 'log');
+
+      await engine.run({ incremental: false });
+
+      expect(console.log.calledWith('Another purge run is already in progress. Skipping.')).to.be.true;
+      expect(purgeStatus.releaseRunLock.callCount).to.equal(0);
+    });
+
+    it('should release lock after successful run', async () => {
+      const purgeFn = function() { return []; };
+      queryStub.onFirstCall().resolves({ rows: [{ fn: purgeFn.toString() }] });
+
+      sinon.stub(rolesService, 'getRoles').resolves({ hash_chw: ['chw'] });
+      sinon.stub(rolesService, 'saveRoles').resolves();
+      sinon.stub(purgeStatus, 'startRunLog').resolves(1);
+      sinon.stub(purgeStatus, 'completeRunLog').resolves();
+      sinon.stub(purgeStatus, 'writePurgeResults').resolves();
+      sinon.stub(purgeStatus, 'cleanupDeletedDocs').resolves(0);
+      sinon.stub(purgeStatus, 'cleanupOrphanedRoles').resolves(0);
+      sinon.stub(contacts, 'getContactsBatch').resolves([]);
+      sinon.stub(records, 'getUnallocatedRecords').resolves([]);
+      sinon.stub(console, 'log');
+
+      await engine.run({ incremental: false });
+
+      expect(purgeStatus.releaseRunLock.calledOnce).to.be.true;
+      expect(purgeStatus.releaseRunLock.calledWith(mockLockClient)).to.be.true;
+    });
+
+    it('should release lock even when run throws an error', async () => {
+      queryStub.onFirstCall().resolves({ rows: [{ fn: 'function() { return []; }' }] });
+
+      sinon.stub(rolesService, 'getRoles').resolves({ hash_chw: ['chw'] });
+      sinon.stub(rolesService, 'saveRoles').resolves();
+      sinon.stub(purgeStatus, 'startRunLog').rejects(new Error('db down'));
+      sinon.stub(purgeStatus, 'failRunLog').resolves();
+
+      try {
+        await engine.run({ incremental: false });
+        expect.fail('should have thrown');
+      } catch (err) {
+        expect(err.message).to.equal('db down');
+      }
+
+      expect(purgeStatus.releaseRunLock.calledOnce).to.be.true;
+      expect(purgeStatus.releaseRunLock.calledWith(mockLockClient)).to.be.true;
     });
 
     it('should skip when no purge function configured', async () => {
@@ -251,6 +371,7 @@ describe('Purge Engine', () => {
       sinon.stub(purgeStatus, 'startRunLog').resolves(1);
       sinon.stub(purgeStatus, 'completeRunLog').resolves();
       sinon.stub(purgeStatus, 'getLastRunTimestamp').resolves(new Date('2025-01-01'));
+      sinon.stub(purgeStatus, 'getLastRunSkippedContacts').resolves([]);
       sinon.stub(purgeStatus, 'writePurgeResults').resolves();
 
       sinon.stub(contacts, 'getChangedContactIds').resolves(['c1']);
@@ -271,6 +392,190 @@ describe('Purge Engine', () => {
       expect(contacts.getChangedContactIds.calledWith(new Date('2025-01-01'))).to.be.true;
       expect(contacts.getContact.callCount).to.equal(2);
       expect(purgeStatus.completeRunLog.calledOnce).to.be.true;
+
+      // Unallocated records should also be filtered by lastRun timestamp
+      expect(records.getUnallocatedRecords.args[0][2]).to.deep.equal(new Date('2025-01-01'));
+    });
+
+    it('should retry previously skipped contacts in incremental mode', async () => {
+      const purgeFn = function() { return []; };
+
+      queryStub.onFirstCall().resolves({
+        rows: [{ fn: purgeFn.toString() }],
+      });
+
+      sinon.stub(rolesService, 'getRoles').resolves({ hash_chw: ['chw'] });
+      sinon.stub(rolesService, 'saveRoles').resolves();
+      sinon.stub(purgeStatus, 'startRunLog').resolves(1);
+      sinon.stub(purgeStatus, 'completeRunLog').resolves();
+      sinon.stub(purgeStatus, 'getLastRunTimestamp').resolves(new Date('2025-01-01'));
+      sinon.stub(purgeStatus, 'writePurgeResults').resolves();
+      sinon.stub(purgeStatus, 'cleanupDeletedDocs').resolves(0);
+      sinon.stub(purgeStatus, 'cleanupOrphanedRoles').resolves(0);
+
+      // No changed contacts or records, but two contacts were skipped in previous run
+      sinon.stub(contacts, 'getChangedContactIds').resolves([]);
+      sinon.stub(records, 'getContactIdsWithChangedRecords').resolves([]);
+      sinon.stub(purgeStatus, 'getLastRunSkippedContacts').resolves(['skipped1', 'skipped2']);
+
+      sinon.stub(contacts, 'getContact')
+        .withArgs('skipped1').resolves({ id: 'skipped1', doc: { _id: 'skipped1', type: 'person' } })
+        .withArgs('skipped2').resolves({ id: 'skipped2', doc: { _id: 'skipped2', type: 'person' } });
+
+      sinon.stub(records, 'getSubjectIds').returns([]);
+      sinon.stub(records, 'getRecordsForSubjects').resolves({ reports: [], messages: [] });
+      sinon.stub(records, 'getUnallocatedRecords').resolves([]);
+
+      sinon.stub(console, 'log');
+
+      await engine.run({ incremental: true });
+
+      // Both previously skipped contacts should be re-evaluated
+      expect(contacts.getContact.callCount).to.equal(2);
+      expect(contacts.getContact.calledWith('skipped1')).to.be.true;
+      expect(contacts.getContact.calledWith('skipped2')).to.be.true;
+      expect(purgeStatus.completeRunLog.calledOnce).to.be.true;
+      expect(console.log.calledWith('Retrying 2 previously skipped contacts')).to.be.true;
+    });
+
+    it('should deduplicate skipped contacts with changed contacts', async () => {
+      const purgeFn = function() { return []; };
+
+      queryStub.onFirstCall().resolves({
+        rows: [{ fn: purgeFn.toString() }],
+      });
+
+      sinon.stub(rolesService, 'getRoles').resolves({ hash_chw: ['chw'] });
+      sinon.stub(rolesService, 'saveRoles').resolves();
+      sinon.stub(purgeStatus, 'startRunLog').resolves(1);
+      sinon.stub(purgeStatus, 'completeRunLog').resolves();
+      sinon.stub(purgeStatus, 'getLastRunTimestamp').resolves(new Date('2025-01-01'));
+      sinon.stub(purgeStatus, 'writePurgeResults').resolves();
+      sinon.stub(purgeStatus, 'cleanupDeletedDocs').resolves(0);
+      sinon.stub(purgeStatus, 'cleanupOrphanedRoles').resolves(0);
+
+      // c1 is both changed AND was previously skipped — should only be processed once
+      sinon.stub(contacts, 'getChangedContactIds').resolves(['c1']);
+      sinon.stub(records, 'getContactIdsWithChangedRecords').resolves([]);
+      sinon.stub(purgeStatus, 'getLastRunSkippedContacts').resolves(['c1', 'c2']);
+
+      sinon.stub(contacts, 'getContact')
+        .withArgs('c1').resolves({ id: 'c1', doc: { _id: 'c1', type: 'person' } })
+        .withArgs('c2').resolves({ id: 'c2', doc: { _id: 'c2', type: 'person' } });
+
+      sinon.stub(records, 'getSubjectIds').returns([]);
+      sinon.stub(records, 'getRecordsForSubjects').resolves({ reports: [], messages: [] });
+      sinon.stub(records, 'getUnallocatedRecords').resolves([]);
+
+      sinon.stub(console, 'log');
+
+      await engine.run({ incremental: true });
+
+      // c1 should be processed once (deduplicated), c2 also processed
+      expect(contacts.getContact.callCount).to.equal(2);
+      expect(purgeStatus.completeRunLog.calledOnce).to.be.true;
+    });
+
+    it('should pass null as since for unallocated records in full mode', async () => {
+      const purgeFn = function() { return []; };
+
+      queryStub.onFirstCall().resolves({
+        rows: [{ fn: purgeFn.toString() }],
+      });
+
+      sinon.stub(rolesService, 'getRoles').resolves({ hash_chw: ['chw'] });
+      sinon.stub(rolesService, 'saveRoles').resolves();
+      sinon.stub(purgeStatus, 'startRunLog').resolves(1);
+      sinon.stub(purgeStatus, 'completeRunLog').resolves();
+      sinon.stub(purgeStatus, 'writePurgeResults').resolves();
+      sinon.stub(purgeStatus, 'cleanupDeletedDocs').resolves(0);
+      sinon.stub(purgeStatus, 'cleanupOrphanedRoles').resolves(0);
+      sinon.stub(contacts, 'getContactsBatch').resolves([]);
+      sinon.stub(records, 'getUnallocatedRecords').resolves([]);
+
+      sinon.stub(console, 'log');
+
+      await engine.run({ incremental: false });
+
+      // Full mode: since should be null (scan all unallocated records)
+      expect(records.getUnallocatedRecords.args[0][2]).to.be.null;
+    });
+
+    it('should re-evaluate contacts when their records are deleted (incremental)', async () => {
+      const purgeFn = function(userCtx, contact, reports) {
+        // Purge contacts that have no reports
+        if (reports.length === 0) { return [contact._id]; }
+        return [];
+      };
+
+      queryStub.onFirstCall().resolves({
+        rows: [{ fn: purgeFn.toString() }],
+      });
+
+      sinon.stub(rolesService, 'getRoles').resolves({ hash_chw: ['chw'] });
+      sinon.stub(rolesService, 'saveRoles').resolves();
+      sinon.stub(purgeStatus, 'startRunLog').resolves(1);
+      sinon.stub(purgeStatus, 'completeRunLog').resolves();
+      sinon.stub(purgeStatus, 'writePurgeResults').resolves();
+      sinon.stub(purgeStatus, 'cleanupDeletedDocs').resolves(1);
+      sinon.stub(purgeStatus, 'cleanupOrphanedRoles').resolves(0);
+      sinon.stub(purgeStatus, 'getLastRunTimestamp').resolves(new Date('2025-01-01'));
+      sinon.stub(purgeStatus, 'getLastRunSkippedContacts').resolves([]);
+
+      // Simulate: no contacts changed, but a record was deleted (its contact needs re-eval)
+      sinon.stub(contacts, 'getChangedContactIds').resolves([]);
+      // getContactIdsWithChangedRecords should return the contact whose record was deleted
+      sinon.stub(records, 'getContactIdsWithChangedRecords').resolves(['c1']);
+
+      sinon.stub(contacts, 'getContact')
+        .withArgs('c1').resolves({ id: 'c1', doc: { _id: 'c1', type: 'person' } });
+
+      // The record is now deleted, so getRecordsForSubjects returns empty
+      sinon.stub(records, 'getSubjectIds').returns(['c1']);
+      sinon.stub(records, 'getRecordsForSubjects').resolves({ reports: [], messages: [] });
+      sinon.stub(records, 'getUnallocatedRecords').resolves([]);
+
+      sinon.stub(console, 'log');
+
+      await engine.run({ incremental: true });
+
+      // Contact c1 should have been re-evaluated
+      expect(contacts.getContact.calledWith('c1')).to.be.true;
+      expect(purgeStatus.writePurgeResults.callCount).to.be.greaterThan(0);
+
+      // Since the contact now has no reports, the purge function should purge the contact
+      const writeCall = purgeStatus.writePurgeResults.args[0][0];
+      expect(writeCall.hash_chw.c1).to.be.true;
+    });
+
+    it('should call cleanupDeletedDocs during run', async () => {
+      const purgeFn = function() { return []; };
+
+      queryStub.onFirstCall().resolves({
+        rows: [{ fn: purgeFn.toString() }],
+      });
+
+      sinon.stub(rolesService, 'getRoles').resolves({ hash_chw: ['chw'] });
+      sinon.stub(rolesService, 'saveRoles').resolves();
+      sinon.stub(purgeStatus, 'startRunLog').resolves(1);
+      sinon.stub(purgeStatus, 'completeRunLog').resolves();
+      sinon.stub(purgeStatus, 'writePurgeResults').resolves();
+      sinon.stub(purgeStatus, 'cleanupDeletedDocs').resolves(3);
+      sinon.stub(purgeStatus, 'cleanupOrphanedRoles').resolves(0);
+
+      sinon.stub(contacts, 'getContactsBatch')
+        .onFirstCall().resolves([])
+        ;
+
+      sinon.stub(records, 'getUnallocatedRecords').resolves([]);
+
+      sinon.stub(console, 'log');
+
+      await engine.run({ incremental: false });
+
+      expect(purgeStatus.cleanupDeletedDocs.calledOnce).to.be.true;
+      const stats = purgeStatus.completeRunLog.args[0][1];
+      expect(stats.deletedDocsCleaned).to.equal(3);
     });
 
     it('should skip contacts with too many records', async () => {
@@ -381,6 +686,330 @@ describe('Purge Engine', () => {
       expect(result.hash_a['target~2024-01~owner1~12345']).to.be.true;
       expect(result.hash_a['target~2024-03~owner2~67890']).to.be.true;
       expect(stats.docsEvaluated).to.equal(2);
+    });
+  });
+
+  describe('hashPurgeFn', () => {
+    it('should produce consistent hashes for the same function', () => {
+      const fn = function(userCtx, contact, reports) { return []; };
+      const hash1 = engine._hashPurgeFn(fn);
+      const hash2 = engine._hashPurgeFn(fn);
+      expect(hash1).to.equal(hash2);
+      expect(hash1).to.be.a('string').with.length(64); // sha256 hex
+    });
+
+    it('should produce different hashes for different functions', () => {
+      const fn1 = function(userCtx, contact, reports) { return []; };
+      const fn2 = function(userCtx, contact, reports) { return reports.map(r => r._id); };
+      expect(engine._hashPurgeFn(fn1)).to.not.equal(engine._hashPurgeFn(fn2));
+    });
+  });
+
+  describe('purge function change detection', () => {
+    let queryStub;
+
+    beforeEach(() => {
+      queryStub = sinon.stub(db, 'query');
+      queryStub.resolves({ rows: [] });
+
+      // Lock always succeeds in these tests
+      const mockClient = { query: sinon.stub().resolves(), release: sinon.stub() };
+      sinon.stub(purgeStatus, 'tryAcquireRunLock').resolves({ acquired: true, client: mockClient });
+      sinon.stub(purgeStatus, 'releaseRunLock').resolves();
+    });
+
+    it('should force full run when purge function changes between runs', async () => {
+      const oldFn = 'function() { return []; }';
+      const newFn = 'function(userCtx, contact, reports) { return reports.map(r => r._id); }';
+
+      // Settings query returns the new purge fn
+      queryStub.onFirstCall().resolves({ rows: [{ fn: newFn }] });
+
+      sinon.stub(rolesService, 'getRoles').resolves({ hash_chw: ['chw'] });
+      sinon.stub(rolesService, 'saveRoles').resolves();
+      sinon.stub(purgeStatus, 'startRunLog').resolves(1);
+      sinon.stub(purgeStatus, 'completeRunLog').resolves();
+      sinon.stub(purgeStatus, 'writePurgeResults').resolves();
+      sinon.stub(purgeStatus, 'cleanupDeletedDocs').resolves(0);
+      sinon.stub(purgeStatus, 'cleanupOrphanedRoles').resolves(0);
+
+      // Last run used the old function hash
+      const oldHash = engine._hashPurgeFn(eval(`(${oldFn})`));
+      sinon.stub(purgeStatus, 'getLastPurgeFnHash').resolves(oldHash);
+
+      // These should NOT be called if full run is forced
+      const getChangedStub = sinon.stub(contacts, 'getChangedContactIds');
+      const getContactStub = sinon.stub(contacts, 'getContact');
+
+      // Full mode will call getContactsBatch
+      sinon.stub(contacts, 'getContactsBatch').resolves([]);
+      sinon.stub(records, 'getUnallocatedRecords').resolves([]);
+
+      sinon.stub(console, 'log');
+
+      await engine.run({ incremental: true });
+
+      // Should log the force message
+      expect(console.log.calledWith('Purge function changed since last run. Forcing full re-evaluation.')).to.be.true;
+
+      // Should NOT have called incremental-specific methods
+      expect(getChangedStub.callCount).to.equal(0);
+      expect(getContactStub.callCount).to.equal(0);
+
+      // Should have called full-mode getContactsBatch
+      expect(contacts.getContactsBatch.callCount).to.be.greaterThan(0);
+
+      // Should store the new hash in stats
+      const stats = purgeStatus.completeRunLog.args[0][1];
+      expect(stats.purgeFnHash).to.be.a('string').with.length(64);
+    });
+
+    it('should proceed incrementally when purge function has not changed', async () => {
+      const fn = 'function() { return []; }';
+
+      queryStub.onFirstCall().resolves({ rows: [{ fn }] });
+
+      sinon.stub(rolesService, 'getRoles').resolves({ hash_chw: ['chw'] });
+      sinon.stub(rolesService, 'saveRoles').resolves();
+      sinon.stub(purgeStatus, 'startRunLog').resolves(1);
+      sinon.stub(purgeStatus, 'completeRunLog').resolves();
+      sinon.stub(purgeStatus, 'writePurgeResults').resolves();
+      sinon.stub(purgeStatus, 'cleanupDeletedDocs').resolves(0);
+      sinon.stub(purgeStatus, 'cleanupOrphanedRoles').resolves(0);
+
+      // Same hash as current function
+      const currentHash = engine._hashPurgeFn(eval(`(${fn})`));
+      sinon.stub(purgeStatus, 'getLastPurgeFnHash').resolves(currentHash);
+      sinon.stub(purgeStatus, 'getLastRoleHashes').resolves(['hash_chw']);
+      sinon.stub(purgeStatus, 'getLastRunTimestamp').resolves(new Date('2025-01-01'));
+
+      sinon.stub(contacts, 'getChangedContactIds').resolves([]);
+      sinon.stub(records, 'getContactIdsWithChangedRecords').resolves([]);
+      sinon.stub(records, 'getUnallocatedRecords').resolves([]);
+
+      sinon.stub(console, 'log');
+
+      await engine.run({ incremental: true });
+
+      // Should NOT force full run
+      expect(console.log.calledWith('Purge function changed since last run. Forcing full re-evaluation.')).to.be.false;
+
+      // Should have called incremental methods
+      expect(contacts.getChangedContactIds.calledOnce).to.be.true;
+    });
+
+    it('should not check hash on first run (no previous hash)', async () => {
+      const fn = 'function() { return []; }';
+
+      queryStub.onFirstCall().resolves({ rows: [{ fn }] });
+
+      sinon.stub(rolesService, 'getRoles').resolves({ hash_chw: ['chw'] });
+      sinon.stub(rolesService, 'saveRoles').resolves();
+      sinon.stub(purgeStatus, 'startRunLog').resolves(1);
+      sinon.stub(purgeStatus, 'completeRunLog').resolves();
+      sinon.stub(purgeStatus, 'writePurgeResults').resolves();
+      sinon.stub(purgeStatus, 'cleanupDeletedDocs').resolves(0);
+      sinon.stub(purgeStatus, 'cleanupOrphanedRoles').resolves(0);
+
+      // No previous run → null hash
+      sinon.stub(purgeStatus, 'getLastPurgeFnHash').resolves(null);
+      sinon.stub(purgeStatus, 'getLastRoleHashes').resolves(null);
+      sinon.stub(purgeStatus, 'getLastRunTimestamp').resolves(null);
+
+      sinon.stub(contacts, 'getContactsBatch').resolves([]);
+      sinon.stub(records, 'getUnallocatedRecords').resolves([]);
+
+      sinon.stub(console, 'log');
+
+      await engine.run({ incremental: true });
+
+      // Should not force full, but also no lastRun so falls through to full mode naturally
+      expect(console.log.calledWith('Purge function changed since last run. Forcing full re-evaluation.')).to.be.false;
+    });
+
+    it('should store purge function hash in completed run log', async () => {
+      const fn = 'function() { return []; }';
+
+      queryStub.onFirstCall().resolves({ rows: [{ fn }] });
+
+      sinon.stub(rolesService, 'getRoles').resolves({ hash_chw: ['chw'] });
+      sinon.stub(rolesService, 'saveRoles').resolves();
+      sinon.stub(purgeStatus, 'startRunLog').resolves(1);
+      sinon.stub(purgeStatus, 'completeRunLog').resolves();
+      sinon.stub(purgeStatus, 'writePurgeResults').resolves();
+      sinon.stub(purgeStatus, 'cleanupDeletedDocs').resolves(0);
+      sinon.stub(purgeStatus, 'cleanupOrphanedRoles').resolves(0);
+
+      sinon.stub(contacts, 'getContactsBatch').resolves([]);
+      sinon.stub(records, 'getUnallocatedRecords').resolves([]);
+
+      sinon.stub(console, 'log');
+
+      await engine.run({ incremental: false });
+
+      const stats = purgeStatus.completeRunLog.args[0][1];
+      expect(stats.purgeFnHash).to.be.a('string').with.length(64);
+    });
+  });
+
+  describe('role change detection', () => {
+    let queryStub;
+
+    beforeEach(() => {
+      queryStub = sinon.stub(db, 'query');
+      queryStub.resolves({ rows: [] });
+
+      const mockClient = { query: sinon.stub().resolves(), release: sinon.stub() };
+      sinon.stub(purgeStatus, 'tryAcquireRunLock').resolves({ acquired: true, client: mockClient });
+      sinon.stub(purgeStatus, 'releaseRunLock').resolves();
+    });
+
+    it('should force full run when new roles are added', async () => {
+      const fn = 'function() { return []; }';
+      queryStub.onFirstCall().resolves({ rows: [{ fn }] });
+
+      // Current roles: two role hashes
+      sinon.stub(rolesService, 'getRoles').resolves({ hash_chw: ['chw'], hash_sup: ['chw_supervisor'] });
+      sinon.stub(rolesService, 'saveRoles').resolves();
+      sinon.stub(purgeStatus, 'startRunLog').resolves(1);
+      sinon.stub(purgeStatus, 'completeRunLog').resolves();
+      sinon.stub(purgeStatus, 'writePurgeResults').resolves();
+      sinon.stub(purgeStatus, 'cleanupDeletedDocs').resolves(0);
+      sinon.stub(purgeStatus, 'cleanupOrphanedRoles').resolves(0);
+
+      // Same purge function hash
+      const currentHash = engine._hashPurgeFn(eval(`(${fn})`));
+      sinon.stub(purgeStatus, 'getLastPurgeFnHash').resolves(currentHash);
+
+      // Last run only had hash_chw (supervisor role is new)
+      sinon.stub(purgeStatus, 'getLastRoleHashes').resolves(['hash_chw']);
+
+      const getChangedStub = sinon.stub(contacts, 'getChangedContactIds');
+      sinon.stub(contacts, 'getContactsBatch').resolves([]);
+      sinon.stub(records, 'getUnallocatedRecords').resolves([]);
+
+      sinon.stub(console, 'log');
+
+      await engine.run({ incremental: true });
+
+      expect(console.log.calledWith('Offline roles changed since last run. Forcing full re-evaluation.')).to.be.true;
+      // Should NOT have called incremental methods
+      expect(getChangedStub.callCount).to.equal(0);
+      // Should have called full-mode getContactsBatch
+      expect(contacts.getContactsBatch.callCount).to.be.greaterThan(0);
+    });
+
+    it('should force full run when roles are removed', async () => {
+      const fn = 'function() { return []; }';
+      queryStub.onFirstCall().resolves({ rows: [{ fn }] });
+
+      // Current roles: only chw (supervisor was removed)
+      sinon.stub(rolesService, 'getRoles').resolves({ hash_chw: ['chw'] });
+      sinon.stub(rolesService, 'saveRoles').resolves();
+      sinon.stub(purgeStatus, 'startRunLog').resolves(1);
+      sinon.stub(purgeStatus, 'completeRunLog').resolves();
+      sinon.stub(purgeStatus, 'writePurgeResults').resolves();
+      sinon.stub(purgeStatus, 'cleanupDeletedDocs').resolves(0);
+      sinon.stub(purgeStatus, 'cleanupOrphanedRoles').resolves(50);
+
+      const currentHash = engine._hashPurgeFn(eval(`(${fn})`));
+      sinon.stub(purgeStatus, 'getLastPurgeFnHash').resolves(currentHash);
+
+      // Last run had both roles
+      sinon.stub(purgeStatus, 'getLastRoleHashes').resolves(['hash_chw', 'hash_sup']);
+
+      sinon.stub(contacts, 'getContactsBatch').resolves([]);
+      sinon.stub(records, 'getUnallocatedRecords').resolves([]);
+
+      sinon.stub(console, 'log');
+
+      await engine.run({ incremental: true });
+
+      expect(console.log.calledWith('Offline roles changed since last run. Forcing full re-evaluation.')).to.be.true;
+      // Should have cleaned up orphaned role entries
+      expect(purgeStatus.cleanupOrphanedRoles.calledOnce).to.be.true;
+      expect(purgeStatus.cleanupOrphanedRoles.args[0][0]).to.deep.equal(['hash_chw']);
+    });
+
+    it('should proceed incrementally when roles have not changed', async () => {
+      const fn = 'function() { return []; }';
+      queryStub.onFirstCall().resolves({ rows: [{ fn }] });
+
+      sinon.stub(rolesService, 'getRoles').resolves({ hash_chw: ['chw'], hash_sup: ['chw_supervisor'] });
+      sinon.stub(rolesService, 'saveRoles').resolves();
+      sinon.stub(purgeStatus, 'startRunLog').resolves(1);
+      sinon.stub(purgeStatus, 'completeRunLog').resolves();
+      sinon.stub(purgeStatus, 'writePurgeResults').resolves();
+      sinon.stub(purgeStatus, 'cleanupDeletedDocs').resolves(0);
+      sinon.stub(purgeStatus, 'cleanupOrphanedRoles').resolves(0);
+
+      const currentHash = engine._hashPurgeFn(eval(`(${fn})`));
+      sinon.stub(purgeStatus, 'getLastPurgeFnHash').resolves(currentHash);
+      sinon.stub(purgeStatus, 'getLastRoleHashes').resolves(['hash_chw', 'hash_sup']);
+      sinon.stub(purgeStatus, 'getLastRunTimestamp').resolves(new Date('2025-01-01'));
+
+      sinon.stub(contacts, 'getChangedContactIds').resolves([]);
+      sinon.stub(records, 'getContactIdsWithChangedRecords').resolves([]);
+      sinon.stub(records, 'getUnallocatedRecords').resolves([]);
+
+      sinon.stub(console, 'log');
+
+      await engine.run({ incremental: true });
+
+      expect(console.log.calledWith('Offline roles changed since last run. Forcing full re-evaluation.')).to.be.false;
+      expect(contacts.getChangedContactIds.calledOnce).to.be.true;
+    });
+
+    it('should not check role hashes on first run (no previous hashes)', async () => {
+      const fn = 'function() { return []; }';
+      queryStub.onFirstCall().resolves({ rows: [{ fn }] });
+
+      sinon.stub(rolesService, 'getRoles').resolves({ hash_chw: ['chw'] });
+      sinon.stub(rolesService, 'saveRoles').resolves();
+      sinon.stub(purgeStatus, 'startRunLog').resolves(1);
+      sinon.stub(purgeStatus, 'completeRunLog').resolves();
+      sinon.stub(purgeStatus, 'writePurgeResults').resolves();
+      sinon.stub(purgeStatus, 'cleanupDeletedDocs').resolves(0);
+      sinon.stub(purgeStatus, 'cleanupOrphanedRoles').resolves(0);
+
+      sinon.stub(purgeStatus, 'getLastPurgeFnHash').resolves(null);
+      sinon.stub(purgeStatus, 'getLastRoleHashes').resolves(null);
+      sinon.stub(purgeStatus, 'getLastRunTimestamp').resolves(null);
+
+      sinon.stub(contacts, 'getContactsBatch').resolves([]);
+      sinon.stub(records, 'getUnallocatedRecords').resolves([]);
+
+      sinon.stub(console, 'log');
+
+      await engine.run({ incremental: true });
+
+      // No force message — null lastRoleHashes skips check
+      expect(console.log.calledWith('Offline roles changed since last run. Forcing full re-evaluation.')).to.be.false;
+    });
+
+    it('should store role hashes in completed run stats', async () => {
+      const fn = 'function() { return []; }';
+      queryStub.onFirstCall().resolves({ rows: [{ fn }] });
+
+      sinon.stub(rolesService, 'getRoles').resolves({ hash_chw: ['chw'], hash_sup: ['chw_supervisor'] });
+      sinon.stub(rolesService, 'saveRoles').resolves();
+      sinon.stub(purgeStatus, 'startRunLog').resolves(1);
+      sinon.stub(purgeStatus, 'completeRunLog').resolves();
+      sinon.stub(purgeStatus, 'writePurgeResults').resolves();
+      sinon.stub(purgeStatus, 'cleanupDeletedDocs').resolves(0);
+      sinon.stub(purgeStatus, 'cleanupOrphanedRoles').resolves(0);
+
+      sinon.stub(contacts, 'getContactsBatch').resolves([]);
+      sinon.stub(records, 'getUnallocatedRecords').resolves([]);
+
+      sinon.stub(console, 'log');
+
+      await engine.run({ incremental: false });
+
+      const stats = purgeStatus.completeRunLog.args[0][1];
+      expect(stats.roleHashes).to.be.an('array');
+      expect(stats.roleHashes).to.include('hash_chw');
+      expect(stats.roleHashes).to.include('hash_sup');
     });
   });
 

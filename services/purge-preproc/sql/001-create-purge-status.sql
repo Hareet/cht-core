@@ -48,5 +48,12 @@ CREATE TABLE IF NOT EXISTS purge_run_log (
   skipped_contacts    JSONB,
   error               TEXT,
   seq_start           TEXT,
-  seq_end             TEXT
+  seq_end             TEXT,
+  purge_fn_hash   TEXT,       -- hash of the purge function used for this run;
+                              -- enables detection of purge.js changes between runs
+                              -- so incremental mode can force a full re-evaluation
+  role_hashes     JSONB       -- array of role hashes evaluated during this run;
+                              -- enables detection of role changes between runs
+                              -- so incremental mode can force a full re-evaluation
+                              -- when new roles appear or existing roles disappear
 );

@@ -60,7 +60,15 @@ const getRecordsForSubjects = async (subjectIds) => {
 // A record is "unassigned" when getSubject() in the Nouveau index returns falsy.
 // getSubject() checks: patient_id, place_id, patient_uuid (top-level & fields),
 // contact._id (for error fallback reports and SMS messages).
-const getUnallocatedRecords = async (limit, offset) => {
+// When `since` is provided, only returns records changed after that timestamp (incremental mode).
+const getUnallocatedRecords = async (limit, offset, since) => {
+  const params = [limit, offset];
+  let sinceClause = '';
+  if (since) {
+    sinceClause = `AND saved_timestamp > $3`;
+    params.push(since);
+  }
+
   const result = await db.query(`
     SELECT _id, doc
     FROM ${tbl()}
@@ -75,9 +83,10 @@ const getUnallocatedRecords = async (limit, offset) => {
       AND COALESCE(doc->'fields'->>'patient_uuid', '') = ''
       AND COALESCE(doc->'fields'->>'place_uuid', '') = ''
       AND COALESCE(doc->'contact'->>'_id', '') = ''
+      ${sinceClause}
     ORDER BY _id
     LIMIT $1 OFFSET $2
-  `, [limit, offset]);
+  `, params);
 
   return result.rows.map(row => ({
     id: row._id,
@@ -87,10 +96,22 @@ const getUnallocatedRecords = async (limit, offset) => {
 
 // Find contacts whose associated reports/messages have changed since a timestamp.
 // Returns contact _ids that need re-evaluation.
+// IMPORTANT: We intentionally include deleted records (_deleted = true) here.
+// When a report is deleted, its parent contact must be re-evaluated because the
+// purge function may produce different results without that report in the group.
+// The deleted record won't appear in the contact's group (getRecordsForSubjects
+// filters _deleted), so the purge function correctly evaluates the new state.
+//
+// Uses UNNEST instead of COALESCE to capture ALL subject IDs per record.
+// A report can reference multiple contacts (e.g., patient_id=A and place_id=B).
+// getRecordsForSubjects matches on ANY subject field, so the report appears in
+// multiple contacts' groups. COALESCE only returned the first non-null field,
+// leaving other contacts with stale purge decisions in incremental mode.
 const getContactIdsWithChangedRecords = async (since) => {
   const result = await db.query(`
-    SELECT DISTINCT
-      COALESCE(
+    SELECT DISTINCT subject_id
+    FROM (
+      SELECT UNNEST(ARRAY[
         NULLIF(doc->>'patient_id', ''),
         NULLIF(doc->>'place_id', ''),
         NULLIF(doc->>'patient_uuid', ''),
@@ -100,16 +121,15 @@ const getContactIdsWithChangedRecords = async (since) => {
         NULLIF(doc->'fields'->>'patient_uuid', ''),
         NULLIF(doc->'fields'->>'place_uuid', ''),
         NULLIF(doc->'contact'->>'_id', '')
-      ) AS subject_id
-    FROM ${tbl()}
-    WHERE doc->>'type' = 'data_record'
-      AND (_deleted IS NOT TRUE)
-      AND saved_timestamp > $1
+      ]) AS subject_id
+      FROM ${tbl()}
+      WHERE doc->>'type' = 'data_record'
+        AND saved_timestamp > $1
+    ) sub
+    WHERE subject_id IS NOT NULL
   `, [since]);
 
-  const subjectIds = result.rows
-    .map(row => row.subject_id)
-    .filter(Boolean);
+  const subjectIds = result.rows.map(row => row.subject_id);
 
   if (!subjectIds.length) {
     return [];

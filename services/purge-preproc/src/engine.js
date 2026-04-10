@@ -1,5 +1,7 @@
 'use strict';
 
+const crypto = require('crypto');
+const vm = require('vm');
 const contacts = require('./contacts');
 const records = require('./records');
 const purgeStatus = require('./purge-status');
@@ -7,8 +9,14 @@ const rolesService = require('./roles');
 
 const CONTACT_BATCH_SIZE = parseInt(process.env.PURGE_CONTACT_BATCH_SIZE || '500', 10);
 const MAX_RECORDS_PER_CONTACT = parseInt(process.env.PURGE_MAX_RECORDS || '20000', 10);
+const PURGE_FN_TIMEOUT_MS = parseInt(process.env.PURGE_FN_TIMEOUT_MS || '5000', 10);
 const TASK_EXPIRATION_DAYS = 60;
 const TARGET_EXPIRATION_MONTHS = 6;
+
+// Compute a hash of the purge function source for change detection.
+const hashPurgeFn = (fn) => {
+  return crypto.createHash('sha256').update(fn.toString()).digest('hex');
+};
 
 // Parse the purge function from app_settings config stored in PostgreSQL.
 // Settings doc structure: { _id: 'settings', settings: { purge: { fn: '...' } } }
@@ -63,14 +71,26 @@ const evaluateGroup = (purgeFn, group, rolesByHash) => {
 
     let idsToPurge;
     try {
-      idsToPurge = purgeFn(
-        { roles: rolesList },
-        group.contact,
-        group.reports,
-        group.messages
+      // Run the purge function inside a vm context with a timeout to prevent
+      // infinite loops or excessively slow purge.js from hanging the service.
+      const sandbox = vm.createContext({
+        purgeFn,
+        userCtx: { roles: rolesList },
+        contact: group.contact,
+        reports: group.reports,
+        messages: group.messages,
+      });
+      idsToPurge = vm.runInNewContext(
+        'purgeFn(userCtx, contact, reports, messages)',
+        sandbox,
+        { timeout: PURGE_FN_TIMEOUT_MS }
       );
-    } catch {
-      // Purge function errors are non-fatal; treat as "purge nothing"
+    } catch (err) {
+      // Purge function errors (including timeouts) are non-fatal; treat as "purge nothing".
+      // vm timeout throws an ERR_SCRIPT_EXECUTION_TIMEOUT error.
+      if (err.code === 'ERR_SCRIPT_EXECUTION_TIMEOUT') {
+        console.warn(`Purge function timed out after ${PURGE_FN_TIMEOUT_MS}ms for role ${rolesList.join(',')}`);
+      }
       continue;
     }
 
@@ -97,12 +117,13 @@ const evaluateGroup = (purgeFn, group, rolesByHash) => {
 };
 
 // Process unallocated records (reports/messages not tied to any contact).
-const processUnallocatedRecords = async (purgeFn, rolesByHash, stats) => {
+// When `since` is provided, only processes records changed after that timestamp (incremental mode).
+const processUnallocatedRecords = async (purgeFn, rolesByHash, stats, since) => {
   let offset = 0;
   const batchSize = CONTACT_BATCH_SIZE;
 
   while (true) {
-    const batch = await records.getUnallocatedRecords(batchSize, offset);
+    const batch = await records.getUnallocatedRecords(batchSize, offset, since);
     if (!batch.length) {
       break;
     }
@@ -213,7 +234,23 @@ const purgeExpiredTargets = async (rolesByHash, stats) => {
 // Full purge evaluation run.
 const run = async (options = {}) => {
   const db = require('./db');
-  const incremental = options.incremental !== false;
+
+  // Acquire advisory lock to prevent concurrent runs from corrupting purge_status.
+  const lock = await purgeStatus.tryAcquireRunLock();
+  if (!lock.acquired) {
+    console.log('Another purge run is already in progress. Skipping.');
+    return;
+  }
+
+  try {
+    await _runWithLock(options, db);
+  } finally {
+    await purgeStatus.releaseRunLock(lock.client);
+  }
+};
+
+const _runWithLock = async (options, db) => {
+  let incremental = options.incremental !== false;
 
   const purgeFn = await getPurgeFn(db);
   if (!purgeFn) {
@@ -221,10 +258,42 @@ const run = async (options = {}) => {
     return;
   }
 
+  const currentFnHash = hashPurgeFn(purgeFn);
+
   const rolesByHash = await rolesService.getRoles();
   if (!Object.keys(rolesByHash).length) {
     console.log('No offline roles found. Skipping.');
     return;
+  }
+
+  // Detect purge function changes: if the function source has changed since
+  // the last completed run, force a full re-evaluation. Incremental mode would
+  // only process recently-changed documents, leaving all other documents with
+  // stale purge decisions from the old function.
+  if (incremental) {
+    const lastFnHash = await purgeStatus.getLastPurgeFnHash();
+    if (lastFnHash && lastFnHash !== currentFnHash) {
+      console.log('Purge function changed since last run. Forcing full re-evaluation.');
+      incremental = false;
+    }
+  }
+
+  // Detect role changes: if the set of offline roles has changed since the
+  // last completed run, force a full re-evaluation. New roles need purge_status
+  // entries for ALL contacts (not just recently-changed ones), and removed roles
+  // leave orphaned entries that should be cleaned up.
+  const currentRoleHashes = Object.keys(rolesByHash).sort();
+  if (incremental) {
+    const lastRoleHashes = await purgeStatus.getLastRoleHashes();
+    if (lastRoleHashes) {
+      const lastSorted = [...lastRoleHashes].sort();
+      const rolesChanged = currentRoleHashes.length !== lastSorted.length ||
+        currentRoleHashes.some((h, i) => h !== lastSorted[i]);
+      if (rolesChanged) {
+        console.log('Offline roles changed since last run. Forcing full re-evaluation.');
+        incremental = false;
+      }
+    }
   }
 
   await rolesService.saveRoles(rolesByHash);
@@ -236,18 +305,34 @@ const run = async (options = {}) => {
     docsPurged: 0,
     docsUnpurged: 0,
     skippedContacts: [],
+    purgeFnHash: currentFnHash,
+    roleHashes: currentRoleHashes,
   };
 
   try {
     let contactIds = null;
+    let lastRun = null;
 
     // Incremental: only process contacts that changed since last run
     if (incremental) {
-      const lastRun = await purgeStatus.getLastRunTimestamp();
+      lastRun = await purgeStatus.getLastRunTimestamp();
       if (lastRun) {
         const changedContacts = await contacts.getChangedContactIds(lastRun);
         const contactsWithChangedRecords = await records.getContactIdsWithChangedRecords(lastRun);
-        contactIds = [...new Set([...changedContacts, ...contactsWithChangedRecords])];
+
+        // Retry contacts that were skipped in the previous run due to transient errors.
+        // Without this, skipped contacts would never be re-evaluated in incremental mode
+        // because their saved_timestamp hasn't changed.
+        const previouslySkipped = await purgeStatus.getLastRunSkippedContacts();
+
+        contactIds = [...new Set([
+          ...changedContacts,
+          ...contactsWithChangedRecords,
+          ...previouslySkipped,
+        ])];
+        if (previouslySkipped.length) {
+          console.log(`Retrying ${previouslySkipped.length} previously skipped contacts`);
+        }
         console.log(`Incremental mode: ${contactIds.length} contacts to re-evaluate`);
       }
     }
@@ -281,12 +366,20 @@ const run = async (options = {}) => {
       }
     }
 
-    // Process unallocated records
-    await processUnallocatedRecords(purgeFn, rolesByHash, stats);
+    // Process unallocated records — in incremental mode, only those changed since last run
+    await processUnallocatedRecords(purgeFn, rolesByHash, stats, lastRun);
 
     // Auto-purge expired tasks and targets (not controlled by purge.js)
     await purgeExpiredTasks(rolesByHash, stats);
     await purgeExpiredTargets(rolesByHash, stats);
+
+    // Clean up stale purge_status entries for deleted documents
+    const cleanedUp = await purgeStatus.cleanupDeletedDocs();
+    stats.deletedDocsCleaned = cleanedUp;
+
+    // Clean up orphaned purge_status entries for role hashes that no longer exist
+    const orphanedCleaned = await purgeStatus.cleanupOrphanedRoles(currentRoleHashes);
+    stats.orphanedRolesCleaned = orphanedCleaned;
 
     await purgeStatus.completeRunLog(runId, stats);
     console.log(`Purge run completed: ${stats.contactsProcessed} contacts, ` +
@@ -339,4 +432,5 @@ module.exports = {
   _processUnallocatedRecords: processUnallocatedRecords,
   _purgeExpiredTasks: purgeExpiredTasks,
   _purgeExpiredTargets: purgeExpiredTargets,
+  _hashPurgeFn: hashPurgeFn,
 };
