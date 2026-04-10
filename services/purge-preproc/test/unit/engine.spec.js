@@ -184,6 +184,7 @@ describe('Purge Engine', () => {
       sinon.stub(purgeStatus, 'completeRunLog').resolves();
       sinon.stub(purgeStatus, 'writePurgeResults').resolves();
       sinon.stub(purgeStatus, 'cleanupDeletedDocs').resolves(0);
+      sinon.stub(purgeStatus, 'cleanupOrphanedRoles').resolves(0);
       sinon.stub(contacts, 'getContactsBatch').resolves([]);
       sinon.stub(records, 'getUnallocatedRecords').resolves([]);
       sinon.stub(console, 'log');
@@ -345,6 +346,7 @@ describe('Purge Engine', () => {
       sinon.stub(purgeStatus, 'completeRunLog').resolves();
       sinon.stub(purgeStatus, 'writePurgeResults').resolves();
       sinon.stub(purgeStatus, 'cleanupDeletedDocs').resolves(1);
+      sinon.stub(purgeStatus, 'cleanupOrphanedRoles').resolves(0);
       sinon.stub(purgeStatus, 'getLastRunTimestamp').resolves(new Date('2025-01-01'));
 
       // Simulate: no contacts changed, but a record was deleted (its contact needs re-eval)
@@ -386,6 +388,7 @@ describe('Purge Engine', () => {
       sinon.stub(purgeStatus, 'completeRunLog').resolves();
       sinon.stub(purgeStatus, 'writePurgeResults').resolves();
       sinon.stub(purgeStatus, 'cleanupDeletedDocs').resolves(3);
+      sinon.stub(purgeStatus, 'cleanupOrphanedRoles').resolves(0);
 
       sinon.stub(contacts, 'getContactsBatch')
         .onFirstCall().resolves([])
@@ -555,6 +558,7 @@ describe('Purge Engine', () => {
       sinon.stub(purgeStatus, 'completeRunLog').resolves();
       sinon.stub(purgeStatus, 'writePurgeResults').resolves();
       sinon.stub(purgeStatus, 'cleanupDeletedDocs').resolves(0);
+      sinon.stub(purgeStatus, 'cleanupOrphanedRoles').resolves(0);
 
       // Last run used the old function hash
       const oldHash = engine._hashPurgeFn(eval(`(${oldFn})`));
@@ -598,10 +602,12 @@ describe('Purge Engine', () => {
       sinon.stub(purgeStatus, 'completeRunLog').resolves();
       sinon.stub(purgeStatus, 'writePurgeResults').resolves();
       sinon.stub(purgeStatus, 'cleanupDeletedDocs').resolves(0);
+      sinon.stub(purgeStatus, 'cleanupOrphanedRoles').resolves(0);
 
       // Same hash as current function
       const currentHash = engine._hashPurgeFn(eval(`(${fn})`));
       sinon.stub(purgeStatus, 'getLastPurgeFnHash').resolves(currentHash);
+      sinon.stub(purgeStatus, 'getLastRoleHashes').resolves(['hash_chw']);
       sinon.stub(purgeStatus, 'getLastRunTimestamp').resolves(new Date('2025-01-01'));
 
       sinon.stub(contacts, 'getChangedContactIds').resolves([]);
@@ -630,9 +636,11 @@ describe('Purge Engine', () => {
       sinon.stub(purgeStatus, 'completeRunLog').resolves();
       sinon.stub(purgeStatus, 'writePurgeResults').resolves();
       sinon.stub(purgeStatus, 'cleanupDeletedDocs').resolves(0);
+      sinon.stub(purgeStatus, 'cleanupOrphanedRoles').resolves(0);
 
       // No previous run → null hash
       sinon.stub(purgeStatus, 'getLastPurgeFnHash').resolves(null);
+      sinon.stub(purgeStatus, 'getLastRoleHashes').resolves(null);
       sinon.stub(purgeStatus, 'getLastRunTimestamp').resolves(null);
 
       sinon.stub(contacts, 'getContactsBatch').resolves([]);
@@ -657,6 +665,7 @@ describe('Purge Engine', () => {
       sinon.stub(purgeStatus, 'completeRunLog').resolves();
       sinon.stub(purgeStatus, 'writePurgeResults').resolves();
       sinon.stub(purgeStatus, 'cleanupDeletedDocs').resolves(0);
+      sinon.stub(purgeStatus, 'cleanupOrphanedRoles').resolves(0);
 
       sinon.stub(contacts, 'getContactsBatch').resolves([]);
       sinon.stub(records, 'getUnallocatedRecords').resolves([]);
@@ -667,6 +676,167 @@ describe('Purge Engine', () => {
 
       const stats = purgeStatus.completeRunLog.args[0][1];
       expect(stats.purgeFnHash).to.be.a('string').with.length(64);
+    });
+  });
+
+  describe('role change detection', () => {
+    let queryStub;
+
+    beforeEach(() => {
+      queryStub = sinon.stub(db, 'query');
+      queryStub.resolves({ rows: [] });
+
+      const mockClient = { query: sinon.stub().resolves(), release: sinon.stub() };
+      sinon.stub(purgeStatus, 'tryAcquireRunLock').resolves({ acquired: true, client: mockClient });
+      sinon.stub(purgeStatus, 'releaseRunLock').resolves();
+    });
+
+    it('should force full run when new roles are added', async () => {
+      const fn = 'function() { return []; }';
+      queryStub.onFirstCall().resolves({ rows: [{ fn }] });
+
+      // Current roles: two role hashes
+      sinon.stub(rolesService, 'getRoles').resolves({ hash_chw: ['chw'], hash_sup: ['chw_supervisor'] });
+      sinon.stub(rolesService, 'saveRoles').resolves();
+      sinon.stub(purgeStatus, 'startRunLog').resolves(1);
+      sinon.stub(purgeStatus, 'completeRunLog').resolves();
+      sinon.stub(purgeStatus, 'writePurgeResults').resolves();
+      sinon.stub(purgeStatus, 'cleanupDeletedDocs').resolves(0);
+      sinon.stub(purgeStatus, 'cleanupOrphanedRoles').resolves(0);
+
+      // Same purge function hash
+      const currentHash = engine._hashPurgeFn(eval(`(${fn})`));
+      sinon.stub(purgeStatus, 'getLastPurgeFnHash').resolves(currentHash);
+
+      // Last run only had hash_chw (supervisor role is new)
+      sinon.stub(purgeStatus, 'getLastRoleHashes').resolves(['hash_chw']);
+
+      const getChangedStub = sinon.stub(contacts, 'getChangedContactIds');
+      sinon.stub(contacts, 'getContactsBatch').resolves([]);
+      sinon.stub(records, 'getUnallocatedRecords').resolves([]);
+
+      sinon.stub(console, 'log');
+
+      await engine.run({ incremental: true });
+
+      expect(console.log.calledWith('Offline roles changed since last run. Forcing full re-evaluation.')).to.be.true;
+      // Should NOT have called incremental methods
+      expect(getChangedStub.callCount).to.equal(0);
+      // Should have called full-mode getContactsBatch
+      expect(contacts.getContactsBatch.callCount).to.be.greaterThan(0);
+    });
+
+    it('should force full run when roles are removed', async () => {
+      const fn = 'function() { return []; }';
+      queryStub.onFirstCall().resolves({ rows: [{ fn }] });
+
+      // Current roles: only chw (supervisor was removed)
+      sinon.stub(rolesService, 'getRoles').resolves({ hash_chw: ['chw'] });
+      sinon.stub(rolesService, 'saveRoles').resolves();
+      sinon.stub(purgeStatus, 'startRunLog').resolves(1);
+      sinon.stub(purgeStatus, 'completeRunLog').resolves();
+      sinon.stub(purgeStatus, 'writePurgeResults').resolves();
+      sinon.stub(purgeStatus, 'cleanupDeletedDocs').resolves(0);
+      sinon.stub(purgeStatus, 'cleanupOrphanedRoles').resolves(50);
+
+      const currentHash = engine._hashPurgeFn(eval(`(${fn})`));
+      sinon.stub(purgeStatus, 'getLastPurgeFnHash').resolves(currentHash);
+
+      // Last run had both roles
+      sinon.stub(purgeStatus, 'getLastRoleHashes').resolves(['hash_chw', 'hash_sup']);
+
+      sinon.stub(contacts, 'getContactsBatch').resolves([]);
+      sinon.stub(records, 'getUnallocatedRecords').resolves([]);
+
+      sinon.stub(console, 'log');
+
+      await engine.run({ incremental: true });
+
+      expect(console.log.calledWith('Offline roles changed since last run. Forcing full re-evaluation.')).to.be.true;
+      // Should have cleaned up orphaned role entries
+      expect(purgeStatus.cleanupOrphanedRoles.calledOnce).to.be.true;
+      expect(purgeStatus.cleanupOrphanedRoles.args[0][0]).to.deep.equal(['hash_chw']);
+    });
+
+    it('should proceed incrementally when roles have not changed', async () => {
+      const fn = 'function() { return []; }';
+      queryStub.onFirstCall().resolves({ rows: [{ fn }] });
+
+      sinon.stub(rolesService, 'getRoles').resolves({ hash_chw: ['chw'], hash_sup: ['chw_supervisor'] });
+      sinon.stub(rolesService, 'saveRoles').resolves();
+      sinon.stub(purgeStatus, 'startRunLog').resolves(1);
+      sinon.stub(purgeStatus, 'completeRunLog').resolves();
+      sinon.stub(purgeStatus, 'writePurgeResults').resolves();
+      sinon.stub(purgeStatus, 'cleanupDeletedDocs').resolves(0);
+      sinon.stub(purgeStatus, 'cleanupOrphanedRoles').resolves(0);
+
+      const currentHash = engine._hashPurgeFn(eval(`(${fn})`));
+      sinon.stub(purgeStatus, 'getLastPurgeFnHash').resolves(currentHash);
+      sinon.stub(purgeStatus, 'getLastRoleHashes').resolves(['hash_chw', 'hash_sup']);
+      sinon.stub(purgeStatus, 'getLastRunTimestamp').resolves(new Date('2025-01-01'));
+
+      sinon.stub(contacts, 'getChangedContactIds').resolves([]);
+      sinon.stub(records, 'getContactIdsWithChangedRecords').resolves([]);
+      sinon.stub(records, 'getUnallocatedRecords').resolves([]);
+
+      sinon.stub(console, 'log');
+
+      await engine.run({ incremental: true });
+
+      expect(console.log.calledWith('Offline roles changed since last run. Forcing full re-evaluation.')).to.be.false;
+      expect(contacts.getChangedContactIds.calledOnce).to.be.true;
+    });
+
+    it('should not check role hashes on first run (no previous hashes)', async () => {
+      const fn = 'function() { return []; }';
+      queryStub.onFirstCall().resolves({ rows: [{ fn }] });
+
+      sinon.stub(rolesService, 'getRoles').resolves({ hash_chw: ['chw'] });
+      sinon.stub(rolesService, 'saveRoles').resolves();
+      sinon.stub(purgeStatus, 'startRunLog').resolves(1);
+      sinon.stub(purgeStatus, 'completeRunLog').resolves();
+      sinon.stub(purgeStatus, 'writePurgeResults').resolves();
+      sinon.stub(purgeStatus, 'cleanupDeletedDocs').resolves(0);
+      sinon.stub(purgeStatus, 'cleanupOrphanedRoles').resolves(0);
+
+      sinon.stub(purgeStatus, 'getLastPurgeFnHash').resolves(null);
+      sinon.stub(purgeStatus, 'getLastRoleHashes').resolves(null);
+      sinon.stub(purgeStatus, 'getLastRunTimestamp').resolves(null);
+
+      sinon.stub(contacts, 'getContactsBatch').resolves([]);
+      sinon.stub(records, 'getUnallocatedRecords').resolves([]);
+
+      sinon.stub(console, 'log');
+
+      await engine.run({ incremental: true });
+
+      // No force message — null lastRoleHashes skips check
+      expect(console.log.calledWith('Offline roles changed since last run. Forcing full re-evaluation.')).to.be.false;
+    });
+
+    it('should store role hashes in completed run stats', async () => {
+      const fn = 'function() { return []; }';
+      queryStub.onFirstCall().resolves({ rows: [{ fn }] });
+
+      sinon.stub(rolesService, 'getRoles').resolves({ hash_chw: ['chw'], hash_sup: ['chw_supervisor'] });
+      sinon.stub(rolesService, 'saveRoles').resolves();
+      sinon.stub(purgeStatus, 'startRunLog').resolves(1);
+      sinon.stub(purgeStatus, 'completeRunLog').resolves();
+      sinon.stub(purgeStatus, 'writePurgeResults').resolves();
+      sinon.stub(purgeStatus, 'cleanupDeletedDocs').resolves(0);
+      sinon.stub(purgeStatus, 'cleanupOrphanedRoles').resolves(0);
+
+      sinon.stub(contacts, 'getContactsBatch').resolves([]);
+      sinon.stub(records, 'getUnallocatedRecords').resolves([]);
+
+      sinon.stub(console, 'log');
+
+      await engine.run({ incremental: false });
+
+      const stats = purgeStatus.completeRunLog.args[0][1];
+      expect(stats.roleHashes).to.be.an('array');
+      expect(stats.roleHashes).to.include('hash_chw');
+      expect(stats.roleHashes).to.include('hash_sup');
     });
   });
 

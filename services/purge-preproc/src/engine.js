@@ -263,6 +263,24 @@ const _runWithLock = async (options, db) => {
     }
   }
 
+  // Detect role changes: if the set of offline roles has changed since the
+  // last completed run, force a full re-evaluation. New roles need purge_status
+  // entries for ALL contacts (not just recently-changed ones), and removed roles
+  // leave orphaned entries that should be cleaned up.
+  const currentRoleHashes = Object.keys(rolesByHash).sort();
+  if (incremental) {
+    const lastRoleHashes = await purgeStatus.getLastRoleHashes();
+    if (lastRoleHashes) {
+      const lastSorted = [...lastRoleHashes].sort();
+      const rolesChanged = currentRoleHashes.length !== lastSorted.length ||
+        currentRoleHashes.some((h, i) => h !== lastSorted[i]);
+      if (rolesChanged) {
+        console.log('Offline roles changed since last run. Forcing full re-evaluation.');
+        incremental = false;
+      }
+    }
+  }
+
   await rolesService.saveRoles(rolesByHash);
 
   const runId = await purgeStatus.startRunLog();
@@ -273,6 +291,7 @@ const _runWithLock = async (options, db) => {
     docsUnpurged: 0,
     skippedContacts: [],
     purgeFnHash: currentFnHash,
+    roleHashes: currentRoleHashes,
   };
 
   try {
@@ -328,6 +347,10 @@ const _runWithLock = async (options, db) => {
     // Clean up stale purge_status entries for deleted documents
     const cleanedUp = await purgeStatus.cleanupDeletedDocs();
     stats.deletedDocsCleaned = cleanedUp;
+
+    // Clean up orphaned purge_status entries for role hashes that no longer exist
+    const orphanedCleaned = await purgeStatus.cleanupOrphanedRoles(currentRoleHashes);
+    stats.orphanedRolesCleaned = orphanedCleaned;
 
     await purgeStatus.completeRunLog(runId, stats);
     console.log(`Purge run completed: ${stats.contactsProcessed} contacts, ` +

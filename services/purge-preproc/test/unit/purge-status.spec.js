@@ -124,6 +124,99 @@ describe('Purge Status', () => {
     });
   });
 
+  describe('getLastRoleHashes', () => {
+    it('should return null when no completed runs', async () => {
+      sinon.stub(db, 'query').resolves({ rows: [] });
+      const result = await purgeStatus.getLastRoleHashes();
+      expect(result).to.be.null;
+    });
+
+    it('should return the role hashes from the latest completed run', async () => {
+      const hashes = ['hash_a', 'hash_b'];
+      sinon.stub(db, 'query').resolves({ rows: [{ role_hashes: hashes }] });
+      const result = await purgeStatus.getLastRoleHashes();
+      expect(result).to.deep.equal(hashes);
+    });
+
+    it('should skip runs with null role_hashes', async () => {
+      const queryStub = sinon.stub(db, 'query').resolves({ rows: [] });
+      await purgeStatus.getLastRoleHashes();
+      const sql = queryStub.args[0][0];
+      expect(sql).to.include('role_hashes IS NOT NULL');
+    });
+  });
+
+  describe('cleanupOrphanedRoles', () => {
+    it('should delete purge_status entries for role hashes not in the active set', async () => {
+      const queryStub = sinon.stub(db, 'query').resolves({ rowCount: 10 });
+      sinon.stub(console, 'log');
+
+      const result = await purgeStatus.cleanupOrphanedRoles(['hash_a', 'hash_b']);
+
+      expect(result).to.equal(10);
+      expect(queryStub.calledOnce).to.be.true;
+      const [sql, params] = queryStub.args[0];
+      expect(sql).to.include('DELETE FROM purge_status');
+      expect(sql).to.include('role_hash != ALL');
+      expect(params[0]).to.deep.equal(['hash_a', 'hash_b']);
+      expect(console.log.calledWith('Cleaned up 10 purge_status entries for removed roles')).to.be.true;
+    });
+
+    it('should return 0 and not log when no orphaned entries', async () => {
+      sinon.stub(db, 'query').resolves({ rowCount: 0 });
+      sinon.stub(console, 'log');
+
+      const result = await purgeStatus.cleanupOrphanedRoles(['hash_a']);
+
+      expect(result).to.equal(0);
+      expect(console.log.callCount).to.equal(0);
+    });
+
+    it('should not run query when no active role hashes', async () => {
+      const queryStub = sinon.stub(db, 'query');
+
+      const result = await purgeStatus.cleanupOrphanedRoles([]);
+
+      expect(result).to.equal(0);
+      expect(queryStub.callCount).to.equal(0);
+    });
+  });
+
+  describe('completeRunLog with role hashes', () => {
+    it('should store role hashes in completed run log', async () => {
+      const queryStub = sinon.stub(db, 'query').resolves();
+
+      await purgeStatus.completeRunLog(1, {
+        contactsProcessed: 10,
+        docsEvaluated: 50,
+        docsPurged: 5,
+        docsUnpurged: 45,
+        skippedContacts: [],
+        purgeFnHash: 'fnhash',
+        roleHashes: ['hash_a', 'hash_b'],
+      });
+
+      const [sql, params] = queryStub.args[0];
+      expect(sql).to.include('role_hashes');
+      expect(params[7]).to.equal(JSON.stringify(['hash_a', 'hash_b']));
+    });
+
+    it('should store empty array when no role hashes', async () => {
+      const queryStub = sinon.stub(db, 'query').resolves();
+
+      await purgeStatus.completeRunLog(1, {
+        contactsProcessed: 0,
+        docsEvaluated: 0,
+        docsPurged: 0,
+        docsUnpurged: 0,
+        skippedContacts: [],
+      });
+
+      const params = queryStub.args[0][1];
+      expect(params[7]).to.equal(JSON.stringify([]));
+    });
+  });
+
   describe('cleanupDeletedDocs', () => {
     it('should delete purge_status entries for deleted couchdb documents', async () => {
       const queryStub = sinon.stub(db, 'query').resolves({ rowCount: 5 });

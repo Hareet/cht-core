@@ -108,6 +108,43 @@ const getLastPurgeFnHash = async () => {
   return result.rows.length ? result.rows[0].purge_fn_hash : null;
 };
 
+// Get the role hashes from the last completed run.
+// Used to detect when offline roles change between runs (new role added, role removed),
+// forcing a full re-evaluation so that all contacts get purge_status entries for new roles.
+const getLastRoleHashes = async () => {
+  const result = await db.query(`
+    SELECT role_hashes
+    FROM purge_run_log
+    WHERE status = 'completed'
+      AND role_hashes IS NOT NULL
+    ORDER BY completed_at DESC
+    LIMIT 1
+  `);
+
+  return result.rows.length ? result.rows[0].role_hashes : null;
+};
+
+// Remove purge_status entries for role hashes that no longer have any active users.
+// When a role combination is removed (all users with that role set are deleted or changed),
+// its purge_status entries become orphaned — no Sync Stream query will ever reference them.
+// Without cleanup, purge_status grows unboundedly as roles change over time.
+const cleanupOrphanedRoles = async (activeRoleHashes) => {
+  if (!activeRoleHashes.length) {
+    return 0;
+  }
+
+  const result = await db.query(`
+    DELETE FROM purge_status
+    WHERE role_hash != ALL($1)
+  `, [activeRoleHashes]);
+
+  const deleted = result.rowCount || 0;
+  if (deleted > 0) {
+    console.log(`Cleaned up ${deleted} purge_status entries for removed roles`);
+  }
+  return deleted;
+};
+
 // Create a new run log entry.
 const startRunLog = async () => {
   const result = await db.query(`
@@ -129,7 +166,8 @@ const completeRunLog = async (runId, stats) => {
       docs_purged = $4,
       docs_unpurged = $5,
       skipped_contacts = $6::jsonb,
-      purge_fn_hash = $7
+      purge_fn_hash = $7,
+      role_hashes = $8::jsonb
     WHERE id = $1
   `, [
     runId,
@@ -139,6 +177,7 @@ const completeRunLog = async (runId, stats) => {
     stats.docsUnpurged,
     JSON.stringify(stats.skippedContacts || []),
     stats.purgeFnHash || null,
+    JSON.stringify(stats.roleHashes || []),
   ]);
 };
 
@@ -180,6 +219,8 @@ module.exports = {
   writePurgeResults,
   getLastRunTimestamp,
   getLastPurgeFnHash,
+  getLastRoleHashes,
+  cleanupOrphanedRoles,
   startRunLog,
   completeRunLog,
   failRunLog,
