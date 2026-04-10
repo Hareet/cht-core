@@ -1,0 +1,228 @@
+# CHT PowerSync Sync Streams Configuration
+# Edition 3 (Sync Streams, not legacy Sync Rules)
+#
+# IMPORTANT: Only PowerSync-supported SQL is used in this file.
+# Supported: SELECT, WHERE, AND, OR, NOT, =, !=, IS NULL, IS NOT NULL,
+#   IN (subquery), IN 'json_array', INNER JOIN, CASE/WHEN, BETWEEN,
+#   ->, ->>, CAST, ifnull, iif, substring, length, instr
+# NOT supported: COALESCE, LIKE, LIMIT, GROUP BY, ORDER BY, jsonb_typeof,
+#   NOT IN (subquery), LEFT/RIGHT JOIN, aggregation
+#
+# JWT claims expected in auth token:
+#   sub:            user_id (e.g., "org.couchdb.user:chw_user")
+#   contact_id:     user's contact person document ID (UUID)
+#   role_hash:      MD5 of sorted roles (for purge group lookup)
+#   report_depth:   max depth for other users' reports (-1 = unlimited)
+
+config:
+  edition: 3
+
+# Global CTE: accessible facility/contact IDs for the authenticated user.
+# Pre-computed by refresh_user_facilities() using recursive CTE in PostgreSQL.
+with:
+  accessible_facilities: |
+    SELECT facility_id
+    FROM "v1"."user_accessible_facilities"
+    WHERE user_id = auth.user_id()
+
+streams:
+  # ================================================================
+  # CONTACTS
+  # ================================================================
+  # Hierarchical filtering by facility + replication depth.
+  # parent_id extraction: ifnull(parent->'_id', parent) handles both
+  # object parents ({"_id":"x"}) and string parents ("x").
+  contacts:
+    auto_subscribe: true
+    priority: 1
+    query: |
+      SELECT
+        c._id AS id,
+        c.doc ->> 'name' AS name,
+        ifnull(c.doc ->> 'contact_type', c.doc ->> 'type') AS contact_type,
+        ifnull(c.doc -> 'parent' ->> '_id', c.doc ->> 'parent') AS parent_id,
+        c.doc ->> 'patient_id' AS patient_id,
+        c.doc ->> 'place_id' AS place_id,
+        c.doc ->> 'phone' AS phone,
+        c.doc ->> 'date_of_birth' AS date_of_birth,
+        c.doc ->> 'sex' AS sex,
+        c.doc ->> 'reported_date' AS reported_date,
+        CAST(c.doc AS TEXT) AS doc
+      FROM "v1"."couchdb" c
+      WHERE c._deleted != true
+        AND c.doc ->> 'type' IN '["contact", "person", "clinic", "health_center", "district_hospital"]'
+        AND c._id IN accessible_facilities
+
+  # ================================================================
+  # REPORTS
+  # ================================================================
+  # Subject resolution uses nested ifnull matching CHT's getSubject():
+  #   patient_id -> fields.patient_id -> place_id -> fields.place_id
+  #   -> fields.patient_uuid -> contact._id
+  #
+  # needs_signoff: walks submitter ancestor chain (5 levels).
+  # report_depth: limits OTHER users' reports by depth.
+  # Privacy: fields.private=true only visible to submitter.
+  reports:
+    auto_subscribe: true
+    priority: 2
+    with:
+      # Pre-computed report_depth-filtered facilities (simple auth.user_id() lookup)
+      # PowerSync only allows = comparisons with auth params, so depth filtering
+      # is done in PostgreSQL by refresh_user_facilities() -> user_report_facilities
+      report_facilities: |
+        SELECT facility_id
+        FROM "v1"."user_report_facilities"
+        WHERE user_id = auth.user_id()
+    query: |
+      SELECT
+        c._id AS id,
+        c.doc ->> 'form' AS form,
+        c.doc ->> 'patient_id' AS patient_id,
+        c.doc -> 'contact' ->> '_id' AS submitter_id,
+        c.doc ->> 'reported_date' AS reported_date,
+        c.doc -> 'fields' ->> 'private' AS is_private,
+        c.doc -> 'fields' ->> 'needs_signoff' AS needs_signoff,
+        CAST(c.doc -> 'fields' AS TEXT) AS fields,
+        CAST(c.doc AS TEXT) AS doc
+      FROM "v1"."couchdb" c
+      WHERE c._deleted != true
+        AND c.doc ->> 'type' = 'data_record'
+        AND c.doc ->> 'form' IS NOT NULL
+        AND (
+          -- Subject matching: each possible subject field checked separately
+          -- (PowerSync requires simple column IN cte, no complex expressions)
+          c.doc ->> 'patient_id' IN report_facilities
+          OR c.doc -> 'fields' ->> 'patient_id' IN report_facilities
+          OR c.doc ->> 'place_id' IN report_facilities
+          OR c.doc -> 'fields' ->> 'place_id' IN report_facilities
+          OR c.doc -> 'fields' ->> 'patient_uuid' IN report_facilities
+          OR c.doc -> 'contact' ->> '_id' IN report_facilities
+          -- needs_signoff=true — replicate UP via submitter ancestor chain
+          OR (
+            c.doc -> 'fields' ->> 'needs_signoff' = 'true'
+            AND (
+              c.doc -> 'contact' ->> '_id' IN accessible_facilities
+              OR c.doc -> 'contact' -> 'parent' ->> '_id' IN accessible_facilities
+              OR c.doc -> 'contact' -> 'parent' -> 'parent' ->> '_id' IN accessible_facilities
+              OR c.doc -> 'contact' -> 'parent' -> 'parent' -> 'parent' ->> '_id' IN accessible_facilities
+              OR c.doc -> 'contact' -> 'parent' -> 'parent' -> 'parent' -> 'parent' ->> '_id' IN accessible_facilities
+            )
+          )
+        )
+        -- Privacy: private reports only visible to submitter
+        AND (
+          c.doc -> 'fields' ->> 'private' != 'true'
+          OR c.doc -> 'contact' ->> '_id' = auth.parameter('contact_id')
+        )
+
+  # ================================================================
+  # TASKS
+  # ================================================================
+  # task.user = CouchDB user ID ("org.couchdb.user:xxx"), NOT contact UUID.
+  tasks:
+    auto_subscribe: true
+    priority: 3
+    query: |
+      SELECT
+        c._id AS id,
+        c.doc ->> 'user' AS task_user,
+        c.doc ->> 'owner' AS owner,
+        c.doc ->> 'requester' AS requester,
+        c.doc ->> 'state' AS state,
+        c.doc ->> 'emission' AS emission_id,
+        c.doc ->> 'dueDate' AS due_date,
+        c.doc ->> 'startDate' AS start_date,
+        c.doc ->> 'endDate' AS end_date,
+        CAST(c.doc AS TEXT) AS doc
+      FROM "v1"."couchdb" c
+      WHERE c._deleted != true
+        AND c.doc ->> 'type' = 'task'
+        AND c.doc ->> 'user' = auth.user_id()
+
+  # ================================================================
+  # TARGETS
+  # ================================================================
+  # target.owner = contact UUID. Syncs to any user who can see
+  # the owner contact (supervisors see subordinate targets).
+  targets:
+    auto_subscribe: true
+    priority: 3
+    query: |
+      SELECT
+        c._id AS id,
+        c.doc ->> 'owner' AS owner,
+        c.doc ->> 'reporting_period' AS reporting_period,
+        CAST(c.doc -> 'targets' AS TEXT) AS targets_data,
+        CAST(c.doc AS TEXT) AS doc
+      FROM "v1"."couchdb" c
+      WHERE c._deleted != true
+        AND c.doc ->> 'type' = 'target'
+        AND c.doc ->> 'owner' IN accessible_facilities
+
+  # ================================================================
+  # GLOBAL CONFIG — all users, no filtering
+  # ================================================================
+  # Matches the _all replication key in CHT's docs_by_replication_key.
+  # By type: form, translations
+  # By _id: resources, branding, partners, service-worker-meta,
+  #         zscore-charts, settings, privacy-policies
+  global_config:
+    auto_subscribe: true
+    priority: 1
+    queries:
+      - |
+        SELECT
+          c._id AS id,
+          c.doc ->> 'type' AS doc_type,
+          CAST(c.doc AS TEXT) AS doc
+        FROM "v1"."couchdb" c
+        WHERE c._deleted != true
+          AND c.doc ->> 'type' IN '["form", "translations"]'
+      - |
+        SELECT
+          c._id AS id,
+          c.doc ->> 'type' AS doc_type,
+          CAST(c.doc AS TEXT) AS doc
+        FROM "v1"."couchdb" c
+        WHERE c._deleted != true
+          AND c._id IN '["resources", "branding", "partners", "service-worker-meta", "zscore-charts", "settings", "privacy-policies"]'
+
+  # ================================================================
+  # USER SETTINGS DOC
+  # ================================================================
+  # User's own org.couchdb.user:<username> document.
+  user_settings_doc:
+    auto_subscribe: true
+    priority: 1
+    query: |
+      SELECT
+        c._id AS id,
+        c.doc ->> 'type' AS doc_type,
+        CAST(c.doc AS TEXT) AS doc
+      FROM "v1"."couchdb" c
+      WHERE c._deleted != true
+        AND c._id = auth.user_id()
+
+  # ================================================================
+  # USER META — feedback, telemetry, read status
+  # ================================================================
+  # Uses substring+instr instead of LIKE (not supported).
+  # Matches _id prefixes: telemetry-, feedback-, read:report:
+  user_meta:
+    auto_subscribe: true
+    priority: 3
+    query: |
+      SELECT
+        c._id AS id,
+        c.doc ->> 'type' AS meta_type,
+        c.doc ->> 'user' AS user_id,
+        CAST(c.doc AS TEXT) AS doc
+      FROM "v1"."couchdb" c
+      WHERE c._deleted != true
+        AND (
+          substring(c._id, 1, 10) = 'telemetry-'
+          OR substring(c._id, 1, 9) = 'feedback-'
+          OR substring(c._id, 1, 12) = 'read:report:'
+        )
+        AND c.doc ->> 'user' = auth.user_id()
