@@ -124,6 +124,53 @@ describe('postgres freetext lib', () => {
       expect(sql).to.include("'rc-code'");
     });
 
+    it('escapes percent wildcard in unkeyed freetext', async () => {
+      poolQuery.resolves({ rows: [{ _id: 'c1' }], rowCount: 1 });
+
+      await queryByFreetext(ctx, 'contacts')(
+        { freetext: '100%' }, null, 10
+      );
+
+      const params = poolQuery.firstCall.args[1];
+      // The % in user input must be escaped so it matches literally
+      expect(params[0]).to.equal('%100\\%%');
+    });
+
+    it('escapes underscore wildcard in unkeyed freetext', async () => {
+      poolQuery.resolves({ rows: [{ _id: 'c1' }], rowCount: 1 });
+
+      await queryByFreetext(ctx, 'contacts')(
+        { freetext: '_admin' }, null, 10
+      );
+
+      const params = poolQuery.firstCall.args[1];
+      // The _ in user input must be escaped so it matches literally
+      expect(params[0]).to.equal('%\\_admin%');
+    });
+
+    it('escapes backslash in unkeyed freetext', async () => {
+      poolQuery.resolves({ rows: [{ _id: 'c1' }], rowCount: 1 });
+
+      await queryByFreetext(ctx, 'contacts')(
+        { freetext: 'path\\to' }, null, 10
+      );
+
+      const params = poolQuery.firstCall.args[1];
+      // The \ in user input must be escaped so it matches literally
+      expect(params[0]).to.equal('%path\\\\to%');
+    });
+
+    it('escapes multiple LIKE wildcards in unkeyed freetext', async () => {
+      poolQuery.resolves({ rows: [{ _id: 'c1' }], rowCount: 1 });
+
+      await queryByFreetext(ctx, 'contacts')(
+        { freetext: '50%_off\\sale' }, null, 10
+      );
+
+      const params = poolQuery.firstCall.args[1];
+      expect(params[0]).to.equal('%50\\%\\_off\\\\sale%');
+    });
+
     it('rejects keyed freetext with SQL injection in key', async () => {
       await expect(
         queryByFreetext(ctx, 'contacts')(
@@ -187,6 +234,17 @@ describe('postgres freetext lib', () => {
       const sql = poolQuery.firstCall.args[0];
       expect(sql).to.include("'data_record'");
       expect(sql).to.include('reported_date');
+    });
+
+    it('escapes LIKE wildcards in unkeyed report freetext', async () => {
+      poolQuery.resolves({ rows: [{ _id: 'r1' }], rowCount: 1 });
+
+      await queryByFreetext(ctx, 'reports')(
+        { freetext: '100%_match' }, null, 10
+      );
+
+      const params = poolQuery.firstCall.args[1];
+      expect(params[0]).to.equal('%100\\%\\_match%');
     });
 
     it('searches reports by keyed freetext', async () => {

@@ -18,6 +18,13 @@ const assertSafeKey = (key: string): void => {
 };
 
 /**
+ * Escapes PostgreSQL LIKE/ILIKE special characters (`%`, `_`, `\`) in user input so they are
+ * matched literally instead of being interpreted as wildcards.
+ * @internal
+ */
+const escapeLikePattern = (term: string): string => term.replace(/[%_\\]/g, '\\$&');
+
+/**
  * Builds a PostgreSQL full-text search query that replicates Nouveau/offline freetext indexes.
  *
  * - Keyed freetext (`key:value`): exact match on `doc->>'{key}' = '{value}'`
@@ -67,8 +74,8 @@ export const queryByFreetext = (
     // Search in both top-level and nested fields
     conditions.push(`(doc->>'${key}' = $${params.length} OR doc->'fields'->>'${key}' = $${params.length})`);
   } else {
-    // Unkeyed: ILIKE prefix search
-    params.push(`%${qualifier.freetext}%`);
+    // Unkeyed: ILIKE substring search (escape LIKE wildcards so %, _, \ are matched literally)
+    params.push(`%${escapeLikePattern(qualifier.freetext)}%`);
     conditions.push(`doc::text ILIKE $${params.length}`);
   }
 
