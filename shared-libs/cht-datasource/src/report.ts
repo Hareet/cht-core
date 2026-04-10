@@ -2,6 +2,7 @@ import { DataObject, getPagedGenerator, isIdentifiable, isRecord, NormalizedPare
 import { adapt, assertDataContext, DataContext } from './libs/data-context';
 import { Doc } from './libs/doc';
 import * as Local from './local';
+import * as Postgres from './postgres';
 import { FreetextQualifier, UuidQualifier } from './qualifier';
 import * as Remote from './remote';
 import { DEFAULT_IDS_PAGE_LIMIT } from './libs/constants';
@@ -40,7 +41,7 @@ export namespace v1 {
    */
   export const get = (context: DataContext): typeof curriedFn => {
     assertDataContext(context);
-    const fn = adapt(context, Local.Report.v1.get, Remote.Report.v1.get);
+    const fn = adapt(context, Local.Report.v1.get, Remote.Report.v1.get, Postgres.Report.v1.get);
 
     /**
      * Returns a report for the given qualifier.
@@ -66,7 +67,7 @@ export namespace v1 {
    */
   export const getUuidsPage = (context: DataContext): typeof curriedFn => {
     assertDataContext(context);
-    const fn = adapt(context, Local.Report.v1.getUuidsPage, Remote.Report.v1.getUuidsPage);
+    const fn = adapt(context, Local.Report.v1.getUuidsPage, Remote.Report.v1.getUuidsPage, Postgres.Report.v1.getUuidsPage);
 
     /**
      * Returns an array of report identifiers for the provided page specifications.
@@ -127,7 +128,7 @@ export namespace v1 {
    */
   export const create = (context: DataContext): typeof curriedFn => {
     assertDataContext(context);
-    const fn = adapt(context, Local.Report.v1.create, Remote.Report.v1.create);
+    const fn = adapt(context, Local.Report.v1.create, Remote.Report.v1.create, Postgres.Report.v1.create);
 
     /**
      * Creates a new report record.
@@ -155,7 +156,7 @@ export namespace v1 {
    */
   export const update = (context: DataContext): typeof curriedFn => {
     assertDataContext(context);
-    const fn = adapt(context, Local.Report.v1.update, Remote.Report.v1.update);
+    const fn = adapt(context, Local.Report.v1.update, Remote.Report.v1.update, Postgres.Report.v1.update);
 
     /**
      * Updates an existing report to have the provided data.
@@ -189,7 +190,7 @@ export namespace v1 {
    */
   export const getWithLineage = (context: DataContext): typeof curriedFnWithLineage => {
     assertDataContext(context);
-    const fn = adapt(context, Local.Report.v1.getWithLineage, Remote.Report.v1.getWithLineage);
+    const fn = adapt(context, Local.Report.v1.getWithLineage, Remote.Report.v1.getWithLineage, Postgres.Report.v1.getWithLineage);
 
     /**
      * Returns a report with lineage for the given qualifier.

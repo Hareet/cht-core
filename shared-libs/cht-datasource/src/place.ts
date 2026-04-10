@@ -3,8 +3,10 @@ import * as Person from './person';
 import { LocalDataContext } from './local/libs/data-context';
 import { ContactTypeQualifier, UuidQualifier } from './qualifier';
 import { RemoteDataContext } from './remote/libs/data-context';
+import { PostgresDataContext } from './postgres/libs/data-context';
 import { adapt, assertDataContext, DataContext } from './libs/data-context';
 import * as Local from './local';
+import * as Postgres from './postgres';
 import * as Remote from './remote';
 import { getPagedGenerator, isIdentifiable, isRecord, NormalizedParent, Nullable, Page } from './libs/core';
 import { DEFAULT_DOCS_PAGE_LIMIT } from './libs/constants';
@@ -34,10 +36,11 @@ export namespace v1 {
   const getPlace =
     <T>(
       localFn: (c: LocalDataContext) => (qualifier: UuidQualifier) => Promise<T>,
-      remoteFn: (c: RemoteDataContext) => (qualifier: UuidQualifier) => Promise<T>
+      remoteFn: (c: RemoteDataContext) => (qualifier: UuidQualifier) => Promise<T>,
+      postgresFn?: (c: PostgresDataContext) => (qualifier: UuidQualifier) => Promise<T>
     ) => (context: DataContext) => {
       assertDataContext(context);
-      const fn = adapt(context, localFn, remoteFn);
+      const fn = adapt(context, localFn, remoteFn, postgresFn);
       return async (qualifier: UuidQualifier): Promise<T> => {
         assertUuidQualifier(qualifier);
         return fn(qualifier);
@@ -50,7 +53,7 @@ export namespace v1 {
    * @returns the place or `null` if no place is found for the qualifier
    * @throws Error if the provided context or qualifier is invalid
    */
-  export const get = getPlace(Local.Place.v1.get, Remote.Place.v1.get);
+  export const get = getPlace(Local.Place.v1.get, Remote.Place.v1.get, Postgres.Place.v1.get);
 
   /**
    * Returns a place for the given qualifier with the place's parent lineage.
@@ -58,7 +61,7 @@ export namespace v1 {
    * @returns the place or `null` if no place is found for the qualifier
    * @throws Error if the provided context or qualifier is invalid
    */
-  export const getWithLineage = getPlace(Local.Place.v1.getWithLineage, Remote.Place.v1.getWithLineage);
+  export const getWithLineage = getPlace(Local.Place.v1.getWithLineage, Remote.Place.v1.getWithLineage, Postgres.Place.v1.getWithLineage);
 
   /**
    * Returns a function for retrieving a paged array of places from the given data context.
@@ -69,7 +72,7 @@ export namespace v1 {
    */
   export const getPage = (context: DataContext): typeof curriedFn => {
     assertDataContext(context);
-    const fn = adapt(context, Local.Place.v1.getPage, Remote.Place.v1.getPage);
+    const fn = adapt(context, Local.Place.v1.getPage, Remote.Place.v1.getPage, Postgres.Place.v1.getPage);
 
     /**
      * Returns an array of places for the provided page specifications.
@@ -127,7 +130,7 @@ export namespace v1 {
    */
   export const create = (context: DataContext): typeof curriedFn => {
     assertDataContext(context);
-    const fn = adapt(context, Local.Place.v1.create, Remote.Place.v1.create);
+    const fn = adapt(context, Local.Place.v1.create, Remote.Place.v1.create, Postgres.Place.v1.create);
 
     /**
      * Creates a new place record.
@@ -159,7 +162,7 @@ export namespace v1 {
    */
   export const update = (context: DataContext): typeof curriedFn => {
     assertDataContext(context);
-    const fn = adapt(context, Local.Place.v1.update, Remote.Place.v1.update);
+    const fn = adapt(context, Local.Place.v1.update, Remote.Place.v1.update, Postgres.Place.v1.update);
 
     /**
      * Updates an existing place to have the provided data.

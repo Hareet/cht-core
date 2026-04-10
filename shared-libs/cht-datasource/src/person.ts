@@ -3,9 +3,11 @@ import { adapt, assertDataContext, DataContext } from './libs/data-context';
 import * as Contact from './contact';
 import * as Remote from './remote';
 import * as Local from './local';
+import * as Postgres from './postgres';
 import * as Place from './place';
 import { LocalDataContext } from './local/libs/data-context';
 import { RemoteDataContext } from './remote/libs/data-context';
+import { PostgresDataContext } from './postgres/libs/data-context';
 import {
   DateTimeString,
   getPagedGenerator,
@@ -42,10 +44,11 @@ export namespace v1 {
   const getPerson =
     <T>(
       localFn: (c: LocalDataContext) => (qualifier: UuidQualifier) => Promise<T>,
-      remoteFn: (c: RemoteDataContext) => (qualifier: UuidQualifier) => Promise<T>
+      remoteFn: (c: RemoteDataContext) => (qualifier: UuidQualifier) => Promise<T>,
+      postgresFn?: (c: PostgresDataContext) => (qualifier: UuidQualifier) => Promise<T>
     ) => (context: DataContext) => {
       assertDataContext(context);
-      const fn = adapt(context, localFn, remoteFn);
+      const fn = adapt(context, localFn, remoteFn, postgresFn);
       return async (qualifier: UuidQualifier): Promise<T> => {
         assertUuidQualifier(qualifier);
         return fn(qualifier);
@@ -58,7 +61,7 @@ export namespace v1 {
    * @returns the person or `null` if no person is found for the qualifier
    * @throws Error if the provided context or qualifier is invalid
    */
-  export const get = getPerson(Local.Person.v1.get, Remote.Person.v1.get);
+  export const get = getPerson(Local.Person.v1.get, Remote.Person.v1.get, Postgres.Person.v1.get);
 
   /**
    * Returns a person for the given qualifier with the person's parent lineage.
@@ -66,7 +69,9 @@ export namespace v1 {
    * @returns the person or `null` if no person is found for the qualifier
    * @throws Error if the provided context or qualifier is invalid
    */
-  export const getWithLineage = getPerson(Local.Person.v1.getWithLineage, Remote.Person.v1.getWithLineage);
+  export const getWithLineage = getPerson(
+    Local.Person.v1.getWithLineage, Remote.Person.v1.getWithLineage, Postgres.Person.v1.getWithLineage
+  );
 
   /**
    * Returns a function for retrieving a paged array of people from the given data context.
@@ -77,7 +82,7 @@ export namespace v1 {
    */
   export const getPage = (context: DataContext): typeof curriedFn => {
     assertDataContext(context);
-    const fn = adapt(context, Local.Person.v1.getPage, Remote.Person.v1.getPage);
+    const fn = adapt(context, Local.Person.v1.getPage, Remote.Person.v1.getPage, Postgres.Person.v1.getPage);
 
     /**
      * Returns an array of people for the provided page specifications.
@@ -135,7 +140,7 @@ export namespace v1 {
    */
   export const create = (context: DataContext): typeof curriedFn => {
     assertDataContext(context);
-    const fn = adapt(context, Local.Person.v1.create, Remote.Person.v1.create);
+    const fn = adapt(context, Local.Person.v1.create, Remote.Person.v1.create, Postgres.Person.v1.create);
 
     /**
      * Creates a new person record.
@@ -165,7 +170,7 @@ export namespace v1 {
    */
   export const update = (context: DataContext): typeof curriedFn => {
     assertDataContext(context);
-    const fn = adapt(context, Local.Person.v1.update, Remote.Person.v1.update);
+    const fn = adapt(context, Local.Person.v1.update, Remote.Person.v1.update, Postgres.Person.v1.update);
 
     /**
      * Updates an existing person to have the provided data.

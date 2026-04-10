@@ -6,6 +6,7 @@ import * as Target from '../src/target';
 import { expect } from 'chai';
 import * as Local from '../src/local';
 import * as Remote from '../src/remote';
+import * as Postgres from '../src/postgres';
 import { and } from '../src/qualifier';
 import * as Core from '../src/libs/core';
 import { fakeGenerator } from './utils';
@@ -51,7 +52,7 @@ describe('target', () => {
         expect(result).to.equal(target);
         expect(assertDataContext).to.have.been.calledOnceWithExactly(dataContext);
         expect(adapt).to.have.been.calledOnceWithExactly(
-          dataContext, Local.Target.v1.get, Remote.Target.v1.get
+          dataContext, Local.Target.v1.get, Remote.Target.v1.get, Postgres.Target.v1.get
         );
         expect(getTarget).to.have.been.calledOnceWithExactly(qualifier);
       });
@@ -73,7 +74,7 @@ describe('target', () => {
         expect(result).to.equal(target);
         expect(assertDataContext).to.have.been.calledOnceWithExactly(dataContext);
         expect(adapt).to.have.been.calledOnceWithExactly(
-          dataContext, Local.Target.v1.get, Remote.Target.v1.get
+          dataContext, Local.Target.v1.get, Remote.Target.v1.get, Postgres.Target.v1.get
         );
         expect(getTarget).to.have.been.calledOnceWithExactly(expectedIdQualifier);
       });
@@ -113,7 +114,7 @@ describe('target', () => {
 
           expect(assertDataContext).to.have.been.calledOnceWithExactly(dataContext);
           expect(adapt).to.have.been.calledOnceWithExactly(
-            dataContext, Local.Target.v1.get, Remote.Target.v1.get
+            dataContext, Local.Target.v1.get, Remote.Target.v1.get, Postgres.Target.v1.get
           );
           expect(getTarget).to.not.have.been.called;
         });
@@ -167,7 +168,7 @@ describe('target', () => {
           expect(result).to.equal(targets);
           expect(assertDataContext).to.have.been.calledOnceWithExactly(dataContext);
           expect(adapt).to.have.been.calledOnceWithExactly(
-            dataContext, Local.Target.v1.getPage, Remote.Target.v1.getPage
+            dataContext, Local.Target.v1.getPage, Remote.Target.v1.getPage, Postgres.Target.v1.getPage
           );
           expect(getPage).to.have.been.calledOnceWith(qualifier);
         });
@@ -205,7 +206,8 @@ describe('target', () => {
             adapt.calledOnceWithExactly(
               dataContext,
               Local.Target.v1.getPage,
-              Remote.Target.v1.getPage
+              Remote.Target.v1.getPage,
+              Postgres.Target.v1.getPage
             )
           ).to.be.true;
           expect(getPage.notCalled).to.be.true;
@@ -237,7 +239,7 @@ describe('target', () => {
 
           expect(assertDataContext).to.have.been.calledOnceWithExactly(dataContext);
           expect(adapt).to.have.been.calledOnceWithExactly(
-            dataContext, Local.Target.v1.getPage, Remote.Target.v1.getPage
+            dataContext, Local.Target.v1.getPage, Remote.Target.v1.getPage, Postgres.Target.v1.getPage
           );
           expect(getPage).to.not.have.been.called;
         });
@@ -265,7 +267,7 @@ describe('target', () => {
 
           expect(assertDataContext).to.have.been.calledOnceWithExactly(dataContext);
           expect(adapt).to.have.been.calledOnceWithExactly(
-            dataContext, Local.Target.v1.getPage, Remote.Target.v1.getPage
+            dataContext, Local.Target.v1.getPage, Remote.Target.v1.getPage, Postgres.Target.v1.getPage
           );
           expect(getPage).to.not.have.been.called;
         });
