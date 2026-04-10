@@ -44,7 +44,7 @@ export { DataContext } from './libs/data-context';
 export { getLocalDataContext } from './local';
 export { getRemoteDataContext } from './remote';
 export { getPostgresDataContext } from './postgres';
-export { InvalidArgumentError, ResourceNotFoundError } from './libs/error';
+export { InvalidArgumentError, ResourceNotFoundError, RevisionConflictError } from './libs/error';
 export * as Contact from './contact';
 export * as Person from './person';
 export * as Place from './place';

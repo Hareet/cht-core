@@ -15,6 +15,7 @@ import {
 import { expect } from 'chai';
 import { PostgresDataContext, DatabasePool } from '../../../src/postgres/libs/data-context';
 import { Nullable } from '../../../src';
+import { ResourceNotFoundError, RevisionConflictError } from '../../../src/libs/error';
 
 describe('postgres doc lib', () => {
   let poolQuery: SinonStub;
@@ -209,24 +210,47 @@ describe('postgres doc lib', () => {
       expect(poolQuery.firstCall.args[1][2]).to.equal('1-pg123');
     });
 
-    it('throws on update failure when document not found', async () => {
-      poolQuery.resolves({ rows: [], rowCount: 0 });
+    it('throws ResourceNotFoundError when document does not exist', async () => {
+      // UPDATE returns 0 rows
+      poolQuery.onFirstCall().resolves({ rows: [], rowCount: 0 });
+      // Follow-up SELECT also returns 0 rows (document not found)
+      poolQuery.onSecondCall().resolves({ rows: [], rowCount: 0 });
 
       await expect(updateDoc(ctx)({ _id: 'abc', _rev: '1-x' }))
-        .to.be.rejectedWith('Error updating document.');
+        .to.be.rejectedWith(ResourceNotFoundError, 'Document [abc] not found.');
+
+      expect(poolQuery.calledTwice).to.be.true;
+      // Verify the follow-up query checks for document existence
+      expect(poolQuery.secondCall.args[0]).to.include('_id = $1');
+      expect(poolQuery.secondCall.args[1]).to.deep.equal(['abc']);
     });
 
-    it('throws when _rev does not match (concurrent modification)', async () => {
-      // Simulates: another process updated the document between our read and write,
-      // so the _rev in the DB no longer matches the one we're providing.
-      poolQuery.resolves({ rows: [], rowCount: 0 });
+    it('throws RevisionConflictError when _rev does not match (concurrent modification)', async () => {
       const doc = { _id: 'abc', _rev: '1-pg123', type: 'person', name: 'stale-update' };
+      // UPDATE returns 0 rows (rev mismatch)
+      poolQuery.onFirstCall().resolves({ rows: [], rowCount: 0 });
+      // Follow-up SELECT finds the document with a different rev
+      poolQuery.onSecondCall().resolves({ rows: [{ current_rev: '2-pg999' }], rowCount: 1 });
 
-      await expect(updateDoc(ctx)(doc)).to.be.rejectedWith('Error updating document.');
+      await expect(updateDoc(ctx)(doc))
+        .to.be.rejectedWith(RevisionConflictError, 'Document [abc] has been modified. Expected rev [1-pg123] but found [2-pg999].');
 
-      expect(poolQuery.calledOnce).to.be.true;
+      expect(poolQuery.calledTwice).to.be.true;
       // Verify _rev is passed as the third parameter for the WHERE clause check
       expect(poolQuery.firstCall.args[1][2]).to.equal('1-pg123');
+    });
+
+    it('throws ResourceNotFoundError when document has been deleted', async () => {
+      const doc = { _id: 'abc', _rev: '1-pg123', type: 'person', name: 'deleted-doc' };
+      // UPDATE returns 0 rows (_deleted = true filtered out by WHERE)
+      poolQuery.onFirstCall().resolves({ rows: [], rowCount: 0 });
+      // Follow-up SELECT also returns 0 rows (deleted docs are filtered)
+      poolQuery.onSecondCall().resolves({ rows: [], rowCount: 0 });
+
+      await expect(updateDoc(ctx)(doc))
+        .to.be.rejectedWith(ResourceNotFoundError, 'Document [abc] not found.');
+
+      expect(poolQuery.calledTwice).to.be.true;
     });
 
     it('increments the rev number correctly across multiple updates', async () => {

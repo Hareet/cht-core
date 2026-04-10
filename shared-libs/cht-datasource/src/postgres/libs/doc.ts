@@ -1,6 +1,7 @@
 import logger from '@medic/logger';
 import { DataObject, Nullable, Page } from '../../libs/core';
 import { Doc, isDoc } from '../../libs/doc';
+import { ResourceNotFoundError, RevisionConflictError } from '../../libs/error';
 import { PostgresDataContext } from './data-context';
 
 /**
@@ -154,7 +155,18 @@ export const updateDoc = (ctx: PostgresDataContext) => async (data: Doc): Promis
     [JSON.stringify(doc), data._id, data._rev]
   );
   if (rowCount === 0) {
-    throw new Error('Error updating document.');
+    // Determine whether the failure was due to a missing document or a revision conflict.
+    const { rows } = await ctx.pool.query<{ current_rev: string }>(
+      `SELECT doc->>'_rev' AS current_rev FROM ${ctx.qualifiedTable}
+       WHERE _id = $1 AND (_deleted IS NULL OR _deleted = false)`,
+      [data._id]
+    );
+    if (rows.length === 0) {
+      throw new ResourceNotFoundError(`Document [${data._id}] not found.`);
+    }
+    throw new RevisionConflictError(
+      `Document [${data._id}] has been modified. Expected rev [${data._rev}] but found [${rows[0].current_rev}].`
+    );
   }
   return doc;
 };
