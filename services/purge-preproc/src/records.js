@@ -87,6 +87,11 @@ const getUnallocatedRecords = async (limit, offset) => {
 
 // Find contacts whose associated reports/messages have changed since a timestamp.
 // Returns contact _ids that need re-evaluation.
+// IMPORTANT: We intentionally include deleted records (_deleted = true) here.
+// When a report is deleted, its parent contact must be re-evaluated because the
+// purge function may produce different results without that report in the group.
+// The deleted record won't appear in the contact's group (getRecordsForSubjects
+// filters _deleted), so the purge function correctly evaluates the new state.
 const getContactIdsWithChangedRecords = async (since) => {
   const result = await db.query(`
     SELECT DISTINCT
@@ -103,7 +108,6 @@ const getContactIdsWithChangedRecords = async (since) => {
       ) AS subject_id
     FROM ${tbl()}
     WHERE doc->>'type' = 'data_record'
-      AND (_deleted IS NOT TRUE)
       AND saved_timestamp > $1
   `, [since]);
 

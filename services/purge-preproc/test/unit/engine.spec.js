@@ -328,6 +328,51 @@ describe('Purge Engine', () => {
       expect(purgeStatus.completeRunLog.calledOnce).to.be.true;
     });
 
+    it('should re-evaluate contacts when their records are deleted (incremental)', async () => {
+      const purgeFn = function(userCtx, contact, reports) {
+        // Purge contacts that have no reports
+        if (reports.length === 0) { return [contact._id]; }
+        return [];
+      };
+
+      queryStub.onFirstCall().resolves({
+        rows: [{ fn: purgeFn.toString() }],
+      });
+
+      sinon.stub(rolesService, 'getRoles').resolves({ hash_chw: ['chw'] });
+      sinon.stub(rolesService, 'saveRoles').resolves();
+      sinon.stub(purgeStatus, 'startRunLog').resolves(1);
+      sinon.stub(purgeStatus, 'completeRunLog').resolves();
+      sinon.stub(purgeStatus, 'writePurgeResults').resolves();
+      sinon.stub(purgeStatus, 'cleanupDeletedDocs').resolves(1);
+      sinon.stub(purgeStatus, 'getLastRunTimestamp').resolves(new Date('2025-01-01'));
+
+      // Simulate: no contacts changed, but a record was deleted (its contact needs re-eval)
+      sinon.stub(contacts, 'getChangedContactIds').resolves([]);
+      // getContactIdsWithChangedRecords should return the contact whose record was deleted
+      sinon.stub(records, 'getContactIdsWithChangedRecords').resolves(['c1']);
+
+      sinon.stub(contacts, 'getContact')
+        .withArgs('c1').resolves({ id: 'c1', doc: { _id: 'c1', type: 'person' } });
+
+      // The record is now deleted, so getRecordsForSubjects returns empty
+      sinon.stub(records, 'getSubjectIds').returns(['c1']);
+      sinon.stub(records, 'getRecordsForSubjects').resolves({ reports: [], messages: [] });
+      sinon.stub(records, 'getUnallocatedRecords').resolves([]);
+
+      sinon.stub(console, 'log');
+
+      await engine.run({ incremental: true });
+
+      // Contact c1 should have been re-evaluated
+      expect(contacts.getContact.calledWith('c1')).to.be.true;
+      expect(purgeStatus.writePurgeResults.callCount).to.be.greaterThan(0);
+
+      // Since the contact now has no reports, the purge function should purge the contact
+      const writeCall = purgeStatus.writePurgeResults.args[0][0];
+      expect(writeCall.hash_chw.c1).to.be.true;
+    });
+
     it('should call cleanupDeletedDocs during run', async () => {
       const purgeFn = function() { return []; };
 
