@@ -1,6 +1,39 @@
 import { Nullable, Page } from '../../libs/core';
 import { ContactTypeQualifier, FreetextQualifier, isContactTypeQualifier, isKeyedFreetextQualifier } from '../../qualifier';
 import { PostgresDataContext } from './data-context';
+import { InvalidArgumentError } from '../../libs/error';
+
+const validateCursor = (cursor: Nullable<string>): number => {
+  if (cursor === null) {
+    return 0;
+  }
+  const skip = Number(cursor);
+  if (isNaN(skip) || skip < 0 || !Number.isInteger(skip)) {
+    throw new InvalidArgumentError(`The cursor must be a string or null for first page: [${JSON.stringify(cursor)}].`);
+  }
+  return skip;
+};
+
+/**
+ * Validates that a freetext search key contains only safe characters for use in JSONB path
+ * expressions. Prevents SQL injection via the key portion of keyed freetext queries (e.g. "key:value").
+ * Only alphanumeric characters, underscores, and hyphens are allowed — these cover all valid
+ * CHT document field names.
+ * @internal
+ */
+const SAFE_KEY_PATTERN = /^[a-zA-Z0-9_-]+$/;
+const assertSafeKey = (key: string): void => {
+  if (!key || !SAFE_KEY_PATTERN.test(key)) {
+    throw new InvalidArgumentError(`Invalid freetext search key [${key}].`);
+  }
+};
+
+/**
+ * Escapes PostgreSQL LIKE/ILIKE special characters (`%`, `_`, `\`) in user input so they are
+ * matched literally instead of being interpreted as wildcards.
+ * @internal
+ */
+const escapeLikePattern = (term: string): string => term.replace(/[%_\\]/g, '\\$&');
 
 /**
  * Builds a PostgreSQL full-text search query that replicates Nouveau/offline freetext indexes.
@@ -47,17 +80,18 @@ export const queryByFreetext = (
     const colonIdx = qualifier.freetext.indexOf(':');
     const key = qualifier.freetext.slice(0, colonIdx);
     const value = qualifier.freetext.slice(colonIdx + 1);
+    assertSafeKey(key);
     params.push(value);
     // Search in both top-level and nested fields
     conditions.push(`(doc->>'${key}' = $${params.length} OR doc->'fields'->>'${key}' = $${params.length})`);
   } else {
-    // Unkeyed: ILIKE prefix search
-    params.push(`%${qualifier.freetext}%`);
+    // Unkeyed: ILIKE substring search (escape LIKE wildcards so %, _, \ are matched literally)
+    params.push(`%${escapeLikePattern(qualifier.freetext)}%`);
     conditions.push(`doc::text ILIKE $${params.length}`);
   }
 
   // Pagination
-  const skip = cursor ? parseInt(cursor, 10) : 0;
+  const skip = validateCursor(cursor);
   params.push(limit);
   params.push(skip);
 

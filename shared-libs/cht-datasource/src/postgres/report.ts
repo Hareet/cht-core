@@ -3,7 +3,7 @@ import { hasStringFieldWithValue, Nullable, Page } from '../libs/core';
 import { FreetextQualifier, UuidQualifier } from '../qualifier';
 import * as Report from '../report';
 import * as Input from '../input';
-import { createDoc, getDocById, getDocIdsByIdRange, getDocsByIds, updateDoc } from './libs/doc';
+import { createDoc, getDocById, getDocIdsByIdRange, getDocsByIds, minifyDoc, updateDoc } from './libs/doc';
 import { PostgresDataContext } from './libs/data-context';
 import logger from '@medic/logger';
 import { InvalidArgumentError, ResourceNotFoundError } from '../libs/error';
@@ -138,7 +138,8 @@ export namespace v1 {
         }
       }
 
-      const { _rev } = await updatePgDoc(updatedReport as unknown as Doc);
+      const minified = minifyDoc(updatedReport as unknown as Doc);
+      const { _rev } = await updatePgDoc(minified);
       return { ...updatedReport, _rev };
     };
   };

@@ -4,12 +4,12 @@ import { assertHasRequiredField, Nullable, Page } from '../libs/core';
 import * as Qualifier from '../qualifier';
 import { ContactTypeQualifier, UuidQualifier } from '../qualifier';
 import * as Person from '../person';
-import { createDoc, fetchAndFilter, getDocById, queryDocsByType, updateDoc } from './libs/doc';
+import { createDoc, fetchAndFilter, getDocById, minifyDoc, queryDocsByType, updateDoc } from './libs/doc';
 import { PostgresDataContext } from './libs/data-context';
 import { SettingsService } from '../local/libs/data-context';
 import logger from '@medic/logger';
 import { InvalidArgumentError, ResourceNotFoundError } from '../libs/error';
-import { fetchHydratedDoc } from './libs/lineage';
+import { assertSameParentLineage, fetchHydratedDoc } from './libs/lineage';
 import * as Input from '../input';
 
 const validateCursor = (cursor: Nullable<string>): number => {
@@ -151,8 +151,10 @@ export namespace v1 {
       if (originalPerson.name) {
         assertHasRequiredField(updatedPerson, { name: 'name', type: 'string' }, InvalidArgumentError);
       }
+      assertSameParentLineage(originalPerson, updatedPerson);
 
-      const { _rev } = await updatePgDoc(updatedPerson);
+      const minified = minifyDoc(updatedPerson);
+      const { _rev } = await updatePgDoc(minified);
       return { ...updatedPerson, _rev };
     };
   };

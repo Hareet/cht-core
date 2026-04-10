@@ -7,6 +7,7 @@ import * as PgLineage from '../../src/postgres/libs/lineage';
 import * as PgFreetext from '../../src/postgres/libs/freetext';
 import * as PgContact from '../../src/postgres/contact';
 import { PostgresDataContext, DatabasePool } from '../../src/postgres/libs/data-context';
+import { InvalidArgumentError } from '../../src';
 
 describe('postgres report', () => {
   let ctx: PostgresDataContext;
@@ -185,6 +186,26 @@ describe('postgres report', () => {
         expect(result).to.deep.equal(expectedPage);
         expect(queryByFreetextInner.firstCall.args[1]).to.equal('5');
         expect(queryByFreetextInner.firstCall.args[2]).to.equal(10);
+      });
+
+      it('throws InvalidArgumentError for non-numeric cursor', async () => {
+        const qualifier = { freetext: 'pregnancy' };
+        queryByFreetextInner.rejects(new InvalidArgumentError(
+          'The cursor must be a string or null for first page: ["abc"].'
+        ));
+
+        await expect(Report.v1.getUuidsPage(ctx)(qualifier, 'abc', 10))
+          .to.be.rejectedWith(InvalidArgumentError, 'The cursor must be a string or null for first page');
+      });
+
+      it('throws InvalidArgumentError for negative cursor', async () => {
+        const qualifier = { freetext: 'pregnancy' };
+        queryByFreetextInner.rejects(new InvalidArgumentError(
+          'The cursor must be a string or null for first page: ["-1"].'
+        ));
+
+        await expect(Report.v1.getUuidsPage(ctx)(qualifier, '-1', 10))
+          .to.be.rejectedWith(InvalidArgumentError, 'The cursor must be a string or null for first page');
       });
     });
 
@@ -411,6 +432,46 @@ describe('postgres report', () => {
 
         expect(getDocIdsByIdRangeInner.calledOnceWithExactly('form:', 'form:\ufff0')).to.be.true;
         expect(updateDocInner.notCalled).to.be.true;
+      });
+
+      it('minifies hydrated lineage and removes patient/place before storing', async () => {
+        const updateInput = {
+          ...originalReport,
+          fields: { hello: 'updated' },
+          contact: {
+            _id: 'contact-1',
+            name: 'Full Contact Name',
+            type: 'person',
+            parent: {
+              _id: 'clinic-1',
+              name: 'Full Clinic Name',
+              parent: { _id: 'district-1', name: 'Full District' }
+            }
+          },
+          patient: {
+            _id: 'patient-1',
+            name: 'Patient Bob',
+            parent: { _id: 'clinic-1', name: 'Clinic' }
+          },
+          place: {
+            _id: 'place-1',
+            name: 'Health Center',
+            parent: { _id: 'district-1' }
+          }
+        };
+
+        const result = await Report.v1.update(ctx)(updateInput);
+
+        expect(result._rev).to.equal('2-pgxyz');
+        const storedDoc = updateDocInner.firstCall.args[0];
+        // contact should be minified
+        expect(storedDoc.contact).to.deep.equal({
+          _id: 'contact-1',
+          parent: { _id: 'clinic-1', parent: { _id: 'district-1' } }
+        });
+        // patient and place should be removed from stored doc
+        expect(storedDoc).to.not.have.property('patient');
+        expect(storedDoc).to.not.have.property('place');
       });
     });
   });

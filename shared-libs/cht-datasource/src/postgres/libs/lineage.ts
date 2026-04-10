@@ -8,6 +8,7 @@ import {
   isIdentifiable,
   isNonEmptyArray,
   isNotNull,
+  isRecord,
   NonEmptyArray,
   NormalizedParent,
   Nullable
@@ -15,7 +16,36 @@ import {
 import { Doc, isDoc } from '../../libs/doc';
 import { getDocsByIds } from './doc';
 import logger from '@medic/logger';
+import { InvalidArgumentError } from '../../libs/error';
 import { PostgresDataContext } from './data-context';
+
+/**
+ * Recursively compares two parent lineage chains by `_id` at each level.
+ * Returns true if the chains are structurally identical (same `_id` at each depth).
+ * Replicates `isSameLineage` from local/libs/lineage.ts.
+ * @internal
+ */
+const isSameLineage = (a: unknown, b: unknown): boolean => {
+  if (!isRecord(a) || !isRecord(b)) {
+    return a === b;
+  }
+  if (a._id !== b._id) {
+    return false;
+  }
+  return isSameLineage(a.parent, b.parent);
+};
+
+/**
+ * Asserts that two documents share the same parent lineage chain.
+ * Throws InvalidArgumentError if any `_id` in the parent chain differs.
+ * Replicates `assertSameParentLineage` from local/libs/lineage.ts.
+ * @internal
+ */
+export const assertSameParentLineage = (a: DataObject, b: DataObject): void => {
+  if (!isSameLineage(a.parent, b.parent)) {
+    throw new InvalidArgumentError('Parent lineage does not match.');
+  }
+};
 
 /**
  * Returns the identified document along with the parent documents recorded for its lineage.
@@ -150,14 +180,102 @@ export const getContactLineage = (ctx: PostgresDataContext) => {
 };
 
 /**
+ * Extracts the patient identifier from a report document.
+ * Mirrors `@medic/lineage/src/utils.js#getPatientId`.
+ * @internal
+ */
+export const getPatientId = (doc: Doc): Nullable<string> => {
+  const fields = doc.fields as Record<string, unknown> | undefined;
+  const id = (fields && (fields.patient_id || fields.patient_uuid)) || doc.patient_id;
+  return (typeof id === 'string' && id.length > 0) ? id : null;
+};
+
+/**
+ * Extracts the place identifier from a report document.
+ * Mirrors `@medic/lineage/src/utils.js#getPlaceId`.
+ * @internal
+ */
+export const getPlaceId = (doc: Doc): Nullable<string> => {
+  const fields = doc.fields as Record<string, unknown> | undefined;
+  const id = (fields && fields.place_id) || doc.place_id;
+  return (typeof id === 'string' && id.length > 0) ? id : null;
+};
+
+/**
+ * Fetches and hydrates a subject contact (patient or place) with its full parent lineage.
+ * @internal
+ */
+const hydrateSubject = (ctx: PostgresDataContext) => async (
+  uuid: string
+): Promise<Nullable<Doc>> => {
+  const lineageDocs = await getLineageDocsById(ctx)(uuid);
+  if (lineageDocs.length === 0 || !lineageDocs[0]) {
+    return null;
+  }
+  if (lineageDocs.length === 1) {
+    return lineageDocs[0];
+  }
+  const hydrateContactLineage = getContactLineage(ctx);
+  const hydrated = await hydrateContactLineage(
+    lineageDocs as NonEmptyArray<Nullable<Doc>>
+  );
+  return hydrated as Doc;
+};
+
+/**
+ * For report documents, resolves patient_id/place_id shortcodes to contact UUIDs and
+ * attaches fully hydrated subject contacts as `patient` and `place` fields.
+ * Mirrors `@medic/lineage`'s `fetchSubjectLineage` + `mergeLineagesIntoDoc`.
+ *
+ * If a shortcode does not match any contact's `patient_id`, `place_id`, or `rc_code`,
+ * falls back to treating it as a UUID (matching CouchDB behavior).
+ * @internal
+ */
+export const hydrateReportSubjects = (ctx: PostgresDataContext) => async (doc: Doc): Promise<Doc> => {
+  if (doc.type !== 'data_record') {
+    return doc;
+  }
+
+  const patientId = getPatientId(doc);
+  const placeId = getPlaceId(doc);
+
+  if (!patientId && !placeId) {
+    return doc;
+  }
+
+  const resolve = resolveShortcode(ctx);
+  const hydrate = hydrateSubject(ctx);
+
+  // Resolve shortcodes to UUIDs in parallel. Fall back to shortcode-as-UUID if not found.
+  const [patientUuid, placeUuid] = await Promise.all([
+    patientId ? resolve(patientId).then(uuid => uuid || patientId) : null,
+    placeId ? resolve(placeId).then(uuid => uuid || placeId) : null,
+  ]);
+
+  const [patient, place] = await Promise.all([
+    patientUuid ? hydrate(patientUuid) : null,
+    placeUuid ? hydrate(placeUuid) : null,
+  ]);
+
+  const result: Record<string, unknown> = { ...doc };
+  if (patient) {
+    result.patient = patient;
+  }
+  if (place) {
+    result.place = place;
+  }
+
+  return result as Doc;
+};
+
+/**
  * Fetches a fully hydrated document from PostgreSQL by:
  * 1. Getting the document and its parent lineage via recursive CTE
  * 2. Fetching primary contacts for each place in the lineage
  * 3. Assembling the hydrated document structure
+ * 4. For reports: resolving patient_id/place_id subjects via shortcode lookup
  *
  * This replaces the PouchDB-based `@medic/lineage.fetchHydratedDoc()`.
- * Note: Subject resolution for reports (patient_id/place_id shortcodes) is not yet
- * implemented; that requires the `contacts_by_reference` view equivalent.
  * @internal
  */
 export const fetchHydratedDoc = (ctx: PostgresDataContext) => async (uuid: string): Promise<Nullable<Doc>> => {
@@ -167,16 +285,21 @@ export const fetchHydratedDoc = (ctx: PostgresDataContext) => async (uuid: strin
   }
 
   const doc = lineageDocs[0];
+  let hydrated: Doc;
+
   if (lineageDocs.length === 1) {
-    return doc;
+    hydrated = doc;
+  } else {
+    // Hydrate lineage: fetch primary contacts for all places
+    const hydrateContactLineage = getContactLineage(ctx);
+    const result = await hydrateContactLineage(
+      lineageDocs as NonEmptyArray<Nullable<Doc>>
+    );
+    hydrated = result as Doc;
   }
 
-  // Hydrate lineage: fetch primary contacts for all places
-  const hydrateContactLineage = getContactLineage(ctx);
-  const hydrated = await hydrateContactLineage(
-    lineageDocs as NonEmptyArray<Nullable<Doc>>
-  );
-  return hydrated as Doc;
+  // Resolve patient/place subjects for reports
+  return hydrateReportSubjects(ctx)(hydrated);
 };
 
 /**

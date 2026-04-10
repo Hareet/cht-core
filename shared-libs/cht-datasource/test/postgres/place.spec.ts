@@ -449,7 +449,7 @@ describe('postgres place', () => {
         expect(createDocInner.notCalled).to.be.true;
       });
 
-      it('sets contact to undefined when contact doc is not a valid contact', async () => {
+      it('throws an error when contact is provided but is not a valid contact', async () => {
         const customType = { id: 'health_center', person: false, parents: ['district_hospital'] };
         const input: Input.v1.PlaceInput = {
           name: 'HC',
@@ -461,10 +461,47 @@ describe('postgres place', () => {
         getDocsByIdsInner.resolves([parentDoc, { _id: 'bad-contact', _rev: '1', type: 'not-contact' }]);
         isContact.returns(false);
 
-        await Place.v1.create(ctx)(input);
+        await expect(Place.v1.create(ctx)(input))
+          .to.be.rejectedWith(InvalidArgumentError, 'Primary contact [bad-contact] not found.');
 
+        expect(createDocInner.notCalled).to.be.true;
+      });
+
+      it('throws an error when contact is provided but not found', async () => {
+        const customType = { id: 'health_center', person: false, parents: ['district_hospital'] };
+        const input: Input.v1.PlaceInput = {
+          name: 'HC',
+          type: 'health_center',
+          parent: 'parent-1',
+          contact: 'nonexistent-contact',
+        };
+        getTypeById.returns(customType);
+        getDocsByIdsInner.resolves([parentDoc, null]);
+        isContact.returns(false);
+
+        await expect(Place.v1.create(ctx)(input))
+          .to.be.rejectedWith(InvalidArgumentError, 'Primary contact [nonexistent-contact] not found.');
+
+        expect(createDocInner.notCalled).to.be.true;
+      });
+
+      it('creates a place without contact when contact is not provided', async () => {
+        const customType = { id: 'health_center', person: false, parents: ['district_hospital'] };
+        const input: Input.v1.PlaceInput = {
+          name: 'HC Without Contact',
+          type: 'health_center',
+          parent: 'parent-1',
+        };
+        getTypeById.returns(customType);
+        getDocsByIdsInner.resolves([parentDoc, null]);
+
+        const result = await Place.v1.create(ctx)(input);
+
+        expect(result).to.equal(createdDoc);
+        expect(createDocInner.calledOnce).to.be.true;
         const createdArg = createDocInner.firstCall.args[0];
         expect(createdArg.contact).to.be.undefined;
+        expect(isContact.notCalled).to.be.true;
       });
     });
 
@@ -557,6 +594,92 @@ describe('postgres place', () => {
           .to.be.rejectedWith(InvalidArgumentError, 'The [name] field must have a [string] value.');
 
         expect(updateDocInner.notCalled).to.be.true;
+      });
+
+      it('throws an error when parent lineage _id changes', async () => {
+        const updatedPlace = {
+          ...originalDoc,
+          parent: { _id: 'different-parent' }
+        };
+        const originalWithParent = {
+          ...originalDoc,
+          parent: { _id: 'original-parent' }
+        };
+        getDocsByIdsInner.resolves([originalWithParent]);
+
+        await expect(Place.v1.update(ctx)(updatedPlace))
+          .to.be.rejectedWith(InvalidArgumentError, 'Parent lineage does not match.');
+
+        expect(updateDocInner.notCalled).to.be.true;
+      });
+
+      it('throws an error when parent is removed', async () => {
+        const updatedPlace = {
+          ...originalDoc,
+          parent: undefined
+        };
+        const originalWithParent = {
+          ...originalDoc,
+          parent: { _id: 'original-parent' }
+        };
+        getDocsByIdsInner.resolves([originalWithParent]);
+
+        await expect(Place.v1.update(ctx)(updatedPlace))
+          .to.be.rejectedWith(InvalidArgumentError, 'Parent lineage does not match.');
+
+        expect(updateDocInner.notCalled).to.be.true;
+      });
+
+      it('throws an error when parent is added to a doc that had none', async () => {
+        const updatedPlace = {
+          ...originalDoc,
+          parent: { _id: 'new-parent' }
+        };
+        getDocsByIdsInner.resolves([originalDoc]);
+
+        await expect(Place.v1.update(ctx)(updatedPlace))
+          .to.be.rejectedWith(InvalidArgumentError, 'Parent lineage does not match.');
+
+        expect(updateDocInner.notCalled).to.be.true;
+      });
+
+      it('minifies hydrated parent and contact lineage before storing', async () => {
+        const originalWithParent = {
+          ...originalDoc,
+          parent: { _id: 'district-1' },
+        };
+        const updatedPlace = {
+          ...originalDoc,
+          name: 'Updated HC',
+          parent: {
+            _id: 'district-1',
+            name: 'District Full',
+            type: 'district_hospital',
+            contact: { _id: 'admin-1', name: 'Admin' }
+          },
+          contact: {
+            _id: 'nurse-1',
+            name: 'Nurse Jane',
+            type: 'person',
+            parent: {
+              _id: 'place-1',
+              name: 'HC Full',
+              parent: { _id: 'district-1', name: 'District Full' }
+            }
+          }
+        };
+        getDocsByIdsInner.resolves([originalWithParent]);
+        updateDocInner.resolves({ ...updatedPlace, _rev: '2-pg456' });
+
+        const result = await Place.v1.update(ctx)(updatedPlace);
+
+        expect(result._rev).to.equal('2-pg456');
+        const storedDoc = updateDocInner.firstCall.args[0];
+        expect(storedDoc.parent).to.deep.equal({ _id: 'district-1' });
+        expect(storedDoc.contact).to.deep.equal({
+          _id: 'nurse-1',
+          parent: { _id: 'place-1', parent: { _id: 'district-1' } }
+        });
       });
     });
   });

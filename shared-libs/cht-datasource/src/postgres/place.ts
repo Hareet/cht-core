@@ -3,12 +3,12 @@ import contactTypeUtils from '@medic/contact-types-utils';
 import { assertHasRequiredField, Nullable, Page } from '../libs/core';
 import { ContactTypeQualifier, UuidQualifier } from '../qualifier';
 import * as Place from '../place';
-import { createDoc, fetchAndFilter, getDocById, getDocsByIds, queryDocsByType, updateDoc } from './libs/doc';
+import { createDoc, fetchAndFilter, getDocById, getDocsByIds, minifyDoc, queryDocsByType, updateDoc } from './libs/doc';
 import { PostgresDataContext } from './libs/data-context';
 import { SettingsService } from '../local/libs/data-context';
 import logger from '@medic/logger';
 import { InvalidArgumentError, ResourceNotFoundError } from '../libs/error';
-import { fetchHydratedDoc } from './libs/lineage';
+import { assertSameParentLineage, fetchHydratedDoc } from './libs/lineage';
 import * as Input from '../input';
 import * as LocalContact from './contact';
 
@@ -122,11 +122,16 @@ export namespace v1 {
         throw new InvalidArgumentError(`Place type [${input.type}] requires a parent contact.`);
       }
 
+      // Validate primary contact if provided
+      if (input.contact && !LocalContact.v1.isContact(ctx.settings, contactDoc)) {
+        throw new InvalidArgumentError(`Primary contact [${input.contact}] not found.`);
+      }
+
       const placeDoc = {
         ...input,
         ...typeProperties,
         parent: parentDoc ? { _id: parentDoc._id } : undefined,
-        contact: contactDoc && LocalContact.v1.isContact(ctx.settings, contactDoc) ? { _id: contactDoc._id } : undefined,
+        contact: contactDoc ? { _id: contactDoc._id } : undefined,
         reported_date: getReportedDateTimestamp(input.reported_date),
       };
       return createPgDoc(placeDoc) as Promise<Place.v1.Place>;
@@ -159,8 +164,10 @@ export namespace v1 {
       if (originalPlace.name !== updatedPlace.name) {
         assertHasRequiredField(updatedPlace, { name: 'name', type: 'string' }, InvalidArgumentError);
       }
+      assertSameParentLineage(originalPlace, updatedPlace);
 
-      const { _rev } = await updatePgDoc(updatedPlace as unknown as Doc);
+      const minified = minifyDoc(updatedPlace as unknown as Doc);
+      const { _rev } = await updatePgDoc(minified);
       return { ...updatedPlace, _rev };
     };
   };

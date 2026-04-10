@@ -592,6 +592,88 @@ describe('postgres person', () => {
           expect(updateDocInner.calledOnceWithExactly(updateDocInput)).to.be.true;
         });
       });
+
+      it('throws error when parent lineage _id changes', async () => {
+        const updateDocInput = {
+          ...originalDoc,
+          parent: {
+            _id: 'different-parent',
+            parent: {
+              _id: 'parent-2'
+            }
+          }
+        };
+        getPersonInner.resolves(originalDoc);
+
+        await expect(Person.v1.update(pgContext)(updateDocInput))
+          .to.be.rejectedWith(InvalidArgumentError, 'Parent lineage does not match.');
+
+        expect(getPersonInner.calledOnceWithExactly(Qualifier.byUuid(originalDoc._id))).to.be.true;
+        expect(updateDocInner.notCalled).to.be.true;
+      });
+
+      it('throws error when parent is removed', async () => {
+        const updateDocInput = {
+          ...originalDoc,
+          parent: undefined
+        };
+        getPersonInner.resolves(originalDoc);
+
+        await expect(Person.v1.update(pgContext)(updateDocInput))
+          .to.be.rejectedWith(InvalidArgumentError, 'Parent lineage does not match.');
+
+        expect(getPersonInner.calledOnceWithExactly(Qualifier.byUuid(originalDoc._id))).to.be.true;
+        expect(updateDocInner.notCalled).to.be.true;
+      });
+
+      it('throws error when grandparent lineage _id changes', async () => {
+        const updateDocInput = {
+          ...originalDoc,
+          parent: {
+            _id: 'parent-1',
+            parent: {
+              _id: 'different-grandparent'
+            }
+          }
+        };
+        getPersonInner.resolves(originalDoc);
+
+        await expect(Person.v1.update(pgContext)(updateDocInput))
+          .to.be.rejectedWith(InvalidArgumentError, 'Parent lineage does not match.');
+
+        expect(getPersonInner.calledOnceWithExactly(Qualifier.byUuid(originalDoc._id))).to.be.true;
+        expect(updateDocInner.notCalled).to.be.true;
+      });
+
+      it('minifies hydrated parent lineage before storing', async () => {
+        const updateDocInput = {
+          ...originalDoc,
+          name: 'updated-name',
+          parent: {
+            _id: 'parent-1',
+            name: 'Parent Full Name',
+            type: 'clinic',
+            parent: {
+              _id: 'parent-2',
+              name: 'Grandparent Full Name',
+              type: 'district_hospital'
+            }
+          }
+        };
+        getPersonInner.resolves(originalDoc);
+        updateDocInner.resolves({ _rev: '2' });
+
+        const result = await Person.v1.update(pgContext)(updateDocInput);
+
+        expect(result._rev).to.equal('2');
+        expect(result.name).to.equal('updated-name');
+        // Verify updateDoc received minified lineage, not the hydrated version
+        const storedDoc = updateDocInner.firstCall.args[0];
+        expect(storedDoc.parent).to.deep.equal({
+          _id: 'parent-1',
+          parent: { _id: 'parent-2' }
+        });
+      });
     });
   });
 });

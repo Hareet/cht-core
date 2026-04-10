@@ -27,3 +27,19 @@ export class ResourceNotFoundError extends Error {
     this.name = 'ResourceNotFoundError';
   }
 }
+
+/**
+ * Represents an error that occurs when an update fails because the document's revision
+ * does not match the current revision in the datastore. This is analogous to CouchDB's
+ * 409 Conflict status and indicates a concurrent modification.
+ */
+export class RevisionConflictError extends Error {
+  /**
+   * Constructor
+   * @param message a descriptive error message why the error was raised
+   */
+  constructor(message: string) {
+    super(message);
+    this.name = 'RevisionConflictError';
+  }
+}
