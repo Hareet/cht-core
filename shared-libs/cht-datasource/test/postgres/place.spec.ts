@@ -449,7 +449,7 @@ describe('postgres place', () => {
         expect(createDocInner.notCalled).to.be.true;
       });
 
-      it('sets contact to undefined when contact doc is not a valid contact', async () => {
+      it('throws an error when contact is provided but is not a valid contact', async () => {
         const customType = { id: 'health_center', person: false, parents: ['district_hospital'] };
         const input: Input.v1.PlaceInput = {
           name: 'HC',
@@ -461,10 +461,47 @@ describe('postgres place', () => {
         getDocsByIdsInner.resolves([parentDoc, { _id: 'bad-contact', _rev: '1', type: 'not-contact' }]);
         isContact.returns(false);
 
-        await Place.v1.create(ctx)(input);
+        await expect(Place.v1.create(ctx)(input))
+          .to.be.rejectedWith(InvalidArgumentError, 'Primary contact [bad-contact] not found.');
 
+        expect(createDocInner.notCalled).to.be.true;
+      });
+
+      it('throws an error when contact is provided but not found', async () => {
+        const customType = { id: 'health_center', person: false, parents: ['district_hospital'] };
+        const input: Input.v1.PlaceInput = {
+          name: 'HC',
+          type: 'health_center',
+          parent: 'parent-1',
+          contact: 'nonexistent-contact',
+        };
+        getTypeById.returns(customType);
+        getDocsByIdsInner.resolves([parentDoc, null]);
+        isContact.returns(false);
+
+        await expect(Place.v1.create(ctx)(input))
+          .to.be.rejectedWith(InvalidArgumentError, 'Primary contact [nonexistent-contact] not found.');
+
+        expect(createDocInner.notCalled).to.be.true;
+      });
+
+      it('creates a place without contact when contact is not provided', async () => {
+        const customType = { id: 'health_center', person: false, parents: ['district_hospital'] };
+        const input: Input.v1.PlaceInput = {
+          name: 'HC Without Contact',
+          type: 'health_center',
+          parent: 'parent-1',
+        };
+        getTypeById.returns(customType);
+        getDocsByIdsInner.resolves([parentDoc, null]);
+
+        const result = await Place.v1.create(ctx)(input);
+
+        expect(result).to.equal(createdDoc);
+        expect(createDocInner.calledOnce).to.be.true;
         const createdArg = createDocInner.firstCall.args[0];
         expect(createdArg.contact).to.be.undefined;
+        expect(isContact.notCalled).to.be.true;
       });
     });
 

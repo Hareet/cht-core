@@ -122,11 +122,16 @@ export namespace v1 {
         throw new InvalidArgumentError(`Place type [${input.type}] requires a parent contact.`);
       }
 
+      // Validate primary contact if provided
+      if (input.contact && !LocalContact.v1.isContact(ctx.settings, contactDoc)) {
+        throw new InvalidArgumentError(`Primary contact [${input.contact}] not found.`);
+      }
+
       const placeDoc = {
         ...input,
         ...typeProperties,
         parent: parentDoc ? { _id: parentDoc._id } : undefined,
-        contact: contactDoc && LocalContact.v1.isContact(ctx.settings, contactDoc) ? { _id: contactDoc._id } : undefined,
+        contact: contactDoc ? { _id: contactDoc._id } : undefined,
         reported_date: getReportedDateTimestamp(input.reported_date),
       };
       return createPgDoc(placeDoc) as Promise<Place.v1.Place>;
