@@ -2,6 +2,41 @@
 
 const db = require('./db');
 
+// Fixed advisory lock ID for purge preprocessing. Prevents concurrent runs
+// from writing conflicting purge_status entries when multiple processes or
+// overlapping interval ticks trigger engine.run() simultaneously.
+const PURGE_ADVISORY_LOCK_ID = 73952; // arbitrary but stable
+
+// Acquire an advisory lock using a dedicated client connection.
+// Returns { acquired: true, client } on success, { acquired: false } if another run holds the lock.
+// The caller MUST call releaseRunLock() when done to release the client back to the pool.
+const tryAcquireRunLock = async () => {
+  const client = await db.getClient();
+  try {
+    const result = await client.query('SELECT pg_try_advisory_lock($1) AS acquired', [PURGE_ADVISORY_LOCK_ID]);
+    if (result.rows[0].acquired) {
+      return { acquired: true, client };
+    }
+    client.release();
+    return { acquired: false };
+  } catch (err) {
+    client.release();
+    throw err;
+  }
+};
+
+// Release the advisory lock and return the client to the pool.
+// Errors during unlock are logged but not thrown — the run already completed.
+const releaseRunLock = async (client) => {
+  try {
+    await client.query('SELECT pg_advisory_unlock($1)', [PURGE_ADVISORY_LOCK_ID]);
+  } catch (err) {
+    console.error('Failed to release purge advisory lock:', err.message);
+  } finally {
+    client.release();
+  }
+};
+
 // Upsert purge decisions for a batch of (doc_id, role_hash) pairs.
 // toPurge is: { [roleHash]: { [docId]: boolean } }
 const writePurgeResults = async (toPurge) => {
@@ -149,4 +184,6 @@ module.exports = {
   completeRunLog,
   failRunLog,
   cleanupDeletedDocs,
+  tryAcquireRunLock,
+  releaseRunLock,
 };

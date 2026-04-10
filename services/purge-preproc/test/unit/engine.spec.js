@@ -151,11 +151,66 @@ describe('Purge Engine', () => {
 
   describe('run', () => {
     let queryStub;
+    let mockLockClient;
 
     beforeEach(() => {
       queryStub = sinon.stub(db, 'query');
       // Default: return empty rows for any unmatched query (task/target auto-purge)
       queryStub.resolves({ rows: [] });
+
+      // Default: lock always succeeds
+      mockLockClient = { query: sinon.stub().resolves(), release: sinon.stub() };
+      sinon.stub(purgeStatus, 'tryAcquireRunLock').resolves({ acquired: true, client: mockLockClient });
+      sinon.stub(purgeStatus, 'releaseRunLock').resolves();
+    });
+
+    it('should skip when another run is already in progress', async () => {
+      purgeStatus.tryAcquireRunLock.resolves({ acquired: false });
+      sinon.stub(console, 'log');
+
+      await engine.run({ incremental: false });
+
+      expect(console.log.calledWith('Another purge run is already in progress. Skipping.')).to.be.true;
+      expect(purgeStatus.releaseRunLock.callCount).to.equal(0);
+    });
+
+    it('should release lock after successful run', async () => {
+      const purgeFn = function() { return []; };
+      queryStub.onFirstCall().resolves({ rows: [{ fn: purgeFn.toString() }] });
+
+      sinon.stub(rolesService, 'getRoles').resolves({ hash_chw: ['chw'] });
+      sinon.stub(rolesService, 'saveRoles').resolves();
+      sinon.stub(purgeStatus, 'startRunLog').resolves(1);
+      sinon.stub(purgeStatus, 'completeRunLog').resolves();
+      sinon.stub(purgeStatus, 'writePurgeResults').resolves();
+      sinon.stub(purgeStatus, 'cleanupDeletedDocs').resolves(0);
+      sinon.stub(contacts, 'getContactsBatch').resolves([]);
+      sinon.stub(records, 'getUnallocatedRecords').resolves([]);
+      sinon.stub(console, 'log');
+
+      await engine.run({ incremental: false });
+
+      expect(purgeStatus.releaseRunLock.calledOnce).to.be.true;
+      expect(purgeStatus.releaseRunLock.calledWith(mockLockClient)).to.be.true;
+    });
+
+    it('should release lock even when run throws an error', async () => {
+      queryStub.onFirstCall().resolves({ rows: [{ fn: 'function() { return []; }' }] });
+
+      sinon.stub(rolesService, 'getRoles').resolves({ hash_chw: ['chw'] });
+      sinon.stub(rolesService, 'saveRoles').resolves();
+      sinon.stub(purgeStatus, 'startRunLog').rejects(new Error('db down'));
+      sinon.stub(purgeStatus, 'failRunLog').resolves();
+
+      try {
+        await engine.run({ incremental: false });
+        expect.fail('should have thrown');
+      } catch (err) {
+        expect(err.message).to.equal('db down');
+      }
+
+      expect(purgeStatus.releaseRunLock.calledOnce).to.be.true;
+      expect(purgeStatus.releaseRunLock.calledWith(mockLockClient)).to.be.true;
     });
 
     it('should skip when no purge function configured', async () => {
@@ -435,6 +490,11 @@ describe('Purge Engine', () => {
     beforeEach(() => {
       queryStub = sinon.stub(db, 'query');
       queryStub.resolves({ rows: [] });
+
+      // Lock always succeeds in these tests
+      const mockClient = { query: sinon.stub().resolves(), release: sinon.stub() };
+      sinon.stub(purgeStatus, 'tryAcquireRunLock').resolves({ acquired: true, client: mockClient });
+      sinon.stub(purgeStatus, 'releaseRunLock').resolves();
     });
 
     it('should force full run when purge function changes between runs', async () => {

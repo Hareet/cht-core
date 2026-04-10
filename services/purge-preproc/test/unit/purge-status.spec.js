@@ -158,6 +158,83 @@ describe('Purge Status', () => {
     });
   });
 
+  describe('tryAcquireRunLock', () => {
+    it('should return acquired true and client when lock succeeds', async () => {
+      const mockClient = {
+        query: sinon.stub().resolves({ rows: [{ acquired: true }] }),
+        release: sinon.stub(),
+      };
+      sinon.stub(db, 'getClient').resolves(mockClient);
+
+      const result = await purgeStatus.tryAcquireRunLock();
+
+      expect(result.acquired).to.be.true;
+      expect(result.client).to.equal(mockClient);
+      expect(mockClient.query.calledOnce).to.be.true;
+      expect(mockClient.query.args[0][0]).to.include('pg_try_advisory_lock');
+      expect(mockClient.release.callCount).to.equal(0); // not released yet
+    });
+
+    it('should return acquired false and release client when lock fails', async () => {
+      const mockClient = {
+        query: sinon.stub().resolves({ rows: [{ acquired: false }] }),
+        release: sinon.stub(),
+      };
+      sinon.stub(db, 'getClient').resolves(mockClient);
+
+      const result = await purgeStatus.tryAcquireRunLock();
+
+      expect(result.acquired).to.be.false;
+      expect(result.client).to.be.undefined;
+      expect(mockClient.release.calledOnce).to.be.true;
+    });
+
+    it('should release client and rethrow on query error', async () => {
+      const mockClient = {
+        query: sinon.stub().rejects(new Error('connection lost')),
+        release: sinon.stub(),
+      };
+      sinon.stub(db, 'getClient').resolves(mockClient);
+
+      try {
+        await purgeStatus.tryAcquireRunLock();
+        expect.fail('should have thrown');
+      } catch (err) {
+        expect(err.message).to.equal('connection lost');
+        expect(mockClient.release.calledOnce).to.be.true;
+      }
+    });
+  });
+
+  describe('releaseRunLock', () => {
+    it('should unlock and release the client', async () => {
+      const mockClient = {
+        query: sinon.stub().resolves(),
+        release: sinon.stub(),
+      };
+
+      await purgeStatus.releaseRunLock(mockClient);
+
+      expect(mockClient.query.calledOnce).to.be.true;
+      expect(mockClient.query.args[0][0]).to.include('pg_advisory_unlock');
+      expect(mockClient.release.calledOnce).to.be.true;
+    });
+
+    it('should release client even if unlock query fails', async () => {
+      const mockClient = {
+        query: sinon.stub().rejects(new Error('unlock failed')),
+        release: sinon.stub(),
+      };
+      sinon.stub(console, 'error');
+
+      await purgeStatus.releaseRunLock(mockClient);
+
+      expect(mockClient.release.calledOnce).to.be.true;
+      expect(console.error.calledOnce).to.be.true;
+      expect(console.error.args[0][0]).to.include('Failed to release');
+    });
+  });
+
   describe('failRunLog', () => {
     it('should mark run as failed', async () => {
       const queryStub = sinon.stub(db, 'query').resolves();

@@ -219,6 +219,22 @@ const purgeExpiredTargets = async (rolesByHash, stats) => {
 // Full purge evaluation run.
 const run = async (options = {}) => {
   const db = require('./db');
+
+  // Acquire advisory lock to prevent concurrent runs from corrupting purge_status.
+  const lock = await purgeStatus.tryAcquireRunLock();
+  if (!lock.acquired) {
+    console.log('Another purge run is already in progress. Skipping.');
+    return;
+  }
+
+  try {
+    await _runWithLock(options, db);
+  } finally {
+    await purgeStatus.releaseRunLock(lock.client);
+  }
+};
+
+const _runWithLock = async (options, db) => {
   let incremental = options.incremental !== false;
 
   const purgeFn = await getPurgeFn(db);
