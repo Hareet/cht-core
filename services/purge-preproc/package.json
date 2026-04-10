@@ -1,0 +1,29 @@
+{
+  "name": "@medic/purge-preproc",
+  "version": "1.0.0",
+  "description": "Purge preprocessing service: evaluates purge.js against PostgreSQL data and writes purge_status",
+  "main": "src/index.js",
+  "private": true,
+  "engines": {
+    "node": ">=22.15.0",
+    "npm": ">=10.9.0"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "test": "nyc mocha './test/**/*.spec.js'",
+    "test:unit": "nyc mocha './test/unit/**/*.spec.js'",
+    "test:integration": "mocha './test/integration/**/*.spec.js' --timeout 30000"
+  },
+  "dependencies": {
+    "@medic/purging-utils": "file:../../shared-libs/purging-utils",
+    "@medic/registration-utils": "file:../../shared-libs/registration-utils",
+    "pg": "^8.13.0"
+  },
+  "devDependencies": {
+    "chai": "^4.4.0",
+    "mocha": "^10.4.0",
+    "nyc": "^17.0.0",
+    "sinon": "^17.0.0"
+  },
+  "license": "Apache-2.0"
+}
