@@ -204,13 +204,38 @@ describe('postgres doc lib', () => {
       expect(result.name).to.equal('updated');
       expect(poolQuery.calledOnce).to.be.true;
       expect(poolQuery.firstCall.args[0]).to.include('UPDATE');
+      expect(poolQuery.firstCall.args[0]).to.include("doc->>'_rev' = $3");
+      expect(poolQuery.firstCall.args[1][1]).to.equal('abc');
+      expect(poolQuery.firstCall.args[1][2]).to.equal('1-pg123');
     });
 
-    it('throws on update failure', async () => {
+    it('throws on update failure when document not found', async () => {
       poolQuery.resolves({ rows: [], rowCount: 0 });
 
       await expect(updateDoc(ctx)({ _id: 'abc', _rev: '1-x' }))
         .to.be.rejectedWith('Error updating document.');
+    });
+
+    it('throws when _rev does not match (concurrent modification)', async () => {
+      // Simulates: another process updated the document between our read and write,
+      // so the _rev in the DB no longer matches the one we're providing.
+      poolQuery.resolves({ rows: [], rowCount: 0 });
+      const doc = { _id: 'abc', _rev: '1-pg123', type: 'person', name: 'stale-update' };
+
+      await expect(updateDoc(ctx)(doc)).to.be.rejectedWith('Error updating document.');
+
+      expect(poolQuery.calledOnce).to.be.true;
+      // Verify _rev is passed as the third parameter for the WHERE clause check
+      expect(poolQuery.firstCall.args[1][2]).to.equal('1-pg123');
+    });
+
+    it('increments the rev number correctly across multiple updates', async () => {
+      poolQuery.resolves({ rows: [], rowCount: 1 });
+
+      const result1 = await updateDoc(ctx)({ _id: 'abc', _rev: '3-pg999', type: 'person' });
+
+      expect(result1._rev).to.match(/^4-pg/);
+      expect(poolQuery.firstCall.args[1][2]).to.equal('3-pg999');
     });
   });
 

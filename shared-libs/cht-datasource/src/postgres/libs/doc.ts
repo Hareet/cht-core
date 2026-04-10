@@ -150,8 +150,8 @@ export const updateDoc = (ctx: PostgresDataContext) => async (data: Doc): Promis
   const { rowCount } = await ctx.pool.query(
     `UPDATE ${ctx.qualifiedTable}
      SET doc = $1, saved_timestamp = NOW()
-     WHERE _id = $2 AND (_deleted IS NULL OR _deleted = false)`,
-    [JSON.stringify(doc), data._id]
+     WHERE _id = $2 AND doc->>'_rev' = $3 AND (_deleted IS NULL OR _deleted = false)`,
+    [JSON.stringify(doc), data._id, data._rev]
   );
   if (rowCount === 0) {
     throw new Error('Error updating document.');
