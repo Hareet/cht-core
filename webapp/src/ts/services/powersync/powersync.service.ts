@@ -36,7 +36,22 @@ export interface PowerSyncStatus {
   downloadError: Error | undefined;
 }
 
-const POWERSYNC_SERVICE_URL = '/powersync';
+/** Configuration for PowerSync initialization */
+export interface PowerSyncConfig {
+  /** PowerSync service URL. If not set, derived from browser location. */
+  powerSyncUrl?: string;
+  /** Enable dev mode (client-side JWT generation) */
+  devMode?: boolean;
+  /** Dev user config. Required if devMode is true. */
+  devUser?: {
+    userId: string;
+    contactId?: string;
+    roles?: string[];
+    reportDepth?: number;
+  };
+}
+
+const DEFAULT_POWERSYNC_SERVICE_URL = '/powersync';
 const DB_FILENAME = 'cht-powersync.db';
 
 @Injectable({
@@ -73,8 +88,11 @@ export class PowerSyncService implements OnDestroy {
    * Safe to call multiple times - will no-op if already initialized.
    *
    * Call this during app bootstrap after authentication is confirmed.
+   *
+   * @param config - Optional configuration. In dev mode, provide devUser
+   *   to enable client-side JWT generation.
    */
-  async initialize(): Promise<void> {
+  async initialize(config?: PowerSyncConfig): Promise<void> {
     if (this.initialized || this.sessionService.isOnlineOnly()) {
       return;
     }
@@ -90,18 +108,14 @@ export class PowerSyncService implements OnDestroy {
       });
     });
 
-    // Derive the PowerSync service URL.
-    // In the containerized dev environment, PowerSync is at powersync:8080.
-    // In production, it would be proxied through the CHT API or a dedicated endpoint.
-    const location = this.locationService;
-    const port = (globalThis as any).document?.location?.port;
-    const protocol = (globalThis as any).document?.location?.protocol || 'http:';
-    const hostname = (globalThis as any).document?.location?.hostname || 'localhost';
-    const powerSyncUrl = `${protocol}//${hostname}${port ? ':' + port : ''}${POWERSYNC_SERVICE_URL}`;
+    // Derive the PowerSync service URL
+    const powerSyncUrl = config?.powerSyncUrl || this.derivePowerSyncUrl();
 
     this.connector = new ChtPowerSyncConnector({
-      apiBaseUrl: location.url,
+      apiBaseUrl: this.locationService.url,
       powerSyncUrl,
+      devMode: config?.devMode,
+      devUser: config?.devUser,
     });
 
     // Register status listener before connecting
@@ -405,6 +419,20 @@ export class PowerSyncService implements OnDestroy {
    */
   isReady(): boolean {
     return this.initialized && (this.statusSubject.value.hasSynced || false);
+  }
+
+  /**
+   * Derive the PowerSync service URL from the current browser location.
+   * In the dev container, PowerSync is proxied at /powersync.
+   * In production, this would be configured via environment.
+   */
+  private derivePowerSyncUrl(): string {
+    const doc = (globalThis as any).document;
+    if (!doc?.location) {
+      return `http://localhost:8080`;
+    }
+    const { protocol, hostname, port } = doc.location;
+    return `${protocol}//${hostname}${port ? ':' + port : ''}${DEFAULT_POWERSYNC_SERVICE_URL}`;
   }
 
   ngOnDestroy(): void {

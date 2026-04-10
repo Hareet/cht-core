@@ -32,6 +32,15 @@ export interface ChtConnectorConfig {
   apiBaseUrl: string;
   /** PowerSync service endpoint URL */
   powerSyncUrl: string;
+  /** Dev mode: generate tokens client-side instead of fetching from API */
+  devMode?: boolean;
+  /** Dev mode user config for token generation */
+  devUser?: {
+    userId: string;
+    contactId?: string;
+    roles?: string[];
+    reportDepth?: number;
+  };
 }
 
 /**
@@ -52,8 +61,28 @@ export class ChtPowerSyncConnector implements PowerSyncBackendConnector {
    * Fetch JWT credentials for PowerSync service authentication.
    * Called automatically every few minutes when the sync stream reconnects.
    * Must always return fresh credentials.
+   *
+   * In dev mode: generates tokens client-side using Web Crypto API.
+   * In production: fetches tokens from CHT API /api/v1/powersync-token endpoint.
    */
   async fetchCredentials(): Promise<PowerSyncCredentials> {
+    if (this.config.devMode && this.config.devUser) {
+      // Dev mode: generate token client-side
+      const { generateDevToken } = await import('./dev-token-provider');
+      const { token, expiresAt } = await generateDevToken({
+        userId: this.config.devUser.userId,
+        contactId: this.config.devUser.contactId,
+        roles: this.config.devUser.roles,
+        reportDepth: this.config.devUser.reportDepth,
+      });
+      return {
+        endpoint: this.config.powerSyncUrl,
+        token,
+        expiresAt,
+      };
+    }
+
+    // Production mode: fetch from CHT API
     const response = await fetch(`${this.config.apiBaseUrl}/api/v1/powersync-token`, {
       credentials: 'same-origin',
       headers: { 'Accept': 'application/json' },
