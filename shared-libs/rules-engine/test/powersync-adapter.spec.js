@@ -465,6 +465,48 @@ describe('powersync-adapter', () => {
       expect(result.reportDocs).to.have.length(2);
       expect(result.taskDocs).to.have.length(2);
     });
+
+    it('excludes reports without any subject identifiers (parity with CouchDB reports_by_subject view)', async () => {
+      // CouchDB's reports_by_subject view only emits rows for reports that have at least one
+      // subject identifier. Reports with no patient_id, place_id, patient_uuid, place_uuid,
+      // or case_id produce zero emissions and are excluded.
+      const reportWithSubject = {
+        _id: 'reportWithSubject',
+        type: 'data_record',
+        form: 'pregnancy',
+        patient_id: 'patient_id',
+        reported_date: 100,
+      };
+      const reportWithoutSubject = {
+        _id: 'reportNoSubject',
+        type: 'data_record',
+        form: 'facility_report',
+        // No patient_id, place_id, subject_id, or case_id
+        reported_date: 200,
+      };
+      seedReports(db, [reportWithSubject, reportWithoutSubject]);
+
+      const result = await powersyncProvider(db).allTaskData(mockUserSettingsDoc);
+      const ids = result.reportDocs.map(d => d._id);
+      expect(ids).to.include('reportWithSubject');
+      expect(ids).to.not.include('reportNoSubject');
+    });
+
+    it('includes reports matched only by case_id (parity with CouchDB view)', async () => {
+      // The CouchDB view also indexes case_id. A report with only case_id should be included.
+      const reportWithCaseIdOnly = {
+        _id: 'reportCaseOnly',
+        type: 'data_record',
+        form: 'case_follow_up',
+        fields: { case_id: 'case-123' },
+        reported_date: 300,
+      };
+      seedReports(db, [reportWithCaseIdOnly]);
+
+      const result = await powersyncProvider(db).allTaskData(mockUserSettingsDoc);
+      const ids = result.reportDocs.map(d => d._id);
+      expect(ids).to.include('reportCaseOnly');
+    });
   });
 
   describe('contactsBySubjectId', () => {

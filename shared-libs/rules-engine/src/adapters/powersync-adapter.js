@@ -103,8 +103,12 @@ const powersyncProvider = (db) => {
         // contacts_by_type: all contacts (person, clinic, health_center, district_hospital, or contact_type)
         db.getAll(`SELECT doc FROM contacts WHERE type = 'contact' OR type IN ('district_hospital', 'health_center', 'clinic', 'person')`)
           .then(parseDocs),
-        // reports_by_subject: all reports (data_records with a form)
-        db.getAll(`SELECT doc FROM reports WHERE type = 'data_record' AND form IS NOT NULL`)
+        // reports_by_subject: all reports (data_records with a form) that have at least one subject identifier.
+        // The CouchDB view only emits rows for reports with subject fields (patient_id, place_id,
+        // patient_uuid, place_uuid, case_id). Reports with none of these produce zero view emissions
+        // and are excluded. We mirror this by requiring at least one denormalized column to be non-NULL.
+        db.getAll(`SELECT doc FROM reports WHERE type = 'data_record' AND form IS NOT NULL
+                   AND (patient_id IS NOT NULL OR place_id IS NOT NULL OR subject_id IS NOT NULL OR case_id IS NOT NULL)`)
           .then(parseDocs),
         self.allTasks('requester'),
       ]);

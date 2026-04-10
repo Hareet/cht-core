@@ -487,6 +487,50 @@ describe('PowerSync adapter integration tests', () => {
     const totalTasks = Object.values(breakdown).reduce((sum, count) => sum + count, 0);
     expect(totalTasks).to.be.greaterThan(0);
   });
+
+  it('should not produce spurious emissions from reports without subject identifiers', async () => {
+    // Parity with PouchDB: the CouchDB reports_by_subject view only emits for reports with
+    // subject fields. Reports without any subject identifiers (patient_id, place_id, etc.) are
+    // invisible to the rules engine. If they leaked through, they'd create phantom headless
+    // contacts and potentially incorrect tasks/targets.
+    seedContact(mockDb, patientContact);
+    seedReport(mockDb, pregnancyRegistrationReport);
+
+    // Seed a report with no subject identifiers — this should be excluded from allTaskData
+    mockDb._tables.reports.push({
+      id: 'orphan-report',
+      type: 'data_record',
+      form: 'facility_summary',
+      patient_id: null,
+      place_id: null,
+      subject_id: null,
+      case_id: null,
+      reported_date: TEST_START,
+      doc: JSON.stringify({
+        _id: 'orphan-report',
+        type: 'data_record',
+        form: 'facility_summary',
+        fields: { summary: 'no subject' },
+        reported_date: TEST_START,
+      }),
+      _rawDoc: {
+        _id: 'orphan-report',
+        type: 'data_record',
+        form: 'facility_summary',
+        fields: { summary: 'no subject' },
+        reported_date: TEST_START,
+      },
+    });
+
+    await rulesEngine.refreshEmissionsFor();
+
+    // Verify only the pregnancy registration report produced tasks, not the orphan report
+    const writtenTasks = mockDb._tables.tasks;
+    expect(writtenTasks.length).to.be.greaterThan(0);
+    writtenTasks.forEach(task => {
+      expect(task.owner).to.equal(patientContact._id);
+    });
+  });
 });
 
 describe('PowerSync schema metadata', () => {
