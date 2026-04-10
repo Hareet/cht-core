@@ -2,7 +2,7 @@ import sinon, { SinonStub } from 'sinon';
 import { expect } from 'chai';
 import { queryByFreetext } from '../../../src/postgres/libs/freetext';
 import { PostgresDataContext, DatabasePool } from '../../../src/postgres/libs/data-context';
-import { InvalidArgumentError } from '../../../src/libs/error';
+import { InvalidArgumentError } from '../../../src';
 
 describe('postgres freetext lib', () => {
   let poolQuery: SinonStub;
@@ -219,6 +219,73 @@ describe('postgres freetext lib', () => {
       ).to.be.rejectedWith(InvalidArgumentError, 'Invalid freetext search key');
 
       expect(poolQuery.notCalled).to.be.true;
+    });
+  });
+
+  describe('cursor validation', () => {
+    it('throws InvalidArgumentError for non-numeric cursor', async () => {
+      await expect(
+        queryByFreetext(ctx, 'contacts')({ freetext: 'test' }, 'abc', 10)
+      ).to.be.rejectedWith(InvalidArgumentError, 'The cursor must be a string or null for first page: ["abc"].');
+
+      expect(poolQuery.notCalled).to.be.true;
+    });
+
+    it('throws InvalidArgumentError for negative cursor', async () => {
+      await expect(
+        queryByFreetext(ctx, 'contacts')({ freetext: 'test' }, '-5', 10)
+      ).to.be.rejectedWith(InvalidArgumentError, 'The cursor must be a string or null for first page: ["-5"].');
+
+      expect(poolQuery.notCalled).to.be.true;
+    });
+
+    it('throws InvalidArgumentError for non-integer cursor', async () => {
+      await expect(
+        queryByFreetext(ctx, 'contacts')({ freetext: 'test' }, '1.5', 10)
+      ).to.be.rejectedWith(InvalidArgumentError, 'The cursor must be a string or null for first page: ["1.5"].');
+
+      expect(poolQuery.notCalled).to.be.true;
+    });
+
+    it('throws InvalidArgumentError for object cursor', async () => {
+      const cursor = { cursor: 'cursor' } as unknown as string;
+
+      await expect(
+        queryByFreetext(ctx, 'contacts')({ freetext: 'test' }, cursor, 10)
+      ).to.be.rejectedWith(InvalidArgumentError, 'The cursor must be a string or null for first page');
+
+      expect(poolQuery.notCalled).to.be.true;
+    });
+
+    it('accepts null cursor', async () => {
+      poolQuery.resolves({ rows: [{ _id: 'a' }], rowCount: 1 });
+
+      const result = await queryByFreetext(ctx, 'contacts')({ freetext: 'test' }, null, 10);
+
+      expect(result.data).to.deep.equal(['a']);
+      expect(poolQuery.calledOnce).to.be.true;
+      const params = poolQuery.firstCall.args[1];
+      expect(params).to.include(0); // skip = 0
+    });
+
+    it('accepts valid numeric string cursor', async () => {
+      poolQuery.resolves({ rows: [{ _id: 'a' }], rowCount: 1 });
+
+      const result = await queryByFreetext(ctx, 'reports')({ freetext: 'test' }, '20', 10);
+
+      expect(result.data).to.deep.equal(['a']);
+      expect(poolQuery.calledOnce).to.be.true;
+      const params = poolQuery.firstCall.args[1];
+      expect(params).to.include(20);
+    });
+
+    it('accepts zero cursor', async () => {
+      poolQuery.resolves({ rows: [], rowCount: 0 });
+
+      const result = await queryByFreetext(ctx, 'contacts')({ freetext: 'test' }, '0', 10);
+
+      expect(result.data).to.deep.equal([]);
+      expect(poolQuery.calledOnce).to.be.true;
     });
   });
 

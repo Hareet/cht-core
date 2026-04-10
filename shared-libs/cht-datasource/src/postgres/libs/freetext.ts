@@ -3,6 +3,17 @@ import { ContactTypeQualifier, FreetextQualifier, isContactTypeQualifier, isKeye
 import { PostgresDataContext } from './data-context';
 import { InvalidArgumentError } from '../../libs/error';
 
+const validateCursor = (cursor: Nullable<string>): number => {
+  if (cursor === null) {
+    return 0;
+  }
+  const skip = Number(cursor);
+  if (isNaN(skip) || skip < 0 || !Number.isInteger(skip)) {
+    throw new InvalidArgumentError(`The cursor must be a string or null for first page: [${JSON.stringify(cursor)}].`);
+  }
+  return skip;
+};
+
 /**
  * Validates that a freetext search key contains only safe characters for use in JSONB path
  * expressions. Prevents SQL injection via the key portion of keyed freetext queries (e.g. "key:value").
@@ -80,7 +91,7 @@ export const queryByFreetext = (
   }
 
   // Pagination
-  const skip = cursor ? parseInt(cursor, 10) : 0;
+  const skip = validateCursor(cursor);
   params.push(limit);
   params.push(skip);
 

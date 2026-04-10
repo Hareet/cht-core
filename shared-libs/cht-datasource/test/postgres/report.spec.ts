@@ -7,6 +7,7 @@ import * as PgLineage from '../../src/postgres/libs/lineage';
 import * as PgFreetext from '../../src/postgres/libs/freetext';
 import * as PgContact from '../../src/postgres/contact';
 import { PostgresDataContext, DatabasePool } from '../../src/postgres/libs/data-context';
+import { InvalidArgumentError } from '../../src';
 
 describe('postgres report', () => {
   let ctx: PostgresDataContext;
@@ -185,6 +186,26 @@ describe('postgres report', () => {
         expect(result).to.deep.equal(expectedPage);
         expect(queryByFreetextInner.firstCall.args[1]).to.equal('5');
         expect(queryByFreetextInner.firstCall.args[2]).to.equal(10);
+      });
+
+      it('throws InvalidArgumentError for non-numeric cursor', async () => {
+        const qualifier = { freetext: 'pregnancy' };
+        queryByFreetextInner.rejects(new InvalidArgumentError(
+          'The cursor must be a string or null for first page: ["abc"].'
+        ));
+
+        await expect(Report.v1.getUuidsPage(ctx)(qualifier, 'abc', 10))
+          .to.be.rejectedWith(InvalidArgumentError, 'The cursor must be a string or null for first page');
+      });
+
+      it('throws InvalidArgumentError for negative cursor', async () => {
+        const qualifier = { freetext: 'pregnancy' };
+        queryByFreetextInner.rejects(new InvalidArgumentError(
+          'The cursor must be a string or null for first page: ["-1"].'
+        ));
+
+        await expect(Report.v1.getUuidsPage(ctx)(qualifier, '-1', 10))
+          .to.be.rejectedWith(InvalidArgumentError, 'The cursor must be a string or null for first page');
       });
     });
 
