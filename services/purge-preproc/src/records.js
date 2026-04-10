@@ -101,10 +101,17 @@ const getUnallocatedRecords = async (limit, offset, since) => {
 // purge function may produce different results without that report in the group.
 // The deleted record won't appear in the contact's group (getRecordsForSubjects
 // filters _deleted), so the purge function correctly evaluates the new state.
+//
+// Uses UNNEST instead of COALESCE to capture ALL subject IDs per record.
+// A report can reference multiple contacts (e.g., patient_id=A and place_id=B).
+// getRecordsForSubjects matches on ANY subject field, so the report appears in
+// multiple contacts' groups. COALESCE only returned the first non-null field,
+// leaving other contacts with stale purge decisions in incremental mode.
 const getContactIdsWithChangedRecords = async (since) => {
   const result = await db.query(`
-    SELECT DISTINCT
-      COALESCE(
+    SELECT DISTINCT subject_id
+    FROM (
+      SELECT UNNEST(ARRAY[
         NULLIF(doc->>'patient_id', ''),
         NULLIF(doc->>'place_id', ''),
         NULLIF(doc->>'patient_uuid', ''),
@@ -114,15 +121,15 @@ const getContactIdsWithChangedRecords = async (since) => {
         NULLIF(doc->'fields'->>'patient_uuid', ''),
         NULLIF(doc->'fields'->>'place_uuid', ''),
         NULLIF(doc->'contact'->>'_id', '')
-      ) AS subject_id
-    FROM ${tbl()}
-    WHERE doc->>'type' = 'data_record'
-      AND saved_timestamp > $1
+      ]) AS subject_id
+      FROM ${tbl()}
+      WHERE doc->>'type' = 'data_record'
+        AND saved_timestamp > $1
+    ) sub
+    WHERE subject_id IS NOT NULL
   `, [since]);
 
-  const subjectIds = result.rows
-    .map(row => row.subject_id)
-    .filter(Boolean);
+  const subjectIds = result.rows.map(row => row.subject_id);
 
   if (!subjectIds.length) {
     return [];

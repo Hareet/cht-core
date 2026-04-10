@@ -42,27 +42,39 @@ describe('Records', () => {
       expect(firstQuery).to.include('data_record');
     });
 
-    it('should filter null subject IDs from deleted records', async () => {
+    it('should use UNNEST to capture all subject IDs per record', async () => {
       const queryStub = sinon.stub(db, 'query');
       sinon.stub(db, 'getSchema').returns('v1');
 
-      // A deleted record whose subject fields are all null/empty
+      // UNNEST returns all non-null subject IDs from each changed record.
+      // A report with patient_id=A and place_id=B returns both A and B.
       queryStub.onFirstCall().resolves({
         rows: [
-          { subject_id: null },
-          { subject_id: 'patient1' },
+          { subject_id: 'patient_A' },
+          { subject_id: 'place_B' },
+          { subject_id: 'patient_C' },
         ],
       });
 
       queryStub.onSecondCall().resolves({
-        rows: [{ _id: 'patient1' }],
+        rows: [
+          { _id: 'contact_for_A' },
+          { _id: 'contact_for_B' },
+          { _id: 'contact_for_C' },
+        ],
       });
 
-      const result = await records.getContactIdsWithChangedRecords(new Date('2025-01-01'));
+      const result = await records.getContactIdsWithChangedRecords(new Date('2025-06-01'));
 
-      expect(result).to.deep.equal(['patient1']);
-      // Only the non-null subject IDs should be queried (passed as array param)
-      expect(queryStub.args[1][1][0]).to.deep.equal(['patient1']);
+      expect(result).to.deep.equal(['contact_for_A', 'contact_for_B', 'contact_for_C']);
+
+      // Verify the SQL uses UNNEST (not COALESCE which only returns the first non-null)
+      const firstQuery = queryStub.args[0][0];
+      expect(firstQuery).to.include('UNNEST');
+      expect(firstQuery).to.not.include('COALESCE');
+
+      // All three subject IDs should be passed to the contact lookup query
+      expect(queryStub.args[1][1][0]).to.deep.equal(['patient_A', 'place_B', 'patient_C']);
     });
 
     it('should return empty array when no changed records', async () => {
@@ -78,18 +90,26 @@ describe('Records', () => {
       expect(queryStub.callCount).to.equal(1);
     });
 
-    it('should return empty array when all changed records have null subjects', async () => {
+    it('should deduplicate subject IDs across records', async () => {
       const queryStub = sinon.stub(db, 'query');
       sinon.stub(db, 'getSchema').returns('v1');
 
+      // UNNEST + DISTINCT in SQL deduplicates; DB returns unique rows
       queryStub.onFirstCall().resolves({
-        rows: [{ subject_id: null }, { subject_id: null }],
+        rows: [
+          { subject_id: 'patient1' },
+          // SQL DISTINCT already removed duplicates
+        ],
+      });
+
+      queryStub.onSecondCall().resolves({
+        rows: [{ _id: 'patient1' }],
       });
 
       const result = await records.getContactIdsWithChangedRecords(new Date('2025-01-01'));
 
-      expect(result).to.deep.equal([]);
-      expect(queryStub.callCount).to.equal(1);
+      expect(result).to.deep.equal(['patient1']);
+      expect(queryStub.args[1][1][0]).to.deep.equal(['patient1']);
     });
   });
 
