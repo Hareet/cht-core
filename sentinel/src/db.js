@@ -1,9 +1,18 @@
 const logger = require('@medic/logger');
+
+const { UNIT_TEST_ENV, CHT_DB_BACKEND } = process.env;
+
+// Feature flag: CHT_DB_BACKEND=postgresql routes all DB access through PostgreSQL
+if (CHT_DB_BACKEND === 'postgresql') {
+  logger.info('Sentinel using PostgreSQL backend (CHT_DB_BACKEND=postgresql)');
+  const pgDb = require('./db-postgresql');
+  module.exports = pgDb;
+  return;
+}
+
 const request = require('@medic/couch-request');
 const environment = require('@medic/environment');
 const audit = require('@medic/audit');
-
-const { UNIT_TEST_ENV } = process.env;
 
 if (UNIT_TEST_ENV) {
   const stubMe = functionName => () => {
