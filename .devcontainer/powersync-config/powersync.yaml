@@ -106,6 +106,7 @@ sync_config:
             AND (
               ifnull(c.doc -> 'fields' ->> 'private', 'false') != 'true'
               OR c.doc -> 'contact' ->> '_id' = auth.parameter('contact_id')
+              OR c.doc -> 'contact' ->> '_id' IN accessible_facilities
             )
 
       sms_messages:

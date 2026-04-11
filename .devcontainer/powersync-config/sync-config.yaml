@@ -19,6 +19,16 @@
 #   role_hash:              MD5 of sorted roles (for purge group lookup)
 #   report_depth:           max depth for other users' reports (-1 = unlimited)
 #   can_view_unallocated:   "true" if user may see reports without a subject
+#
+# NOTE ON SUBJECT RESOLUTION PARITY:
+# CHT's docs_by_replication_key CouchDB view resolves report subjects as:
+#   patient_id -> fields.patient_id -> place_id -> fields.place_id
+#   -> fields.patient_uuid -> contact._id -> _unassigned
+# The view does NOT check: doc.patient_uuid (top-level), doc.place_uuid,
+# or doc.fields.place_uuid. However, shared-libs/registration-utils DOES
+# check all of these (including place_uuid). Our Sync Streams intentionally
+# match registration-utils for forward compatibility, accepting minor
+# over-replication vs the CouchDB view for these rare edge cases.
 
 config:
   edition: 3
@@ -71,10 +81,18 @@ streams:
   # report_facilities includes both UUIDs and shortcodes (patient_id,
   # place_id) so subject matching works for both identifier types.
   #
-  # needs_signoff: walks submitter ancestor chain (5 levels).
+  # needs_signoff: walks submitter ancestor chain (5 levels static).
+  #   CHT dynamically walks the ENTIRE chain; our static 5-level walk
+  #   covers National→County→Sub-county→Facility→CHW Area.
+  #   If deeper hierarchies exist, pre-compute needs_signoff contacts
+  #   in refresh_user_facilities() instead of relying on nested JSON.
   # report_depth: limits OTHER users' reports by depth.
   # Own reports: submitter always sees their own reports (bypass depth).
-  # Privacy: fields.private=true only visible to submitter.
+  # Privacy: fields.private=true only visible to submitter or users who
+  #   can see the submitter (per CHT's isSensitive() in authorization.js).
+  #   A doc is sensitive (blocked) ONLY when ALL of: private=true, subject
+  #   in user's facilities, AND submitter NOT in accessible_facilities.
+  #   If the submitter IS accessible, private reports are still synced.
   reports:
     auto_subscribe: true
     priority: 2
@@ -131,11 +149,14 @@ streams:
             )
           )
         )
-        -- Privacy: private reports only visible to submitter.
+        -- Privacy: private reports only visible to submitter or users who
+        -- can see the submitter. CHT's isSensitive() blocks a doc only when
+        -- the submitter is NOT in the user's accessible subjects.
         -- Must handle NULL: ifnull wraps the field so missing private != excluded.
         AND (
           ifnull(c.doc -> 'fields' ->> 'private', 'false') != 'true'
           OR c.doc -> 'contact' ->> '_id' = auth.parameter('contact_id')
+          OR c.doc -> 'contact' ->> '_id' IN accessible_facilities
         )
 
   # ================================================================
