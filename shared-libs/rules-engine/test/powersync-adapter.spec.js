@@ -42,6 +42,30 @@ const reportConnectedByPlace = {
   reported_date: 2000,
 };
 
+// Report linked to patient by patient_id AND to place by place_uuid.
+// getSubjectId returns 'patient' (patient_id takes priority).
+// This report should appear for 'patient' contact but NOT for 'place' contact after post-filtering.
+const reportConnectedByPatientAndPlaceUuid = {
+  _id: 'reportByPatientAndPlaceUuid',
+  type: 'data_record',
+  form: 'form',
+  fields: {
+    place_uuid: 'place',
+  },
+  patient_id: 'patient',
+};
+
+// Report linked only to place by place_uuid.
+// getSubjectId returns 'place' (fields.place_uuid).
+const reportConnectedByPlaceUuid = {
+  _id: 'reportByPlaceUuid',
+  type: 'data_record',
+  form: 'form',
+  fields: {
+    place_uuid: 'place',
+  },
+};
+
 const taskOwnedByChtContact = {
   _id: 'taskOwnedBy',
   type: 'task',
@@ -92,6 +116,28 @@ const failedTask = {
   requester: 'patient',
   owner: 'patient',
   state: 'Failed',
+};
+
+const taskRequestedByChtPlace = {
+  _id: 'taskRequestedByPlace',
+  type: 'task',
+  requester: 'place',
+};
+
+const readyTaskForPlace = {
+  _id: 'readyPlaceTask',
+  type: 'task',
+  requester: 'place',
+  owner: 'place',
+  state: 'Ready',
+};
+
+const cancelledTaskForPlace = {
+  _id: 'cancelledPlaceTask',
+  type: 'task',
+  requester: 'place',
+  owner: 'place',
+  state: 'Cancelled',
 };
 
 /**
@@ -702,38 +748,145 @@ describe('powersync-adapter', () => {
   });
 
   describe('allTaskRows', () => {
-    it('returns all task rows', async () => {
-      seedTasks(db, [cancelledTask, readyTask, taskOwnedByChtContact]);
+    it('returns all task rows with correct _unassigned mapping (PouchDB parity)', async () => {
+      seedTasks(db, [
+        cancelledTask, readyTask, taskOwnedByChtContact,
+        taskRequestedByChtContact, taskRequestedByChtPlace,
+        readyTaskForPlace, cancelledTaskForPlace,
+      ]);
 
       const rows = await powersyncProvider(db).allTaskRows();
-      expect(rows).to.have.length(3);
-      expect(rows.find(r => r.id === 'readyTask').value).to.deep.equal({ state: 'Ready' });
+      expect(rows).to.have.length(7);
+      expect(rows).to.have.deep.members([
+        { id: 'cancelledTask', key: ['owner', 'all', 'patient'], value: { state: 'Cancelled' } },
+        { id: 'readyTask', key: ['owner', 'all', 'patient'], value: { state: 'Ready' } },
+        { id: 'taskOwnedBy', key: ['owner', 'all', 'patient'], value: {} },
+        // Tasks without owner map to '_unassigned' (PouchDB parity: view uses doc.owner || '_unassigned')
+        { id: 'taskRequestedBy', key: ['owner', 'all', '_unassigned'], value: {} },
+        { id: 'taskRequestedByPlace', key: ['owner', 'all', '_unassigned'], value: {} },
+        { id: 'readyPlaceTask', key: ['owner', 'all', 'place'], value: { state: 'Ready' } },
+        { id: 'cancelledPlaceTask', key: ['owner', 'all', 'place'], value: { state: 'Cancelled' } },
+      ]);
     });
   });
 
   describe('taskDataFor', () => {
     beforeEach(() => {
       seedContacts(db, [contactDoc, placeDoc]);
-      seedReports(db, [pregnancyReport, reportConnectedByPlace]);
-      seedTasks(db, [taskRequestedByChtContact, cancelledTask]);
+      seedReports(db, [
+        pregnancyReport,
+        reportConnectedByPlace,
+        reportConnectedByPatientAndPlaceUuid,
+        reportConnectedByPlaceUuid,
+      ]);
+      seedTasks(db, [
+        taskRequestedByChtContact,
+        cancelledTask,
+        completedTask,
+        failedTask,
+        readyTask,
+        draftTask,
+        taskRequestedByChtPlace,
+        readyTaskForPlace,
+        cancelledTaskForPlace,
+      ]);
     });
 
     it('empty contacts yields empty', async () => {
       expect(await powersyncProvider(db).taskDataFor([])).to.be.empty;
     });
 
-    it('returns contact docs, reports, and tasks for known contact', async () => {
+    it('returns exact contact docs, reports, and tasks for patient contact (PouchDB parity)', async () => {
+      // Subject IDs for 'patient' contact: { 'patient', 'patient_id' }
+      // pregnancyReport: patient_id='patient_id' → matched. getSubjectId='patient_id' → in set ✓
+      // reportByPlace: place_id='patient' → matched. getSubjectId='patient' (place_id) → in set ✓
+      // reportByPatientAndPlaceUuid: patient_id='patient' → matched. getSubjectId='patient' → in set ✓
+      // reportByPlaceUuid: subject_id='place' → NOT in set → not matched by SQL
       const result = await powersyncProvider(db).taskDataFor(['patient'], mockUserSettingsDoc);
       expect(result.contactDocs).to.have.length(1);
       expect(result.contactDocs[0]._id).to.equal('patient');
-      expect(result.reportDocs.length).to.be.greaterThan(0);
-      expect(result.taskDocs.length).to.be.greaterThan(0);
+
+      const reportIds = result.reportDocs.map(d => d._id).sort();
+      expect(reportIds).to.deep.equal([
+        'pregReport',
+        'reportByPatientAndPlaceUuid',
+        'reportByPlace',
+      ]);
+
+      const taskIds = result.taskDocs.map(d => d._id).sort();
+      expect(taskIds).to.deep.equal([
+        'cancelledTask',
+        'completedTask',
+        'draftTask',
+        'failedTask',
+        'readyTask',
+        'taskRequestedBy',
+      ]);
+
       expect(result.userSettingsId).to.equal('org.couchdb.user:username');
+    });
+
+    it('should exclude multi-subject reports whose primary subject is another contact (PouchDB parity)', async () => {
+      // For the 'place' contact: subject IDs = { 'place', 'place_id' }
+      // reportByPatientAndPlaceUuid: subject_id='place' → matched by SQL.
+      //   BUT getSubjectId returns 'patient' (patient_id takes priority) → NOT in set → filtered OUT
+      // reportByPlaceUuid: subject_id='place' → matched. getSubjectId='place' → in set ✓
+      // pregnancyReport: patient_id='patient_id' → NOT in set
+      // reportByPlace: place_id='patient' → NOT in set
+      const result = await powersyncProvider(db).taskDataFor(['place'], mockUserSettingsDoc);
+      expect(result.contactDocs).to.have.length(1);
+      expect(result.contactDocs[0]._id).to.equal('place');
+
+      const reportIds = result.reportDocs.map(d => d._id);
+      expect(reportIds).to.deep.equal(['reportByPlaceUuid']);
+
+      const taskIds = result.taskDocs.map(d => d._id).sort();
+      expect(taskIds).to.deep.equal([
+        'cancelledPlaceTask',
+        'readyPlaceTask',
+        'taskRequestedByPlace',
+      ]);
+    });
+
+    it('should include all reports and tasks for both contacts', async () => {
+      const result = await powersyncProvider(db).taskDataFor(
+        [contactDoc._id, placeDoc._id], mockUserSettingsDoc
+      );
+      expect(result.contactDocs).to.have.length(2);
+
+      const reportIds = result.reportDocs.map(d => d._id).sort();
+      // Subject IDs combined: { 'patient', 'place', 'patient_id', 'place_id' }
+      // All reports with matching subjects included after post-filter:
+      //   pregnancyReport: getSubjectId='patient_id' → in set ✓
+      //   reportByPlace: getSubjectId='patient' (place_id='patient') → in set ✓
+      //   reportByPatientAndPlaceUuid: getSubjectId='patient' → in set ✓
+      //   reportByPlaceUuid: getSubjectId='place' → in set ✓
+      expect(reportIds).to.deep.equal([
+        'pregReport',
+        'reportByPatientAndPlaceUuid',
+        'reportByPlace',
+        'reportByPlaceUuid',
+      ]);
+
+      const taskIds = result.taskDocs.map(d => d._id).sort();
+      expect(taskIds).to.deep.equal([
+        'cancelledPlaceTask',
+        'cancelledTask',
+        'completedTask',
+        'draftTask',
+        'failedTask',
+        'readyPlaceTask',
+        'readyTask',
+        'taskRequestedBy',
+        'taskRequestedByPlace',
+      ]);
     });
 
     it('returns empty docs for unrecognized contact', async () => {
       const result = await powersyncProvider(db).taskDataFor(['unknown'], mockUserSettingsDoc);
       expect(result.contactDocs).to.be.empty;
+      expect(result.reportDocs).to.be.empty;
+      expect(result.taskDocs).to.be.empty;
       expect(result.userSettingsId).to.equal('org.couchdb.user:username');
     });
   });

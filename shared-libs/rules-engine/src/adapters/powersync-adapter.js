@@ -267,8 +267,8 @@ const powersyncProvider = (db) => {
             await tx.execute(
               `INSERT OR REPLACE INTO tasks (id, type, state, owner, requester, user, authored_on, doc)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-              [id, 'task', taskDoc.state, taskDoc.owner || null, taskDoc.requester || null,
-                taskDoc.user || null, taskDoc.authoredOn || null, doc]
+              [id, 'task', taskDoc.state, taskDoc.owner ?? null, taskDoc.requester ?? null,
+                taskDoc.user ?? null, taskDoc.authoredOn ?? null, doc]
             );
           }
         });

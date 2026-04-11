@@ -488,6 +488,39 @@ describe('PowerSync adapter integration tests', () => {
     expect(totalTasks).to.be.greaterThan(0);
   });
 
+  it('should return Ready tasks via fetchTasksFor with specific contact IDs', async () => {
+    // This tests the targeted refresh path: taskDataFor → tasksByRelation('owner') → filter Ready
+    // This is the most common production path (only refreshes dirty contacts).
+    seedContact(mockDb, patientContact);
+    seedReport(mockDb, pregnancyFollowupReport);
+
+    // First do a full refresh to populate state store
+    await rulesEngine.refreshEmissionsFor();
+
+    // Now fetch tasks for the specific contact — exercises tasksByRelation('owner')
+    const tasks = await rulesEngine.fetchTasksFor([patientContact._id]);
+    tasks.forEach(task => {
+      expect(task.state).to.equal('Ready');
+      expect(task.owner).to.equal(patientContact._id);
+    });
+  });
+
+  it('should return task breakdown for specific contact IDs', async () => {
+    seedContact(mockDb, patientContact);
+    seedReport(mockDb, pregnancyRegistrationReport);
+
+    await rulesEngine.refreshEmissionsFor();
+
+    // fetchTasksBreakdown with specific contacts exercises allTaskRowsByOwner
+    const breakdown = await rulesEngine.fetchTasksBreakdown([patientContact._id]);
+    const totalTasks = Object.values(breakdown).reduce((sum, count) => sum + count, 0);
+    expect(totalTasks).to.be.greaterThan(0);
+
+    // All counted tasks should belong to the patient contact
+    const writtenTasks = mockDb._tables.tasks.filter(t => t.owner === patientContact._id);
+    expect(writtenTasks.length).to.equal(totalTasks);
+  });
+
   it('should not produce spurious emissions from reports without subject identifiers', async () => {
     // Parity with PouchDB: the CouchDB reports_by_subject view only emits for reports with
     // subject fields. Reports without any subject identifiers (patient_id, place_id, etc.) are
