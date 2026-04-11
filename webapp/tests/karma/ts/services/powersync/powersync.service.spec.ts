@@ -7,6 +7,38 @@ import { PowerSyncService } from '@mm-services/powersync/powersync.service';
 import { SessionService } from '@mm-services/session.service';
 import { LocationService } from '@mm-services/location.service';
 
+/**
+ * Mock WatchedQuery returned by db.query().watch().
+ * Allows tests to push data/errors into the subscriber chain.
+ */
+class MockWatchedQuery {
+  private listeners: any[] = [];
+  close = sinon.stub();
+
+  registerListener(listener: any): () => void {
+    this.listeners.push(listener);
+    return () => {
+      const idx = this.listeners.indexOf(listener);
+      if (idx >= 0) {
+        this.listeners.splice(idx, 1);
+      }
+    };
+  }
+
+  // Test helpers
+  _emitData(data: any[]) {
+    for (const l of this.listeners) {
+      l.onData?.(data);
+    }
+  }
+
+  _emitError(error: Error) {
+    for (const l of this.listeners) {
+      l.onError?.(error);
+    }
+  }
+}
+
 // Mock PowerSyncDatabase
 class MockPowerSyncDatabase {
   private statusListeners: any[] = [];
@@ -33,6 +65,14 @@ class MockPowerSyncDatabase {
   execute = sinon.stub().resolves();
   writeTransaction = sinon.stub().callsFake(async (fn) => fn({ execute: sinon.stub().resolves() }));
   getUploadQueueStats = sinon.stub().resolves({ count: 0 });
+
+  // query().watch() chain used by the watch() method
+  _lastWatchedQuery: MockWatchedQuery | null = null;
+  query = sinon.stub().callsFake(() => {
+    const wq = new MockWatchedQuery();
+    this._lastWatchedQuery = wq;
+    return { watch: () => wq };
+  });
 
   registerListener(listener: any) {
     this.statusListeners.push(listener);
@@ -610,6 +650,200 @@ describe('PowerSync Service', () => {
         const result = await service.waitForFirstSync();
 
         expect(result).to.be.false;
+      });
+    });
+
+    describe('watch (initialized)', () => {
+      it('should emit data from the WatchedQuery through the Observable', (done) => {
+        const expectedRows = [
+          { id: 'c1', name: 'Alice' },
+          { id: 'c2', name: 'Bob' },
+        ];
+
+        service.watch('SELECT * FROM contacts').subscribe({
+          next: (rows) => {
+            expect(rows).to.deep.equal(expectedRows);
+            done();
+          },
+        });
+
+        // Verify query was created with correct SQL and params
+        expect(mockDb.query.calledOnce).to.be.true;
+        const queryArg = mockDb.query.firstCall.args[0];
+        expect(queryArg.sql).to.equal('SELECT * FROM contacts');
+        expect(queryArg.parameters).to.deep.equal([]);
+
+        // Push data through the mock WatchedQuery
+        mockDb._lastWatchedQuery!._emitData(expectedRows);
+      });
+
+      it('should pass SQL parameters to query', () => {
+        service.watch('SELECT * FROM contacts WHERE id = ?', ['c1']).subscribe(() => {});
+
+        const queryArg = mockDb.query.firstCall.args[0];
+        expect(queryArg.parameters).to.deep.equal(['c1']);
+      });
+
+      it('should emit multiple data updates', () => {
+        const emissions: any[][] = [];
+
+        service.watch('SELECT * FROM contacts').subscribe({
+          next: (rows) => emissions.push(rows),
+        });
+
+        mockDb._lastWatchedQuery!._emitData([{ id: 'c1' }]);
+        mockDb._lastWatchedQuery!._emitData([{ id: 'c1' }, { id: 'c2' }]);
+        mockDb._lastWatchedQuery!._emitData([]);
+
+        expect(emissions).to.have.length(3);
+        expect(emissions[0]).to.deep.equal([{ id: 'c1' }]);
+        expect(emissions[1]).to.deep.equal([{ id: 'c1' }, { id: 'c2' }]);
+        expect(emissions[2]).to.deep.equal([]);
+      });
+
+      it('should propagate errors from WatchedQuery', (done) => {
+        service.watch('SELECT * FROM invalid').subscribe({
+          error: (err) => {
+            expect(err.message).to.equal('table not found');
+            done();
+          },
+        });
+
+        mockDb._lastWatchedQuery!._emitError(new Error('table not found'));
+      });
+
+      it('should dispose listener and close WatchedQuery on unsubscribe', () => {
+        const subscription = service.watch('SELECT * FROM contacts').subscribe(() => {});
+
+        const wq = mockDb._lastWatchedQuery!;
+        // Before unsubscribe: listener is registered
+        expect((wq as any).listeners.length).to.equal(1);
+
+        subscription.unsubscribe();
+
+        // After unsubscribe: listener removed and close() called
+        expect((wq as any).listeners.length).to.equal(0);
+        expect(wq.close.calledOnce).to.be.true;
+      });
+
+      it('should not emit after unsubscribe', () => {
+        const emissions: any[][] = [];
+        const subscription = service.watch('SELECT * FROM contacts').subscribe({
+          next: (rows) => emissions.push(rows),
+        });
+
+        mockDb._lastWatchedQuery!._emitData([{ id: 'c1' }]);
+        expect(emissions).to.have.length(1);
+
+        subscription.unsubscribe();
+
+        // This emission should NOT reach the subscriber
+        mockDb._lastWatchedQuery!._emitData([{ id: 'c2' }]);
+        expect(emissions).to.have.length(1);
+      });
+    });
+
+    describe('watchContactsByType (initialized)', () => {
+      it('should create reactive query with correct SQL for single type', () => {
+        service.watchContactsByType(['person']).subscribe(() => {});
+
+        expect(mockDb.query.calledOnce).to.be.true;
+        const queryArg = mockDb.query.firstCall.args[0];
+        expect(queryArg.sql).to.include('contact_type IN (?)');
+        expect(queryArg.sql).to.include('ORDER BY name');
+        expect(queryArg.parameters).to.deep.equal(['person']);
+      });
+
+      it('should create reactive query with correct SQL for multiple types', () => {
+        service.watchContactsByType(['person', 'clinic']).subscribe(() => {});
+
+        const queryArg = mockDb.query.firstCall.args[0];
+        expect(queryArg.sql).to.include('?, ?');
+        expect(queryArg.parameters).to.deep.equal(['person', 'clinic']);
+      });
+
+      it('should emit contact rows through Observable', (done) => {
+        const rows = [{ id: 'c1', contact_type: 'person', name: 'Alice' }];
+
+        service.watchContactsByType(['person']).subscribe({
+          next: (data) => {
+            expect(data).to.deep.equal(rows);
+            done();
+          },
+        });
+
+        mockDb._lastWatchedQuery!._emitData(rows);
+      });
+    });
+
+    describe('watchReportsForPatient', () => {
+      it('should create reactive query with correct SQL and patient UUID', () => {
+        service.watchReportsForPatient('patient-1').subscribe(() => {});
+
+        expect(mockDb.query.calledOnce).to.be.true;
+        const queryArg = mockDb.query.firstCall.args[0];
+        expect(queryArg.sql).to.include('patient_uuid = ?');
+        expect(queryArg.sql).to.include('ORDER BY reported_date DESC');
+        expect(queryArg.parameters).to.deep.equal(['patient-1']);
+      });
+
+      it('should emit report rows through Observable', (done) => {
+        const rows = [
+          { id: 'r1', form: 'pregnancy', patient_uuid: 'patient-1', reported_date: '2026-04-10' },
+        ];
+
+        service.watchReportsForPatient('patient-1').subscribe({
+          next: (data) => {
+            expect(data).to.deep.equal(rows);
+            done();
+          },
+        });
+
+        mockDb._lastWatchedQuery!._emitData(rows);
+      });
+    });
+
+    describe('reconnect (concurrency)', () => {
+      it('should guard against concurrent reconnect calls', async () => {
+        // Make disconnect slow to create a window for concurrent calls
+        mockDb.disconnect = sinon.stub().callsFake(
+          () => new Promise(resolve => setTimeout(resolve, 50))
+        );
+
+        // Fire two reconnects concurrently
+        const p1 = service.reconnect();
+        const p2 = service.reconnect();
+
+        await Promise.all([p1, p2]);
+
+        // disconnect should only be called once - second call was a no-op
+        expect(mockDb.disconnect.callCount).to.equal(1);
+        expect(mockDb.connect.callCount).to.equal(1);
+      });
+
+      it('should reset reconnecting flag after completion', async () => {
+        await service.reconnect();
+
+        expect((service as any).reconnecting).to.be.false;
+      });
+
+      it('should reset reconnecting flag even when disconnect throws', async () => {
+        mockDb.disconnect.rejects(new Error('DB locked'));
+
+        await service.reconnect();
+
+        expect((service as any).reconnecting).to.be.false;
+        // connect should still have been called
+        expect(mockDb.connect.calledOnce).to.be.true;
+      });
+
+      it('should allow reconnect after previous reconnect completes', async () => {
+        await service.reconnect();
+        await service.reconnect();
+
+        // Both calls should have succeeded sequentially
+        expect(mockDb.disconnect.callCount).to.equal(2);
+        expect(mockDb.connect.callCount).to.equal(2);
       });
     });
 
