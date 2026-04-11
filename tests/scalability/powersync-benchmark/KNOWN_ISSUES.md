@@ -190,3 +190,15 @@ streams:
 This eliminates the `with` block entirely. The JOIN is evaluated server-side without parameter expansion, so there is no row limit.
 
 **Applies to all streams using `IN accessible_facilities` or `IN report_facilities`:** contacts, reports, sms_messages, targets.
+
+**Config override (self-hosted):** The default 1,000 limit can be raised via `api.parameters.max_parameter_query_results` in the service config YAML:
+
+```yaml
+api:
+  tokens:
+    - !env PS_ADMIN_TOKEN
+  parameters:
+    max_parameter_query_results: 5000
+```
+
+Confirmed working on PowerSync Service v1.20.4. The `parameters:` nesting is required — placing `max_parameter_query_results` directly under `api:` (without `parameters:`) is silently ignored.

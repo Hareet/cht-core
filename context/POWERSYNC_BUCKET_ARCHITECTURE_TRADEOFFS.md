@@ -3,22 +3,38 @@
 ## Decision Document: National-Scale eCHIS Deployment (100K+ CHWs, 47 Counties)
 
 **Date:** 2026-04-10
-**Status:** Analysis complete, recommendation ready for review
+**Updated:** 2026-04-11 — Empirical bucket semantics test completed (see Section 1.1)
+**Status:** Empirically validated. Consolidation strategy confirmed viable.
 **Authors:** Hareet (CHT migration lead) + Claude Code analysis
 
 ---
 
 ## 1. Executive Summary
 
-**Recommendation: Option B (Pre-computed mapping tables) is the correct architecture.** It is already partially implemented in the current codebase and should be completed with one critical modification: collapsing the JOIN pattern so each stream produces **1 bucket per user** instead of **N buckets per facility**.
+**Recommendation: Stream consolidation with CTE sharing.** Empirical testing on 2026-04-11 confirmed that all query patterns (JOIN, inline subquery, named CTE) create N buckets per facility — there is no "1 bucket" collapse. However, **multiple queries within one stream sharing the same CTE DO share buckets** (confirmed: 2 queries, 15 facilities = 15 buckets, not 30).
 
-The current implementation (`sync-config.yaml` and `powersync.yaml`) uses `INNER JOIN` against `user_accessible_facilities` and `user_report_facilities` tables. This is the right data model, but the JOIN creates one bucket per matched row in the join table per user. A CHW with 1,010 accessible facilities creates 1,010 buckets from the contacts stream alone -- exceeding the default 1,000 limit and causing PSYNC_S2305 sync failure.
+The strategy: merge streams that use the same CTE (`accessible_facilities` or `report_facilities`) into consolidated streams with `queries:[]`. Combined with raising `max_parameter_query_results` to 5,000 via `api.parameters.max_parameter_query_results`, this reduces total buckets from `9×N` to `N_accessible + N_report + 4`.
 
-The fix is to restructure the Sync Streams queries so that filtering happens via `auth.user_id()` in a subquery or CTE rather than via a multi-row JOIN. In Sync Streams edition 3, a query filtered only by `auth.user_id()` produces exactly **1 bucket per user**, regardless of how many rows the subquery returns. The `IN (subquery)` pattern -- where the subquery filters by `auth.user_id()` -- evaluates the subquery server-side and does not expand into separate buckets.
+**Projected bucket counts after consolidation:**
+- CHW (30 facilities): ~70 buckets (was ~270)
+- Supervisor (200 facilities): ~450 buckets (was ~1,800)
+- County admin (1,010 facilities): ~2,500 buckets (was ~9,000, fits in 5,000 limit)
 
-**However, the existing KNOWN_ISSUES.md documents that `IN <cte>` is limited to 1,000 expansions.** This means `IN accessible_facilities` (where `accessible_facilities` is a CTE) will fail when it returns >1,000 rows. The solution documented there is to use `INNER JOIN` instead, which avoids the CTE expansion limit. But `INNER JOIN` creates one bucket per joined row. This is the core tension.
+### 1.1 Empirical Test Results (2026-04-11)
 
-**The resolution:** Use a true subquery `IN (SELECT ...)` rather than a named CTE. PowerSync evaluates `IN (SELECT facility_id FROM v1.user_accessible_facilities WHERE user_id = auth.user_id())` differently from `IN accessible_facilities` -- the former is a correlated subquery that PowerSync processes server-side, while the latter is a CTE that gets expanded into parameters. If this distinction does not hold in practice (it needs testing), then Option A (raising the limit to 5,000-10,000) becomes the pragmatic fallback combined with the existing JOIN architecture.
+Test user `bucket_test_user` with exactly 15 facilities, 5 experiment streams:
+
+| Experiment | Pattern | Buckets | Result |
+|------------|---------|---------|--------|
+| exp1_direct | `WHERE col = auth.user_id()` | **1** | Control confirmed |
+| exp2_join | `INNER JOIN ... ON auth.user_id()` | **15** | N buckets confirmed |
+| exp3_subquery | `WHERE _id IN (SELECT ... WHERE user_id = auth.user_id())` | **15** | N buckets — no collapse |
+| exp4_cte | `WITH my_fac AS (...) WHERE _id IN my_fac` | **15** | CTE = subquery = JOIN |
+| exp5_consolidated | Two `queries:[]` sharing one CTE | **15** | SHARING WORKS (not 30) |
+
+Total: 61 buckets (1 + 15 + 15 + 15 + 15). Test code at `tests/scalability/powersync-benchmark/bucket-semantics-test.js`.
+
+**Key finding:** The ONLY way to get 1 bucket per user is `WHERE col = auth.user_id()` — a direct equality against the auth parameter with no intermediary table. All forms of intermediary lookup (JOIN, subquery, CTE) create N buckets. But queries within the same stream sharing the same CTE merge their bucket sets.
 
 ---
 

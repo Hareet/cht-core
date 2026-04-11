@@ -1,0 +1,175 @@
+# PowerSync Bucket Semantics Test Configuration
+#
+# Temporarily replaces the production sync config to empirically test
+# how different SQL patterns affect bucket creation.
+#
+# Deploy:
+#   1. cp .agents/worktrees/agent-3/.devcontainer/powersync-config/powersync.yaml /tmp/powersync.yaml.backup
+#   2. cp tests/scalability/powersync-benchmark/bucket-test-config.yaml \
+#         .agents/worktrees/agent-3/.devcontainer/powersync-config/powersync.yaml
+#   3. docker restart cht-powersync
+#
+# Restore:
+#   1. cp /tmp/powersync.yaml.backup .agents/worktrees/agent-3/.devcontainer/powersync-config/powersync.yaml
+#   2. docker restart cht-powersync
+
+replication:
+  connections:
+    - type: postgresql
+      uri: !env PS_DATABASE_URI
+      sslmode: disable
+
+storage:
+  type: postgresql
+  uri: !env PS_DATABASE_URI
+  sslmode: disable
+
+port: 8080
+
+api:
+  tokens:
+    - !env PS_ADMIN_TOKEN
+  parameters:
+    max_parameter_query_results: 5000
+
+sync_config:
+  content: |
+    config:
+      edition: 3
+
+    streams:
+      # =============================================================
+      # EXPERIMENT 1: CONTROL — Direct auth.user_id() filter
+      # Expected: 1 bucket per user
+      # Rationale: Only auth parameter in the query, no subquery/JOIN
+      # =============================================================
+      exp1_direct:
+        auto_subscribe: true
+        priority: 1
+        query: |
+          SELECT
+            exp1_direct._id AS id,
+            exp1_direct.doc ->> 'name' AS name,
+            CAST(exp1_direct.doc AS TEXT) AS doc
+          FROM "v1"."couchdb" exp1_direct
+          WHERE exp1_direct._deleted != true
+            AND exp1_direct.doc ->> 'type' = 'contact'
+            AND exp1_direct.doc ->> 'user' = auth.user_id()
+
+      # =============================================================
+      # EXPERIMENT 2: BASELINE — INNER JOIN (current production pattern)
+      # Expected: N buckets (15 for test user)
+      # This is what we already know is happening.
+      # =============================================================
+      exp2_join:
+        auto_subscribe: true
+        priority: 1
+        query: |
+          SELECT
+            exp2_join._id AS id,
+            exp2_join.doc ->> 'name' AS name,
+            CAST(exp2_join.doc AS TEXT) AS doc
+          FROM "v1"."couchdb" exp2_join
+          INNER JOIN "v1"."user_accessible_facilities" uaf
+            ON uaf.user_id = auth.user_id()
+            AND exp2_join._id = uaf.facility_id
+          WHERE exp2_join._deleted != true
+
+      # =============================================================
+      # EXPERIMENT 3: THE CRITICAL TEST — Inline subquery IN (SELECT ...)
+      # Expected per docs: N buckets (one per subquery result row)
+      # Hypothesis: might collapse to 1 bucket if PowerSync evaluates
+      #   the subquery server-side as a correlated filter.
+      # THIS IS THE MAKE-OR-BREAK EXPERIMENT.
+      # =============================================================
+      exp3_subquery:
+        auto_subscribe: true
+        priority: 1
+        query: |
+          SELECT
+            exp3_subquery._id AS id,
+            exp3_subquery.doc ->> 'name' AS name,
+            CAST(exp3_subquery.doc AS TEXT) AS doc
+          FROM "v1"."couchdb" exp3_subquery
+          WHERE exp3_subquery._deleted != true
+            AND exp3_subquery._id IN (
+              SELECT facility_id
+              FROM "v1"."user_accessible_facilities"
+              WHERE user_id = auth.user_id()
+            )
+
+      # =============================================================
+      # EXPERIMENT 4: Named CTE — WITH ... IN <cte_name>
+      # Expected: N buckets (CTE expanded to parameter list)
+      # Also confirms CTE vs inline subquery equivalence.
+      # =============================================================
+      exp4_cte:
+        auto_subscribe: true
+        priority: 1
+        with:
+          my_facilities: |
+            SELECT facility_id
+            FROM "v1"."user_accessible_facilities"
+            WHERE user_id = auth.user_id()
+        query: |
+          SELECT
+            exp4_cte._id AS id,
+            exp4_cte.doc ->> 'name' AS name,
+            CAST(exp4_cte.doc AS TEXT) AS doc
+          FROM "v1"."couchdb" exp4_cte
+          WHERE exp4_cte._deleted != true
+            AND exp4_cte._id IN my_facilities
+
+      # =============================================================
+      # EXPERIMENT 5: CONSOLIDATED — Two queries sharing one CTE
+      # Expected: N buckets total (shared), NOT 2*N
+      # Per docs: "Queries using the same CTE within a stream may
+      #   share buckets; the compiler can merge them into a single set."
+      # If confirmed, this is the consolidation strategy.
+      # =============================================================
+      exp5_consolidated:
+        auto_subscribe: true
+        priority: 1
+        with:
+          my_facilities: |
+            SELECT facility_id
+            FROM "v1"."user_accessible_facilities"
+            WHERE user_id = auth.user_id()
+        queries:
+          - |
+            SELECT
+              exp5_consolidated._id AS id,
+              exp5_consolidated.doc ->> 'name' AS name,
+              CAST(exp5_consolidated.doc AS TEXT) AS doc
+            FROM "v1"."couchdb" exp5_consolidated
+            WHERE exp5_consolidated._deleted != true
+              AND exp5_consolidated.doc ->> 'type' = 'contact'
+              AND exp5_consolidated._id IN my_facilities
+          - |
+            SELECT
+              exp5_consolidated._id AS id,
+              exp5_consolidated.doc ->> 'name' AS name,
+              CAST(exp5_consolidated.doc AS TEXT) AS doc
+            FROM "v1"."couchdb" exp5_consolidated
+            WHERE exp5_consolidated._deleted != true
+              AND exp5_consolidated.doc ->> 'type' = 'data_record'
+              AND exp5_consolidated.doc ->> 'patient_id' IN my_facilities
+
+client_auth:
+  jwks:
+    keys:
+      - kty: RSA
+        n: "uJv4x1pL6mQgbfp0XO4iN3X3FNiXnYFlSW-JsPEdIGrCSm2T-tzzVMQR8Ov_xHbR9ej9WlM62v1LVbUHpQmAWQAYCx90b5rYe9YxRSqd6zKgUS3NtdpyNyxGF_poDtg5Su81fGtlO9jtQHGUfqwnQ_hClX3Y5zi7ySp_v-l4IE2DH8FijYsNIVAybGle3VcTVsCDotvspe1LXQN07gjeJNFuqXRSXTSjhMC2ZY19cpX4fvvo4ffdVL5kBD1JZax164fAHFY-14yJ61rcnwC0G0O5stlK7rzVHy_ZMFNJb-b6gIzx1XQ52DY2Uu2kGzqvOFquvVksjFPQcd2jsTsZ_w"
+        e: AQAB
+        alg: RS256
+        kid: cht-dev-key-1
+        use: sig
+  audience:
+    - cht-powersync-dev
+  telemetry:
+    disable_telemetry_sharing: true
+
+system:
+  logging:
+    level: debug
+    format: text

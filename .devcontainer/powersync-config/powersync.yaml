@@ -21,6 +21,11 @@ port: 8080
 api:
   tokens:
     - !env PS_ADMIN_TOKEN
+  # Raise from default 1000 to support per-county deployments where
+  # supervisors/admins see >1000 facilities, each becoming a bucket.
+  # See context/POWERSYNC_BUCKET_ARCHITECTURE_TRADEOFFS.md for analysis.
+  parameters:
+    max_parameter_query_results: 5000
 
 # Sync config inlined to avoid file path issues across container mounts.
 # Uses JOINs instead of WITH/IN CTEs to avoid PowerSync's 1,000 parameter limit.
