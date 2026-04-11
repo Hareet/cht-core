@@ -1,0 +1,10 @@
+{
+  "name": "powersync-benchmark",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@powersync/node": "^0.12.0",
+    "better-sqlite3": "^12.0.0",
+    "pg": "^8.13.0"
+  }
+}

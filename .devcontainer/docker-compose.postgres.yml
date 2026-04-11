@@ -44,11 +44,15 @@ services:
     deploy:
       resources:
         limits:
-          memory: 4G
+          memory: 32G
+          cpus: "8"
     command: >
       postgres
-        -c shared_buffers=1GB
-        -c work_mem=20MB
+        -c shared_buffers=8GB
+        -c work_mem=64MB
+        -c effective_cache_size=24GB
+        -c maintenance_work_mem=1GB
+        -c random_page_cost=1.1
         -c jit=off
         -c wal_level=logical
         -c max_replication_slots=4
