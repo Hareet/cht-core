@@ -172,7 +172,7 @@ describe('pg-changes.js — PostgreSQL changes detection', function () {
         `SELECT _id, saved_timestamp FROM ${DOCS_TABLE}
          ORDER BY saved_timestamp DESC, _id DESC LIMIT 1`
       );
-      const cursor = beforeRows.length > 0
+      const cursor = (beforeRows.length > 0 && beforeRows[0].saved_timestamp)
         ? { timestamp: beforeRows[0].saved_timestamp.toISOString(), id: beforeRows[0]._id }
         : { timestamp: null, id: '' };
 
