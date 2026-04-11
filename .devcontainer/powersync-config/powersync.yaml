@@ -25,7 +25,8 @@ api:
   # supervisors/admins see >1000 facilities, each becoming a bucket.
   # See context/POWERSYNC_BUCKET_ARCHITECTURE_TRADEOFFS.md for analysis.
   parameters:
-    max_parameter_query_results: 5000
+    max_parameter_query_results: 10000
+    max_buckets_per_connection: 10000
 
 # Sync config inlined to avoid file path issues across container mounts.
 # Uses JOINs instead of WITH/IN CTEs to avoid PowerSync's 1,000 parameter limit.

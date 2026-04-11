@@ -191,14 +191,22 @@ This eliminates the `with` block entirely. The JOIN is evaluated server-side wit
 
 **Applies to all streams using `IN accessible_facilities` or `IN report_facilities`:** contacts, reports, sms_messages, targets.
 
-**Config override (self-hosted):** The default 1,000 limit can be raised via `api.parameters.max_parameter_query_results` in the service config YAML:
+**Config override (self-hosted):** There are TWO separate limits, both under `api.parameters`:
 
 ```yaml
 api:
   tokens:
     - !env PS_ADMIN_TOKEN
   parameters:
-    max_parameter_query_results: 5000
+    max_parameter_query_results: 10000  # CTE expansion limit (default 1000)
+    max_buckets_per_connection: 10000   # Total buckets per user (default 1000)
 ```
 
-Confirmed working on PowerSync Service v1.20.4. The `parameters:` nesting is required — placing `max_parameter_query_results` directly under `api:` (without `parameters:`) is silently ignored.
+| Key | Default | Error message | What it limits |
+|-----|---------|--------------|----------------|
+| `max_parameter_query_results` | 1000 | "Too many parameter query results: N (limit of X)" | CTE `IN <name>` expansion into `IN ($1, $2, ..., $N)` |
+| `max_buckets_per_connection` | 1000 | "Too many buckets: N (limit of X)" | Total bucket count across all streams per user |
+
+Both confirmed working on PowerSync Service v1.20.4. The `parameters:` nesting is required — placing keys directly under `api:` (without `parameters:`) is silently ignored.
+
+**Performance note:** PowerSync docs state sync latency scales linearly with bucket count. At 6,000 buckets (county admin with 1,010 facilities after stream consolidation), expect ~6× baseline latency. Acceptable for initial sync of supervisors; may need further optimization for real-time incremental sync on mobile.

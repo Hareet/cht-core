@@ -7,6 +7,8 @@
     { "name": "ac2", "pass": "Secret_1" }
   ],
   "powersync_users": [
+    { "name": "ac1" },
+    { "name": "ac2" },
     { "name": "chw_user" },
     { "name": "supervisor_user" },
     { "name": "county_admin" }
