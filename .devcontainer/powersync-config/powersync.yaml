@@ -95,8 +95,8 @@ sync_config:
               AND targets.doc ->> 'owner' IN accessible_facilities
 
       # Subject-matched + own + needs_signoff reports
-      # Two CTEs: report_facilities + accessible_facilities (separate bucket sets)
-      # Buckets: M (subject) + N_signoff (needs_signoff) + 1 (own)
+      # One CTE (report_facilities) + auth filters for own/signoff
+      # Buckets: M (subject) + 1 (own) + 1 (needs_signoff) = M + 2
       report_data:
         auto_subscribe: true
         priority: 2
@@ -104,10 +104,6 @@ sync_config:
           report_facilities: |
             SELECT facility_id
             FROM "v1"."user_report_facilities"
-            WHERE user_id = auth.user_id()
-          accessible_facilities: |
-            SELECT facility_id
-            FROM "v1"."user_accessible_facilities"
             WHERE user_id = auth.user_id()
         queries:
           # Query 1: Reports by pre-resolved subject (INNER JOIN)
@@ -150,7 +146,7 @@ sync_config:
               AND reports.doc ->> 'type' = 'data_record'
               AND reports.doc ->> 'form' IS NOT NULL
               AND reports.doc -> 'contact' ->> '_id' = auth.parameter('contact_id')
-          # Query 3: needs_signoff (5-level ancestor chain)
+          # Query 3: needs_signoff via pre-computed visibility (1 bucket)
           - |
             SELECT
               reports._id AS id,
@@ -163,17 +159,13 @@ sync_config:
               CAST(reports.doc -> 'fields' AS TEXT) AS fields,
               CAST(reports.doc AS TEXT) AS doc
             FROM "v1"."couchdb" reports
+            INNER JOIN "v1"."report_needs_signoff_visible" rnsv
+              ON rnsv.report_id = reports._id
+              AND rnsv.visible_to_user = auth.user_id()
             WHERE reports._deleted != true
               AND reports.doc ->> 'type' = 'data_record'
               AND reports.doc ->> 'form' IS NOT NULL
               AND reports.doc -> 'fields' ->> 'needs_signoff' = 'true'
-              AND (
-                reports.doc -> 'contact' ->> '_id' IN accessible_facilities
-                OR reports.doc -> 'contact' -> 'parent' ->> '_id' IN accessible_facilities
-                OR reports.doc -> 'contact' -> 'parent' -> 'parent' ->> '_id' IN accessible_facilities
-                OR reports.doc -> 'contact' -> 'parent' -> 'parent' -> 'parent' ->> '_id' IN accessible_facilities
-                OR reports.doc -> 'contact' -> 'parent' -> 'parent' -> 'parent' -> 'parent' ->> '_id' IN accessible_facilities
-              )
               AND (
                 ifnull(reports.doc -> 'fields' ->> 'private', 'false') != 'true'
                 OR reports.doc -> 'contact' ->> '_id' = auth.parameter('contact_id')

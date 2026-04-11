@@ -89,6 +89,24 @@ CREATE INDEX IF NOT EXISTS idx_couchdb_place_id
   WHERE doc ->> 'place_id' IS NOT NULL;
 
 -- ============================================================
+-- 2d. Needs-signoff Visibility (pre-computed)
+-- Maps each needs_signoff report to the users who should see it
+-- (based on the submitter's ancestor chain matching the user's
+-- accessible_facilities). Eliminates the 5-arm OR ancestor walk
+-- in the Sync Stream query, reducing to 1 bucket per user.
+-- Populated by refresh_needs_signoff_visibility() and auto-maintained
+-- by a trigger on v1.couchdb for needs_signoff reports.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS v1.report_needs_signoff_visible (
+  report_id       TEXT NOT NULL,
+  visible_to_user TEXT NOT NULL,
+  PRIMARY KEY (report_id, visible_to_user)
+);
+
+CREATE INDEX IF NOT EXISTS idx_rnsv_user
+  ON v1.report_needs_signoff_visible(visible_to_user);
+
+-- ============================================================
 -- 3. Purge Status
 -- Tracks which documents should be excluded from sync per role.
 -- Populated by the purge preprocessing service (Agent 4).
@@ -464,7 +482,112 @@ CREATE TRIGGER trg_auto_resolve_report_subject
   EXECUTE FUNCTION v1.auto_resolve_report_subject();
 
 -- ============================================================
--- 8. Publication for PowerSync logical replication
+-- 8. Needs-signoff Visibility
+-- Pre-computes which users can see each needs_signoff report.
+-- For each such report, walks the submitter's ancestor chain
+-- (up to 5 levels via recursive CTE), then finds all users
+-- whose accessible_facilities include any of those ancestors.
+-- ============================================================
+CREATE OR REPLACE FUNCTION v1.refresh_needs_signoff_visibility()
+RETURNS void
+LANGUAGE plpgsql AS $$
+BEGIN
+  TRUNCATE v1.report_needs_signoff_visible;
+
+  INSERT INTO v1.report_needs_signoff_visible (report_id, visible_to_user)
+  SELECT DISTINCT r._id, uaf.user_id
+  FROM v1.couchdb r
+  CROSS JOIN LATERAL (
+    -- Walk submitter's ancestor chain (recursive, up to 5 levels)
+    WITH RECURSIVE chain AS (
+      SELECT r.doc -> 'contact' ->> '_id' AS ancestor_id, 0 AS lvl
+      UNION ALL
+      SELECT
+        CASE
+          WHEN jsonb_typeof(c.doc -> 'parent') = 'object' THEN c.doc -> 'parent' ->> '_id'
+          WHEN jsonb_typeof(c.doc -> 'parent') = 'string' THEN c.doc ->> 'parent'
+        END,
+        chain.lvl + 1
+      FROM chain
+      JOIN v1.couchdb c ON c._id = chain.ancestor_id
+      WHERE chain.lvl < 5
+        AND chain.ancestor_id IS NOT NULL
+        AND NOT COALESCE(c._deleted, false)
+    )
+    SELECT ancestor_id FROM chain WHERE ancestor_id IS NOT NULL
+  ) ancestors
+  JOIN v1.user_accessible_facilities uaf ON uaf.facility_id = ancestors.ancestor_id
+  WHERE NOT COALESCE(r._deleted, false)
+    AND r.doc ->> 'type' = 'data_record'
+    AND r.doc ->> 'form' IS NOT NULL
+    AND r.doc -> 'fields' ->> 'needs_signoff' = 'true'
+    AND r.doc -> 'contact' ->> '_id' IS NOT NULL;
+END;
+$$;
+
+-- Single-report refresh: used by the auto-trigger when a needs_signoff
+-- report is inserted or updated.
+CREATE OR REPLACE FUNCTION v1.refresh_single_needs_signoff(p_report_id TEXT, p_contact_id TEXT)
+RETURNS void
+LANGUAGE plpgsql AS $$
+BEGIN
+  DELETE FROM v1.report_needs_signoff_visible WHERE report_id = p_report_id;
+
+  IF p_contact_id IS NULL THEN
+    RETURN;
+  END IF;
+
+  INSERT INTO v1.report_needs_signoff_visible (report_id, visible_to_user)
+  SELECT DISTINCT p_report_id, uaf.user_id
+  FROM (
+    WITH RECURSIVE chain AS (
+      SELECT p_contact_id AS ancestor_id, 0 AS lvl
+      UNION ALL
+      SELECT
+        CASE
+          WHEN jsonb_typeof(c.doc -> 'parent') = 'object' THEN c.doc -> 'parent' ->> '_id'
+          WHEN jsonb_typeof(c.doc -> 'parent') = 'string' THEN c.doc ->> 'parent'
+        END,
+        chain.lvl + 1
+      FROM chain
+      JOIN v1.couchdb c ON c._id = chain.ancestor_id
+      WHERE chain.lvl < 5
+        AND chain.ancestor_id IS NOT NULL
+        AND NOT COALESCE(c._deleted, false)
+    )
+    SELECT ancestor_id FROM chain WHERE ancestor_id IS NOT NULL
+  ) ancestors
+  JOIN v1.user_accessible_facilities uaf ON uaf.facility_id = ancestors.ancestor_id;
+END;
+$$;
+
+-- Auto-trigger: keeps report_needs_signoff_visible in sync with couchdb.
+-- Fires only for data_records (same WHEN clause as report_subjects trigger).
+CREATE OR REPLACE FUNCTION v1.auto_refresh_needs_signoff()
+RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+  IF NEW.doc -> 'fields' ->> 'needs_signoff' = 'true'
+     AND NEW.doc ->> 'form' IS NOT NULL
+     AND NOT COALESCE(NEW._deleted, false) THEN
+    PERFORM v1.refresh_single_needs_signoff(NEW._id, NEW.doc -> 'contact' ->> '_id');
+  ELSE
+    -- Not a needs_signoff report (or deleted) — remove any existing visibility rows
+    DELETE FROM v1.report_needs_signoff_visible WHERE report_id = NEW._id;
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS trg_auto_refresh_needs_signoff ON v1.couchdb;
+CREATE TRIGGER trg_auto_refresh_needs_signoff
+  AFTER INSERT OR UPDATE ON v1.couchdb
+  FOR EACH ROW
+  WHEN (NEW.doc ->> 'type' = 'data_record')
+  EXECUTE FUNCTION v1.auto_refresh_needs_signoff();
+
+-- ============================================================
+-- 9. Publication for PowerSync logical replication
 -- PowerSync reads changes via the PostgreSQL WAL.
 -- All tables referenced in Sync Streams must be published.
 -- ============================================================
@@ -475,6 +598,7 @@ CREATE PUBLICATION powersync FOR TABLE
   v1.user_accessible_facilities,
   v1.user_report_facilities,
   v1.report_subjects,
+  v1.report_needs_signoff_visible,
   v1.purge_status;
 
 -- ============================================================
@@ -510,5 +634,8 @@ SELECT v1.refresh_all_user_facilities();
 
 -- Pre-resolve report subjects (shortcode → UUID mapping)
 SELECT v1.refresh_report_subjects();
+
+-- Pre-compute needs_signoff visibility (ancestor chain → user mapping)
+SELECT v1.refresh_needs_signoff_visibility();
 
 COMMIT;

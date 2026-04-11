@@ -129,21 +129,20 @@ streams:
   # ================================================================
   # REPORT DATA — subject-matched + own + needs_signoff reports
   # ================================================================
-  # Three query groups, two CTEs:
-  #   report_facilities      → subject-matched reports (M buckets)
-  #   accessible_facilities  → needs_signoff ancestor chain (separate bucket set)
-  #   auth.parameter         → own reports (1 bucket)
+  # Three query groups, one CTE:
+  #   report_facilities  → subject-matched reports (M buckets)
+  #   auth.parameter     → own reports (1 bucket)
+  #   auth.user_id()     → needs_signoff via pre-computed visibility (1 bucket)
   #
   # Subject matching uses the pre-resolved report_subjects table (setup.sql
-  # section 7). Each report maps to a single subject UUID. Uses a nested
-  # subquery (not INNER JOIN) to avoid JOIN-induced bucket keys.
+  # section 7). Each report maps to a single subject UUID.
   # report_facilities contains UUIDs only (no shortcodes).
   #
-  # needs_signoff is here (not in accessible_data) because its 5-level
-  # ancestor chain walk creates 5 IN accessible_facilities references,
-  # which would inflate accessible_data's shared bucket count.
+  # needs_signoff uses pre-computed report_needs_signoff_visible table
+  # (setup.sql section 8) instead of the 5-level ancestor chain walk.
+  # The JOIN filter is auth.user_id() → 1 bucket (not 5× from OR arms).
   #
-  # Buckets: M (report_facilities) + N_signoff (accessible_facilities) + 1 (own)
+  # Buckets: M (report_facilities) + 1 (own) + 1 (needs_signoff) = M + 2
   report_data:
     auto_subscribe: true
     priority: 2
@@ -151,10 +150,6 @@ streams:
       report_facilities: |
         SELECT facility_id
         FROM "v1"."user_report_facilities"
-        WHERE user_id = auth.user_id()
-      accessible_facilities: |
-        SELECT facility_id
-        FROM "v1"."user_accessible_facilities"
         WHERE user_id = auth.user_id()
     queries:
       # Query 1: Reports whose pre-resolved subject matches report_facilities.
@@ -200,9 +195,10 @@ streams:
           AND reports.doc ->> 'type' = 'data_record'
           AND reports.doc ->> 'form' IS NOT NULL
           AND reports.doc -> 'contact' ->> '_id' = auth.parameter('contact_id')
-      # Query 3: needs_signoff reports (moved from accessible_data).
-      # Walks 5 levels of submitter ancestor chain to find supervisors.
-      # Uses accessible_facilities CTE (separate bucket set from report_facilities).
+      # Query 3: needs_signoff reports via pre-computed visibility.
+      # report_needs_signoff_visible maps (report_id, visible_to_user)
+      # pre-computed by walking submitter ancestor chains in PostgreSQL.
+      # The JOIN filter visible_to_user = auth.user_id() → 1 bucket.
       - |
         SELECT
           reports._id AS id,
@@ -215,17 +211,13 @@ streams:
           CAST(reports.doc -> 'fields' AS TEXT) AS fields,
           CAST(reports.doc AS TEXT) AS doc
         FROM "v1"."couchdb" reports
+        INNER JOIN "v1"."report_needs_signoff_visible" rnsv
+          ON rnsv.report_id = reports._id
+          AND rnsv.visible_to_user = auth.user_id()
         WHERE reports._deleted != true
           AND reports.doc ->> 'type' = 'data_record'
           AND reports.doc ->> 'form' IS NOT NULL
           AND reports.doc -> 'fields' ->> 'needs_signoff' = 'true'
-          AND (
-            reports.doc -> 'contact' ->> '_id' IN accessible_facilities
-            OR reports.doc -> 'contact' -> 'parent' ->> '_id' IN accessible_facilities
-            OR reports.doc -> 'contact' -> 'parent' -> 'parent' ->> '_id' IN accessible_facilities
-            OR reports.doc -> 'contact' -> 'parent' -> 'parent' -> 'parent' ->> '_id' IN accessible_facilities
-            OR reports.doc -> 'contact' -> 'parent' -> 'parent' -> 'parent' -> 'parent' ->> '_id' IN accessible_facilities
-          )
           AND (
             ifnull(reports.doc -> 'fields' ->> 'private', 'false') != 'true'
             OR reports.doc -> 'contact' ->> '_id' = auth.parameter('contact_id')
