@@ -66,6 +66,10 @@ sync_config:
             SELECT facility_id
             FROM "v1"."user_report_facilities"
             WHERE user_id = auth.user_id()
+          accessible_facilities: |
+            SELECT facility_id
+            FROM "v1"."user_accessible_facilities"
+            WHERE user_id = auth.user_id()
         query: |
           SELECT
             c._id AS id,
@@ -240,7 +244,7 @@ client_auth:
   jwks:
     keys:
       - kty: RSA
-        n: "xbn-lbZyne3nDbuSUTiImlTT2YbPEl9I81JZw5di-aPsmpHBQYeZDkHGa96i0f-w3ASFynj6UdIFILXU-hcC3NpV-owv1243rUG48xORdXykW_46UXTE7JGpzi-f_RJjZ-frqRR5-fTJteYUAQ96ETwq4uRmLuzrRWbXE9DpTtAkZjZqWBMIbdSGQ6MDc3CGazEkTVqLaBXS9SvpkT7sEq0F0Rllwha5xvvj9UVx0AoXqf2ij71y4LOKVFfjsNVIiDGUm1JXSdcJG32ArcX4S5dJ28mFiBC_IvKafeBFTWqUCukK6DM75RM3v6fy1cZ6dk6gQ_s1nqiA0YhbYhywhQ"
+        n: "uJv4x1pL6mQgbfp0XO4iN3X3FNiXnYFlSW-JsPEdIGrCSm2T-tzzVMQR8Ov_xHbR9ej9WlM62v1LVbUHpQmAWQAYCx90b5rYe9YxRSqd6zKgUS3NtdpyNyxGF_poDtg5Su81fGtlO9jtQHGUfqwnQ_hClX3Y5zi7ySp_v-l4IE2DH8FijYsNIVAybGle3VcTVsCDotvspe1LXQN07gjeJNFuqXRSXTSjhMC2ZY19cpX4fvvo4ffdVL5kBD1JZax164fAHFY-14yJ61rcnwC0G0O5stlK7rzVHy_ZMFNJb-b6gIzx1XQ52DY2Uu2kGzqvOFquvVksjFPQcd2jsTsZ_w"
         e: AQAB
         alg: RS256
         kid: cht-dev-key-1

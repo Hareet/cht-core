@@ -104,6 +104,13 @@ streams:
         SELECT facility_id
         FROM "v1"."user_report_facilities"
         WHERE user_id = auth.user_id()
+      # Local override of the global CTE — required because PowerSync
+      # v1.20.4 cannot resolve a stream that mixes local and global CTEs
+      # (causes "circular reference when resolving result set" error).
+      accessible_facilities: |
+        SELECT facility_id
+        FROM "v1"."user_accessible_facilities"
+        WHERE user_id = auth.user_id()
     query: |
       SELECT
         c._id AS id,
