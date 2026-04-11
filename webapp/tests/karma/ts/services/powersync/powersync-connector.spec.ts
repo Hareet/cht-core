@@ -780,4 +780,223 @@ describe('PowerSync Connector', () => {
       });
     });
   });
+
+  // ---------------------------------------------------------------------------
+  // Fetch timeout
+  // ---------------------------------------------------------------------------
+  describe('fetch timeout', () => {
+    let mockDb: any;
+
+    const createMockTransaction = (crud: any[]) => ({
+      crud,
+      complete: sinon.stub().resolves(),
+    });
+
+    beforeEach(() => {
+      mockDb = {
+        getNextCrudTransaction: sinon.stub(),
+        execute: sinon.stub().resolves(),
+      };
+    });
+
+    /**
+     * Helper: creates a fetch stub that respects the AbortSignal on the request.
+     * The fetch never resolves on its own — it only settles when the signal aborts.
+     * This simulates a hung server that accepts the connection but never responds.
+     */
+    function stubHungFetch() {
+      fetchStub.callsFake((_url: string, init: any) => {
+        return new Promise((_resolve, reject) => {
+          if (init?.signal) {
+            if (init.signal.aborted) {
+              reject(init.signal.reason ?? new DOMException('The operation was aborted.', 'AbortError'));
+              return;
+            }
+            init.signal.addEventListener('abort', () => {
+              reject(init.signal.reason ?? new DOMException('The operation was aborted.', 'AbortError'));
+            });
+          }
+          // Never resolves — simulates a hung server
+        });
+      });
+    }
+
+    describe('signal presence', () => {
+      it('should pass AbortSignal to credential fetch', async () => {
+        fetchStub.resolves(new Response(JSON.stringify({ token: 'test' }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        }));
+
+        await connector.fetchCredentials();
+
+        const [, opts] = fetchStub.firstCall.args;
+        expect(opts.signal).to.be.instanceOf(AbortSignal);
+      });
+
+      it('should pass AbortSignal to PUT upload fetch', async () => {
+        const tx = createMockTransaction([{
+          op: 'PUT',
+          table: 'contacts',
+          id: 'c1',
+          opData: { name: 'John', contact_type: 'person' },
+        }]);
+        mockDb.getNextCrudTransaction.resolves(tx);
+        fetchStub.resolves(new Response('{}', { status: 200 }));
+
+        await connector.uploadData(mockDb);
+
+        const [, opts] = fetchStub.firstCall.args;
+        expect(opts.signal).to.be.instanceOf(AbortSignal);
+      });
+
+      it('should pass AbortSignal to PATCH upload fetch', async () => {
+        const tx = createMockTransaction([{
+          op: 'PATCH',
+          table: 'contacts',
+          id: 'c1',
+          opData: { name: 'Updated', contact_type: 'person' },
+        }]);
+        mockDb.getNextCrudTransaction.resolves(tx);
+        fetchStub.resolves(new Response('{}', { status: 200 }));
+
+        await connector.uploadData(mockDb);
+
+        const [, opts] = fetchStub.firstCall.args;
+        expect(opts.signal).to.be.instanceOf(AbortSignal);
+      });
+
+      it('should pass AbortSignal to DELETE upload fetch', async () => {
+        const tx = createMockTransaction([{
+          op: 'DELETE',
+          table: 'contacts',
+          id: 'c1',
+          opData: { contact_type: 'person' },
+        }]);
+        mockDb.getNextCrudTransaction.resolves(tx);
+        fetchStub.resolves(new Response('{}', { status: 200 }));
+
+        await connector.uploadData(mockDb);
+
+        const [, opts] = fetchStub.firstCall.args;
+        expect(opts.signal).to.be.instanceOf(AbortSignal);
+      });
+    });
+
+    describe('timeout behavior', () => {
+      it('should reject credentials fetch when request times out', async () => {
+        const shortTimeout = new ChtPowerSyncConnector({
+          apiBaseUrl: 'http://localhost:5988/medic',
+          powerSyncUrl: 'http://localhost:8080',
+          fetchTimeoutMs: 50,
+        });
+        stubHungFetch();
+
+        try {
+          await shortTimeout.fetchCredentials();
+          expect.fail('should have thrown');
+        } catch (err: any) {
+          expect(err.name).to.equal('TimeoutError');
+        }
+      });
+
+      it('should reject upload when request times out', async () => {
+        const shortTimeout = new ChtPowerSyncConnector({
+          apiBaseUrl: 'http://localhost:5988/medic',
+          powerSyncUrl: 'http://localhost:8080',
+          fetchTimeoutMs: 50,
+        });
+
+        const tx = createMockTransaction([{
+          op: 'PUT',
+          table: 'contacts',
+          id: 'c1',
+          opData: { name: 'John', contact_type: 'person' },
+        }]);
+        mockDb.getNextCrudTransaction.resolves(tx);
+        stubHungFetch();
+
+        try {
+          await shortTimeout.uploadData(mockDb);
+          expect.fail('should have thrown');
+        } catch (err: any) {
+          expect(err.name).to.equal('TimeoutError');
+        }
+
+        // Transaction should NOT be completed on timeout — triggers PowerSync retry
+        expect(tx.complete.called).to.be.false;
+      });
+
+      it('should not complete transaction when second op in batch times out', async () => {
+        const shortTimeout = new ChtPowerSyncConnector({
+          apiBaseUrl: 'http://localhost:5988/medic',
+          powerSyncUrl: 'http://localhost:8080',
+          fetchTimeoutMs: 50,
+        });
+
+        const tx = createMockTransaction([
+          { op: 'PUT', table: 'contacts', id: 'c1', opData: { name: 'A', contact_type: 'person' } },
+          { op: 'PUT', table: 'contacts', id: 'c2', opData: { name: 'B', contact_type: 'person' } },
+        ]);
+        mockDb.getNextCrudTransaction.resolves(tx);
+
+        // First call succeeds, second hangs until timeout
+        fetchStub.onFirstCall().resolves(new Response('{}', { status: 200 }));
+        fetchStub.onSecondCall().callsFake((_url: string, init: any) => {
+          return new Promise((_resolve, reject) => {
+            if (init?.signal) {
+              init.signal.addEventListener('abort', () => {
+                reject(init.signal.reason ?? new DOMException('Aborted', 'AbortError'));
+              });
+            }
+          });
+        });
+
+        try {
+          await shortTimeout.uploadData(mockDb);
+          expect.fail('should have thrown');
+        } catch (err: any) {
+          // Timeout on second op
+          expect(err).to.be.instanceOf(DOMException);
+        }
+
+        expect(tx.complete.called).to.be.false;
+      });
+
+      it('should use custom fetchTimeoutMs when provided', async () => {
+        const customTimeout = new ChtPowerSyncConnector({
+          apiBaseUrl: 'http://localhost:5988/medic',
+          powerSyncUrl: 'http://localhost:8080',
+          fetchTimeoutMs: 5000,
+        });
+
+        fetchStub.resolves(new Response(JSON.stringify({ token: 'test' }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        }));
+
+        await customTimeout.fetchCredentials();
+
+        // Signal should be present (we can't directly read the timeout value
+        // from the signal, but we verify it's there)
+        const [, opts] = fetchStub.firstCall.args;
+        expect(opts.signal).to.be.instanceOf(AbortSignal);
+        expect(opts.signal.aborted).to.be.false;
+      });
+
+      it('should use default timeout when fetchTimeoutMs is not configured', async () => {
+        // connector uses default config (no fetchTimeoutMs)
+        fetchStub.resolves(new Response(JSON.stringify({ token: 'test' }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        }));
+
+        await connector.fetchCredentials();
+
+        const [, opts] = fetchStub.firstCall.args;
+        expect(opts.signal).to.be.instanceOf(AbortSignal);
+        expect(opts.signal.aborted).to.be.false;
+      });
+    });
+  });
 });

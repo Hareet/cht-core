@@ -41,6 +41,8 @@ export interface ChtConnectorConfig {
     roles?: string[];
     reportDepth?: number;
   };
+  /** Timeout for HTTP requests in milliseconds (default: 30000) */
+  fetchTimeoutMs?: number;
 }
 
 /**
@@ -50,11 +52,29 @@ export interface ChtConnectorConfig {
  */
 const PERSON_TYPES = new Set(['person']);
 
+/**
+ * Default timeout for HTTP requests (30 seconds).
+ * Prevents hung requests from stalling the upload queue indefinitely.
+ */
+const DEFAULT_FETCH_TIMEOUT_MS = 30_000;
+
 export class ChtPowerSyncConnector implements PowerSyncBackendConnector {
   private config: ChtConnectorConfig;
 
   constructor(config: ChtConnectorConfig) {
     this.config = config;
+  }
+
+  /**
+   * Fetch with a per-request timeout. Prevents hung requests from
+   * stalling the upload queue or credential refresh indefinitely.
+   * On timeout, throws a TimeoutError which triggers PowerSync retry.
+   */
+  private fetchWithTimeout(url: string, init: RequestInit = {}): Promise<Response> {
+    return fetch(url, {
+      ...init,
+      signal: AbortSignal.timeout(this.config.fetchTimeoutMs ?? DEFAULT_FETCH_TIMEOUT_MS),
+    });
   }
 
   /**
@@ -83,7 +103,7 @@ export class ChtPowerSyncConnector implements PowerSyncBackendConnector {
     }
 
     // Production mode: fetch from CHT API
-    const response = await fetch(`${this.config.apiBaseUrl}/api/v1/powersync-token`, {
+    const response = await this.fetchWithTimeout(`${this.config.apiBaseUrl}/api/v1/powersync-token`, {
       credentials: 'same-origin',
       headers: { 'Accept': 'application/json' },
     });
@@ -129,7 +149,7 @@ export class ChtPowerSyncConnector implements PowerSyncBackendConnector {
         switch (op.op) {
           case UpdateType.PUT: {
             const body = this.transformForApi(op.table, { id: op.id, ...op.opData });
-            const response = await fetch(url, {
+            const response = await this.fetchWithTimeout(url, {
               method: 'POST',
               credentials: 'same-origin',
               headers: {
@@ -144,7 +164,7 @@ export class ChtPowerSyncConnector implements PowerSyncBackendConnector {
 
           case UpdateType.PATCH: {
             const body = this.transformForApi(op.table, { id: op.id, ...op.opData });
-            const response = await fetch(`${url}/${op.id}`, {
+            const response = await this.fetchWithTimeout(`${url}/${op.id}`, {
               method: 'PUT',
               credentials: 'same-origin',
               headers: {
@@ -158,7 +178,7 @@ export class ChtPowerSyncConnector implements PowerSyncBackendConnector {
           }
 
           case UpdateType.DELETE: {
-            const response = await fetch(`${url}/${op.id}`, {
+            const response = await this.fetchWithTimeout(`${url}/${op.id}`, {
               method: 'DELETE',
               credentials: 'same-origin',
               headers: { 'Accept': 'application/json' },

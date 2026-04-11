@@ -3,7 +3,7 @@ import sinon from 'sinon';
 import { expect } from 'chai';
 import { NgZone } from '@angular/core';
 
-import { PowerSyncService } from '@mm-services/powersync/powersync.service';
+import { PowerSyncService, PowerSyncStatus } from '@mm-services/powersync/powersync.service';
 import { SessionService } from '@mm-services/session.service';
 import { LocationService } from '@mm-services/location.service';
 
@@ -844,6 +844,112 @@ describe('PowerSync Service', () => {
         // Both calls should have succeeded sequentially
         expect(mockDb.disconnect.callCount).to.equal(2);
         expect(mockDb.connect.callCount).to.equal(2);
+      });
+    });
+
+    describe('status$ transitions', () => {
+      it('should track connected → synced progression', () => {
+        const emissions: PowerSyncStatus[] = [];
+        service.status$.subscribe(status => emissions.push({ ...status }));
+
+        // Initial state
+        expect(emissions).to.have.length(1);
+        expect(emissions[0].connected).to.be.false;
+        expect(emissions[0].hasSynced).to.be.false;
+
+        // Simulate: connecting
+        (service as any).statusSubject.next({
+          ...service.getCurrentStatus(),
+          connecting: true,
+        });
+        expect(emissions).to.have.length(2);
+        expect(emissions[1].connecting).to.be.true;
+        expect(emissions[1].connected).to.be.false;
+
+        // Simulate: connected
+        (service as any).statusSubject.next({
+          ...service.getCurrentStatus(),
+          connecting: false,
+          connected: true,
+        });
+        expect(emissions).to.have.length(3);
+        expect(emissions[2].connected).to.be.true;
+        expect(emissions[2].connecting).to.be.false;
+
+        // Simulate: first sync complete
+        (service as any).statusSubject.next({
+          ...service.getCurrentStatus(),
+          hasSynced: true,
+          lastSyncedAt: new Date('2026-04-11T10:00:00Z'),
+        });
+        expect(emissions).to.have.length(4);
+        expect(emissions[3].hasSynced).to.be.true;
+        expect(emissions[3].lastSyncedAt).to.deep.equal(new Date('2026-04-11T10:00:00Z'));
+      });
+
+      it('should reflect upload errors in status$', () => {
+        const emissions: PowerSyncStatus[] = [];
+        service.status$.subscribe(status => emissions.push({ ...status }));
+
+        const uploadError = new Error('Upload failed: 500 Internal Server Error');
+        (service as any).statusSubject.next({
+          ...service.getCurrentStatus(),
+          uploading: true,
+          uploadError,
+        });
+
+        expect(emissions).to.have.length(2);
+        expect(emissions[1].uploading).to.be.true;
+        expect(emissions[1].uploadError).to.equal(uploadError);
+        expect(emissions[1].uploadError!.message).to.include('500');
+      });
+
+      it('should reflect download errors in status$', () => {
+        const emissions: PowerSyncStatus[] = [];
+        service.status$.subscribe(status => emissions.push({ ...status }));
+
+        const downloadError = new Error('Sync stream disconnected');
+        (service as any).statusSubject.next({
+          ...service.getCurrentStatus(),
+          downloadError,
+        });
+
+        expect(emissions).to.have.length(2);
+        expect(emissions[1].downloadError).to.equal(downloadError);
+      });
+
+      it('should clear errors on recovery', () => {
+        const emissions: PowerSyncStatus[] = [];
+        service.status$.subscribe(status => emissions.push({ ...status }));
+
+        // Error state
+        (service as any).statusSubject.next({
+          ...service.getCurrentStatus(),
+          uploadError: new Error('Network error'),
+        });
+
+        // Recovery: error cleared
+        (service as any).statusSubject.next({
+          ...service.getCurrentStatus(),
+          uploadError: undefined,
+        });
+
+        expect(emissions).to.have.length(3);
+        expect(emissions[2].uploadError).to.be.undefined;
+      });
+
+      it('getCurrentStatus should reflect the latest emission', () => {
+        (service as any).statusSubject.next({
+          ...service.getCurrentStatus(),
+          connected: true,
+          hasSynced: true,
+          lastSyncedAt: new Date('2026-04-11'),
+        });
+
+        const status = service.getCurrentStatus();
+        expect(status.connected).to.be.true;
+        expect(status.hasSynced).to.be.true;
+        expect(status.lastSyncedAt).to.deep.equal(new Date('2026-04-11'));
       });
     });
 
