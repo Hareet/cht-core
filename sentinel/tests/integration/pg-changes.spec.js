@@ -710,6 +710,157 @@ const testLiveFeedNoDuplicateOnScheduledPoll = async () => {
   }
 };
 
+// ─── Test: since:'now' resolves to fixed timestamp and detects changes ──
+const testSinceNowCursorResolution = async () => {
+  console.log('\n--- since:"now" Cursor Resolution ---');
+
+  // Start a live feed with since:'now' — the CouchDB convention that
+  // config.js uses to watch for settings changes.
+  const feed = new PgChangesFeed({
+    live: true,
+    since: 'now',
+    batchSize: 100,
+    pollInterval: 120000, // effectively disabled — rely on NOTIFY
+  });
+
+  const changes = [];
+  feed.on('change', c => changes.push(c));
+  await feed.start();
+
+  // Verify the cursor was resolved from the literal 'now' to a real timestamp
+  const cursor = feed.seq;
+  if (!cursor || cursor === 'now') {
+    fail('since:now resolution', `cursor not resolved: ${cursor}`);
+    feed.cancel();
+    return;
+  }
+  const { timestamp } = PgChangesFeed.parseCursor(cursor);
+  if (timestamp && timestamp.match(/^\d{4}-\d{2}-\d{2}T/)) {
+    pass(`Cursor resolved to real timestamp: ${timestamp.substring(0, 26)}`);
+  } else {
+    fail('since:now resolution', `expected ISO timestamp, got: ${timestamp}`);
+    feed.cancel();
+    return;
+  }
+
+  // Wait for LISTEN to settle
+  await sleep(500);
+
+  // Insert a doc after the feed started
+  const docId = `test:since-now:${Date.now()}`;
+  await insertTestDoc(docId, 'data_record');
+
+  // Wait for NOTIFY → debounce → poll
+  await sleep(1500);
+  feed.cancel();
+
+  if (changes.some(c => c.id === docId)) {
+    pass(`since:"now" feed detected change inserted after start`);
+  } else {
+    fail('since:now detection',
+      `doc ${docId} not found among ${changes.length} changes`);
+  }
+};
+
+// ─── Test: parseCursor('now') safety net returns null cursor ─────────
+const testParseCursorNowSafetyNet = () => {
+  console.log('\n--- parseCursor("now") Safety Net ---');
+
+  const { timestamp, id } = PgChangesFeed.parseCursor('now');
+  if (timestamp === null && id === '') {
+    pass('parseCursor("now") returns null cursor (safety net)');
+  } else {
+    fail('parseCursor now', `expected null cursor, got timestamp=${timestamp} id=${id}`);
+  }
+};
+
+// ─── Test: cancel() during active poll does not emit error ───────────
+const testCancelDuringPollNoError = async () => {
+  console.log('\n--- Cancel During Active Poll: No Spurious Errors ---');
+
+  const feed = new PgChangesFeed({
+    live: true,
+    since: null,        // start from beginning — forces a real poll
+    batchSize: 5,       // small batch to keep poll active longer
+    pollInterval: 120000,
+  });
+
+  const errors = [];
+  feed.on('error', err => errors.push(err));
+  // Don't await start — let the initial poll begin
+  const startPromise = feed.start();
+
+  // Cancel almost immediately while the initial poll is likely in-flight
+  await sleep(10);
+  feed.cancel();
+
+  // Wait for any async aftermath to settle
+  await sleep(500);
+
+  // Also await the start promise to avoid unhandled rejection
+  try {
+    await startPromise;
+  } catch {
+    // Expected — start may throw because pool was closed
+  }
+
+  if (errors.length === 0) {
+    pass('No error events emitted after cancel()');
+  } else {
+    fail('cancel-no-error',
+      `${errors.length} error(s) emitted after cancel: ${errors.map(e => e.message).join('; ')}`);
+  }
+};
+
+// ─── Test: since:'now' with polling (no NOTIFY) still detects changes ──
+const testSinceNowPollingOnly = async () => {
+  console.log('\n--- since:"now" with Polling Only (no NOTIFY) ---');
+
+  // Use a non-live feed started with since:'now' to verify that the
+  // resolved cursor works correctly with pure polling (no LISTEN).
+  const feed = new PgChangesFeed({
+    live: false,
+    since: 'now',
+    batchSize: 100,
+  });
+
+  // Start should resolve 'now' and do an initial poll (finding 0 rows)
+  await feed.start();
+  const cursorAfterStart = feed.seq;
+  feed.cancel();
+
+  // Verify cursor was resolved
+  const { timestamp } = PgChangesFeed.parseCursor(cursorAfterStart);
+  if (!timestamp || !timestamp.match(/^\d{4}-\d{2}-\d{2}T/)) {
+    fail('since:now polling', `cursor not resolved: ${cursorAfterStart}`);
+    return;
+  }
+
+  // Insert a doc after the resolved cursor
+  const docId = `test:since-now-poll:${Date.now()}`;
+  await insertTestDoc(docId, 'data_record');
+  await sleep(200);
+
+  // Start a new feed from the resolved cursor
+  const feed2 = new PgChangesFeed({
+    live: false,
+    since: cursorAfterStart,
+    batchSize: 100,
+  });
+  const changes = [];
+  feed2.on('change', c => changes.push(c));
+  await feed2.start();
+  await sleep(300);
+  feed2.cancel();
+
+  if (changes.some(c => c.id === docId)) {
+    pass(`Resolved cursor correctly captures changes in subsequent polls`);
+  } else {
+    fail('since:now polling',
+      `doc ${docId} not found among ${changes.length} changes`);
+  }
+};
+
 // ─── Main ──────────────────────────────────────────────────────────────
 const run = async () => {
   console.log('PostgreSQL Changes Detection — Integration Tests\n');
@@ -744,6 +895,10 @@ const run = async () => {
     await testNoDuplicatesOnConsecutivePolls();
     await testMicrosecondPrecisionInCursor();
     await testLiveFeedNoDuplicateOnScheduledPoll();
+    testParseCursorNowSafetyNet();
+    await testSinceNowCursorResolution();
+    await testSinceNowPollingOnly();
+    await testCancelDuringPollNoError();
   } finally {
     await cleanup();
     await pool.end();

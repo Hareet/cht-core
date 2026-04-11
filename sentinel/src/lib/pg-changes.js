@@ -163,6 +163,13 @@ class PgChangesFeed extends EventEmitter {
     if (!seq || seq === '0') {
       return { timestamp: null, id: '' };
     }
+    // CouchDB uses 'now' to mean "start from current point".  If this
+    // literal leaks into a poll query it re-evaluates on every execution,
+    // silently missing every change.  start() resolves it to a real
+    // timestamp; treat it as null here as a safety net.
+    if (seq === 'now') {
+      return { timestamp: null, id: '' };
+    }
     const parts = String(seq).split('::');
     const timestamp = parts[0];
     // Guard against cursors built from rows with NULL saved_timestamp,
@@ -194,6 +201,24 @@ class PgChangesFeed extends EventEmitter {
     this._pool.on('error', (err) => {
       logger.error('pg-changes: Pool error: %o', err);
     });
+
+    // Resolve CouchDB-style 'now' cursor to an actual PostgreSQL server
+    // timestamp so it doesn't re-evaluate on every poll.  Without this,
+    // 'now'::timestamptz re-evaluates to the current time on each query
+    // and every change inserted between polls is silently missed.
+    if (this._since === 'now') {
+      const client = await this._pool.connect();
+      try {
+        const { rows } = await client.query(
+          `SELECT to_char(NOW() AT TIME ZONE 'UTC',
+                  'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS ts`
+        );
+        this._since = PgChangesFeed.buildCursor(rows[0].ts, '\uffff');
+        logger.debug('pg-changes: Resolved "now" cursor to %s', this._since);
+      } finally {
+        client.release();
+      }
+    }
 
     if (this._live) {
       this._listener = new NotifyListener(this._config);
@@ -354,6 +379,12 @@ class PgChangesFeed extends EventEmitter {
         client.release();
       }
     } catch (err) {
+      // After cancel(), in-flight pool operations throw connection-closed
+      // errors.  Emitting them would surprise callers that already tore
+      // down their listeners, so swallow errors once we're stopped.
+      if (!this._running) {
+        return;
+      }
       logger.error('pg-changes: Poll query error: %o', err);
       this.emit('error', err);
     } finally {
