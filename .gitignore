@@ -70,4 +70,4 @@ release-notes.md
 .devcontainer/.current-phase
 .devcontainer/.gates/
 .devcontainer/.env
-.devcontainer/powersync-config/
+.devcontainer/powersync-config/*.pem

@@ -3,8 +3,8 @@
 ## Decision Document: National-Scale eCHIS Deployment (100K+ CHWs, 47 Counties)
 
 **Date:** 2026-04-10
-**Updated:** 2026-04-11 — Empirical bucket semantics test completed (see Section 1.1)
-**Status:** Empirically validated. Consolidation strategy confirmed viable.
+**Updated:** 2026-04-11 — Empirical bucket semantics test + consolidation + end-to-end validation
+**Status:** Consolidation implemented and validated. ac1 (1,010 facilities) syncs at 6,040 buckets.
 **Authors:** Hareet (CHT migration lead) + Claude Code analysis
 
 ---
@@ -13,12 +13,36 @@
 
 **Recommendation: Stream consolidation with CTE sharing.** Empirical testing on 2026-04-11 confirmed that all query patterns (JOIN, inline subquery, named CTE) create N buckets per facility — there is no "1 bucket" collapse. However, **multiple queries within one stream sharing the same CTE DO share buckets** (confirmed: 2 queries, 15 facilities = 15 buckets, not 30).
 
-The strategy: merge streams that use the same CTE (`accessible_facilities` or `report_facilities`) into consolidated streams with `queries:[]`. Combined with raising `max_parameter_query_results` to 5,000 via `api.parameters.max_parameter_query_results`, this reduces total buckets from `9×N` to `N_accessible + N_report + 4`.
+The strategy: merge streams that use the same CTE (`accessible_facilities` or `report_facilities`) into consolidated streams with `queries:[]`. Combined with raising both PowerSync limits via `api.parameters`, this reduces total buckets from `9×N` to `N_accessible + N_report + 4`.
 
-**Projected bucket counts after consolidation:**
-- CHW (30 facilities): ~70 buckets (was ~270)
-- Supervisor (200 facilities): ~450 buckets (was ~1,800)
-- County admin (1,010 facilities): ~2,500 buckets (was ~9,000, fits in 5,000 limit)
+### PowerSync Service Limits (two separate config keys)
+
+```yaml
+api:
+  parameters:
+    max_parameter_query_results: 10000  # CTE expansion into IN ($1,...,$N) — default 1000
+    max_buckets_per_connection: 10000   # Total buckets per user — default 1000
+```
+
+These are distinct limits producing different PSYNC_S2305 error messages. Both must be raised for large-facility users.
+
+### Actual Bucket Counts (validated 2026-04-11)
+
+| User | Facilities | accessible_data | report_data | Others | Total | Status |
+|------|-----------|----------------|-------------|--------|-------|--------|
+| chw_user (small) | ~6 | 13 | 23 | 4 | **40** | Excellent |
+| threshold_user | 200 | 400 | 1 | 4 | **405** | Good |
+| threshold_user | 500 | 1,000 | 1 | 4 | **1,005** | OK (needs raised limits) |
+| ac1 | 1,010 | 2,021 | 4,015 | 4 | **6,040** | Works (limits at 10K) |
+
+**Why the multiplier:** `accessible_data` creates ~2× buckets per facility (contacts query matches on both `_id` and `parent_id`). `report_data` creates ~4× because `user_report_facilities` includes both UUIDs and shortcodes (patient_id, place_id).
+
+**Performance boundary:** PowerSync docs state sync latency scales linearly with bucket count. At 6,040 buckets, expect ~6× baseline latency per incremental sync. Acceptable for initial sync and CHW-scale users (40 buckets = negligible overhead). Supervisors (~1,000 buckets) should be fine. County admins (~6,000 buckets) may experience slower incremental sync on mobile — needs real-device benchmarking.
+
+**Optimization opportunities to reduce multiplier:**
+1. Split contacts CTE into two: one for `_id` match, one for `parent` match — may reduce bucket duplication
+2. Exclude shortcodes from `user_report_facilities` and match reports by UUID only — would halve report_data buckets
+3. Use subscription parameters for on-demand report loading (not viable for offline-first CHWs)
 
 ### 1.1 Empirical Test Results (2026-04-11)
 
