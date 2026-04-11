@@ -62,6 +62,33 @@ CREATE INDEX IF NOT EXISTS idx_urf_facility
   ON v1.user_report_facilities(facility_id);
 
 -- ============================================================
+-- 2c. Report Subjects (pre-resolved)
+-- Maps each report to its single resolved subject UUID.
+-- Eliminates the need for 9 OR arms and shortcodes in the
+-- Sync Stream query, reducing report_data from 4× to 1× buckets.
+-- Populated by refresh_report_subjects() and auto-maintained
+-- by a trigger on v1.couchdb.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS v1.report_subjects (
+  report_id  TEXT PRIMARY KEY,
+  subject_id TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_report_subjects_subject
+  ON v1.report_subjects(subject_id);
+
+-- Indexes for shortcode → UUID resolution during subject resolution.
+-- Reports reference subjects by shortcode (e.g., patient_id="13602").
+-- These indexes make the lookup fast during refresh_report_subjects().
+CREATE INDEX IF NOT EXISTS idx_couchdb_patient_id
+  ON v1.couchdb ((doc ->> 'patient_id'))
+  WHERE doc ->> 'patient_id' IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_couchdb_place_id
+  ON v1.couchdb ((doc ->> 'place_id'))
+  WHERE doc ->> 'place_id' IS NOT NULL;
+
+-- ============================================================
 -- 3. Purge Status
 -- Tracks which documents should be excluded from sync per role.
 -- Populated by the purge preprocessing service (Agent 4).
@@ -201,6 +228,25 @@ BEGIN
   )
   SELECT p_user_id, _id, depth FROM descendants;
 
+  -- Step 1.5: Expand to include direct children of all descendants.
+  -- In CHT, a person's replication key is parent._id, so if the parent
+  -- is in the subject list, the person is replicated even if the person
+  -- is at depth > replication_depth. This step pre-computes that expansion.
+  -- MUST run BEFORE Step 2 (ancestors) to avoid over-including children
+  -- of ancestor places (e.g., sibling clinics under the parent HC).
+  INSERT INTO v1.user_accessible_facilities (user_id, facility_id, depth)
+  SELECT DISTINCT p_user_id, c._id, uaf.depth + 1
+  FROM v1.couchdb c
+  JOIN v1.user_accessible_facilities uaf
+    ON uaf.user_id = p_user_id
+    AND (
+      c.doc -> 'parent' ->> '_id' = uaf.facility_id
+      OR (jsonb_typeof(c.doc -> 'parent') = 'string' AND c.doc ->> 'parent' = uaf.facility_id)
+    )
+  WHERE NOT COALESCE(c._deleted, false)
+    AND c.doc ->> 'type' IN ('contact', 'person', 'clinic', 'health_center', 'district_hospital')
+  ON CONFLICT (user_id, facility_id) DO NOTHING;
+
   -- Step 2: Walk hierarchy UPWARD from user's facility (ancestors)
   -- Adds parent places so user can see their HC, county, etc.
   -- Ancestors get depth 0 (same as facility) since they're structural.
@@ -287,35 +333,11 @@ BEGIN
       OR (SELECT report_depth FROM v1.user_settings WHERE user_id = p_user_id) < 0
     );
 
-  -- Step 5b: Add shortcodes (patient_id, place_id) directly to report_facilities.
-  -- CHT reports reference subjects by shortcode (e.g., patient_id="13602").
-  -- The shortcode inherits the depth of the contact it belongs to, so
-  -- report_depth filtering is applied here too.
-  INSERT INTO v1.user_report_facilities (user_id, facility_id)
-  SELECT p_user_id, c.doc ->> 'patient_id'
-  FROM v1.couchdb c
-  JOIN v1.user_accessible_facilities uaf
-    ON c._id = uaf.facility_id AND uaf.user_id = p_user_id
-  WHERE c.doc ->> 'patient_id' IS NOT NULL
-    AND NOT COALESCE(c._deleted, false)
-    AND (
-      uaf.depth <= (SELECT report_depth FROM v1.user_settings WHERE user_id = p_user_id)
-      OR (SELECT report_depth FROM v1.user_settings WHERE user_id = p_user_id) < 0
-    )
-  ON CONFLICT (user_id, facility_id) DO NOTHING;
-
-  INSERT INTO v1.user_report_facilities (user_id, facility_id)
-  SELECT p_user_id, c.doc ->> 'place_id'
-  FROM v1.couchdb c
-  JOIN v1.user_accessible_facilities uaf
-    ON c._id = uaf.facility_id AND uaf.user_id = p_user_id
-  WHERE c.doc ->> 'place_id' IS NOT NULL
-    AND NOT COALESCE(c._deleted, false)
-    AND (
-      uaf.depth <= (SELECT report_depth FROM v1.user_settings WHERE user_id = p_user_id)
-      OR (SELECT report_depth FROM v1.user_settings WHERE user_id = p_user_id) < 0
-    )
-  ON CONFLICT (user_id, facility_id) DO NOTHING;
+  -- Step 5b: REMOVED — shortcodes no longer needed in user_report_facilities.
+  -- Subject resolution is now handled by the report_subjects table, which
+  -- pre-resolves shortcodes to UUIDs. The report_data Sync Stream query
+  -- JOINs against report_subjects and matches subject_id IN report_facilities
+  -- (UUIDs only). This eliminates the 2× bucket multiplier from shortcodes.
 END;
 $$;
 
@@ -336,7 +358,113 @@ END;
 $$;
 
 -- ============================================================
--- 7. Publication for PowerSync logical replication
+-- 7. Report Subject Resolution
+-- Resolves a report's subject to a single UUID by following
+-- CHT's getSubject() priority chain:
+--   patient_id → fields.patient_id → place_id → fields.place_id
+--   → patient_uuid → fields.patient_uuid → place_uuid
+--   → fields.place_uuid → contact._id
+-- Shortcodes (patient_id, place_id) are resolved by looking up
+-- the contact whose shortcode matches.
+-- ============================================================
+CREATE OR REPLACE FUNCTION v1.resolve_report_subject(p_doc JSONB)
+RETURNS TEXT
+LANGUAGE sql STABLE AS $$
+  SELECT COALESCE(
+    -- 1. patient_id shortcode → contact UUID
+    (SELECT c._id FROM v1.couchdb c
+     WHERE c.doc ->> 'patient_id' = p_doc ->> 'patient_id'
+       AND p_doc ->> 'patient_id' IS NOT NULL AND p_doc ->> 'patient_id' != ''
+       AND NOT COALESCE(c._deleted, false)
+       AND c.doc ->> 'type' IN ('contact', 'person', 'clinic', 'health_center', 'district_hospital')
+     LIMIT 1),
+    -- 2. fields.patient_id shortcode → contact UUID
+    (SELECT c._id FROM v1.couchdb c
+     WHERE c.doc ->> 'patient_id' = p_doc -> 'fields' ->> 'patient_id'
+       AND p_doc -> 'fields' ->> 'patient_id' IS NOT NULL
+       AND p_doc -> 'fields' ->> 'patient_id' != ''
+       AND NOT COALESCE(c._deleted, false)
+       AND c.doc ->> 'type' IN ('contact', 'person', 'clinic', 'health_center', 'district_hospital')
+     LIMIT 1),
+    -- 3. place_id shortcode → place UUID
+    (SELECT c._id FROM v1.couchdb c
+     WHERE c.doc ->> 'place_id' = p_doc ->> 'place_id'
+       AND p_doc ->> 'place_id' IS NOT NULL AND p_doc ->> 'place_id' != ''
+       AND NOT COALESCE(c._deleted, false)
+       AND c.doc ->> 'type' IN ('contact', 'person', 'clinic', 'health_center', 'district_hospital')
+     LIMIT 1),
+    -- 4. fields.place_id shortcode → place UUID
+    (SELECT c._id FROM v1.couchdb c
+     WHERE c.doc ->> 'place_id' = p_doc -> 'fields' ->> 'place_id'
+       AND p_doc -> 'fields' ->> 'place_id' IS NOT NULL
+       AND p_doc -> 'fields' ->> 'place_id' != ''
+       AND NOT COALESCE(c._deleted, false)
+       AND c.doc ->> 'type' IN ('contact', 'person', 'clinic', 'health_center', 'district_hospital')
+     LIMIT 1),
+    -- 5-9: UUID fields (no resolution needed, use directly)
+    NULLIF(p_doc ->> 'patient_uuid', ''),
+    NULLIF(p_doc -> 'fields' ->> 'patient_uuid', ''),
+    NULLIF(p_doc ->> 'place_uuid', ''),
+    NULLIF(p_doc -> 'fields' ->> 'place_uuid', ''),
+    NULLIF(p_doc -> 'contact' ->> '_id', '')
+  );
+$$;
+
+-- Batch-refresh all report subjects. Call after data loads or
+-- when contacts change (shortcode→UUID mapping may change).
+CREATE OR REPLACE FUNCTION v1.refresh_report_subjects()
+RETURNS void
+LANGUAGE plpgsql AS $$
+BEGIN
+  TRUNCATE v1.report_subjects;
+
+  INSERT INTO v1.report_subjects (report_id, subject_id)
+  SELECT report_id, subject_id
+  FROM (
+    SELECT r._id AS report_id,
+           v1.resolve_report_subject(r.doc) AS subject_id
+    FROM v1.couchdb r
+    WHERE r.doc ->> 'type' = 'data_record'
+      AND r.doc ->> 'form' IS NOT NULL
+      AND NOT COALESCE(r._deleted, false)
+  ) resolved
+  WHERE subject_id IS NOT NULL;
+END;
+$$;
+
+-- Auto-resolve trigger: keeps report_subjects in sync with couchdb.
+-- Fires only for data_records (reports) to minimize overhead.
+CREATE OR REPLACE FUNCTION v1.auto_resolve_report_subject()
+RETURNS trigger
+LANGUAGE plpgsql AS $$
+DECLARE
+  v_subject_id TEXT;
+BEGIN
+  IF NEW.doc ->> 'form' IS NOT NULL AND NOT COALESCE(NEW._deleted, false) THEN
+    v_subject_id := v1.resolve_report_subject(NEW.doc);
+    IF v_subject_id IS NOT NULL THEN
+      INSERT INTO v1.report_subjects (report_id, subject_id)
+      VALUES (NEW._id, v_subject_id)
+      ON CONFLICT (report_id) DO UPDATE SET subject_id = EXCLUDED.subject_id;
+    ELSE
+      DELETE FROM v1.report_subjects WHERE report_id = NEW._id;
+    END IF;
+  ELSIF COALESCE(NEW._deleted, false) THEN
+    DELETE FROM v1.report_subjects WHERE report_id = NEW._id;
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS trg_auto_resolve_report_subject ON v1.couchdb;
+CREATE TRIGGER trg_auto_resolve_report_subject
+  AFTER INSERT OR UPDATE ON v1.couchdb
+  FOR EACH ROW
+  WHEN (NEW.doc ->> 'type' = 'data_record')
+  EXECUTE FUNCTION v1.auto_resolve_report_subject();
+
+-- ============================================================
+-- 8. Publication for PowerSync logical replication
 -- PowerSync reads changes via the PostgreSQL WAL.
 -- All tables referenced in Sync Streams must be published.
 -- ============================================================
@@ -346,6 +474,7 @@ CREATE PUBLICATION powersync FOR TABLE
   v1.user_settings,
   v1.user_accessible_facilities,
   v1.user_report_facilities,
+  v1.report_subjects,
   v1.purge_status;
 
 -- ============================================================
@@ -378,5 +507,8 @@ ON CONFLICT (user_id) DO NOTHING;
 
 -- Compute accessible facilities for seed users
 SELECT v1.refresh_all_user_facilities();
+
+-- Pre-resolve report subjects (shortcode → UUID mapping)
+SELECT v1.refresh_report_subjects();
 
 COMMIT;

@@ -44,6 +44,12 @@ const USERS = {
     report_depth: -1,
     can_view_unallocated: true,  // admins can see unassigned reports
   },
+  bucket_test_user: {
+    user_id: 'org.couchdb.user:bucket_test_user',
+    contact_id: 'bucket-test-contact-1',
+    roles: ['chw'],
+    report_depth: 1,
+  },
 };
 
 function md5(str) {
