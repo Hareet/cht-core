@@ -93,11 +93,53 @@ CREATE MATERIALIZED VIEW IF NOT EXISTS v1.unpurged_contacts AS
   SELECT ps.doc_id, ps.role_hash
   FROM v1.purge_status ps;
 
--- Note: For the PoC, we use a simplified approach where purge
--- exclusion is handled at the query level with direct conditions
--- (e.g., task age > 60 days) rather than the full purge.js logic.
--- The materialized view above is a placeholder for the full
--- purge preprocessing pipeline.
+-- Purge exclusion strategy:
+-- PowerSync Sync Streams cannot do NOT IN (subquery) or LEFT JOIN.
+-- Instead, when the purge preprocessor (Agent 4) inserts into purge_status,
+-- a trigger checks whether ALL active roles have purged the doc. Only when
+-- every role has purged it does the trigger soft-delete the couchdb row.
+-- The Sync Streams already filter on _deleted != true, so universally-purged
+-- docs are automatically excluded from all users.
+--
+-- Per-role purge (where some roles purge but others don't) is a known
+-- limitation of this approach. In CHT, this mainly affects tasks/targets
+-- (which are user-scoped, so role doesn't matter) and reports (where
+-- per-role purge differences are rare). For the rare cross-role case,
+-- the purge preprocessor should filter at the user_accessible_facilities
+-- level instead of relying on soft-delete.
+
+CREATE OR REPLACE FUNCTION v1.purge_soft_delete()
+RETURNS trigger
+LANGUAGE plpgsql AS $$
+DECLARE
+  v_active_roles INT;
+  v_purged_roles INT;
+BEGIN
+  -- Count distinct active role hashes in the system
+  SELECT COUNT(DISTINCT role_hash) INTO v_active_roles
+  FROM v1.user_settings;
+
+  -- Count how many distinct roles have purged this doc
+  SELECT COUNT(DISTINCT role_hash) INTO v_purged_roles
+  FROM v1.purge_status
+  WHERE doc_id = NEW.doc_id;
+
+  -- Only soft-delete when ALL active roles have purged this doc
+  IF v_purged_roles >= v_active_roles THEN
+    UPDATE v1.couchdb
+    SET _deleted = true
+    WHERE _id = NEW.doc_id
+      AND NOT COALESCE(_deleted, false);
+  END IF;
+
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS trg_purge_soft_delete ON v1.purge_status;
+CREATE TRIGGER trg_purge_soft_delete
+  AFTER INSERT ON v1.purge_status
+  FOR EACH ROW EXECUTE FUNCTION v1.purge_soft_delete();
 
 -- ============================================================
 -- 5. Function: Refresh accessible facilities for one user
@@ -225,8 +267,17 @@ BEGIN
   -- Step 5: Populate user_report_facilities (report_depth-filtered subset)
   -- PowerSync only allows = comparisons with auth parameters, so we
   -- pre-compute the depth filter here instead of in the Sync Stream CTE.
+  --
+  -- NOTE: Shortcodes (patient_id, place_id) are added ONLY to
+  -- user_report_facilities, NOT to user_accessible_facilities. This is
+  -- because accessible_facilities is used by contacts, targets, and
+  -- sms_messages streams which match by _id (always a UUID). Putting
+  -- shortcodes there creates empty PowerSync buckets — one per shortcode
+  -- per stream — wasting bandwidth and counting against the 1,000 bucket
+  -- limit per user.
   DELETE FROM v1.user_report_facilities WHERE user_id = p_user_id;
 
+  -- Step 5a: Copy UUIDs from accessible_facilities, filtered by report_depth
   INSERT INTO v1.user_report_facilities (user_id, facility_id)
   SELECT p_user_id, facility_id
   FROM v1.user_accessible_facilities
@@ -235,6 +286,36 @@ BEGIN
       depth <= (SELECT report_depth FROM v1.user_settings WHERE user_id = p_user_id)
       OR (SELECT report_depth FROM v1.user_settings WHERE user_id = p_user_id) < 0
     );
+
+  -- Step 5b: Add shortcodes (patient_id, place_id) directly to report_facilities.
+  -- CHT reports reference subjects by shortcode (e.g., patient_id="13602").
+  -- The shortcode inherits the depth of the contact it belongs to, so
+  -- report_depth filtering is applied here too.
+  INSERT INTO v1.user_report_facilities (user_id, facility_id)
+  SELECT p_user_id, c.doc ->> 'patient_id'
+  FROM v1.couchdb c
+  JOIN v1.user_accessible_facilities uaf
+    ON c._id = uaf.facility_id AND uaf.user_id = p_user_id
+  WHERE c.doc ->> 'patient_id' IS NOT NULL
+    AND NOT COALESCE(c._deleted, false)
+    AND (
+      uaf.depth <= (SELECT report_depth FROM v1.user_settings WHERE user_id = p_user_id)
+      OR (SELECT report_depth FROM v1.user_settings WHERE user_id = p_user_id) < 0
+    )
+  ON CONFLICT (user_id, facility_id) DO NOTHING;
+
+  INSERT INTO v1.user_report_facilities (user_id, facility_id)
+  SELECT p_user_id, c.doc ->> 'place_id'
+  FROM v1.couchdb c
+  JOIN v1.user_accessible_facilities uaf
+    ON c._id = uaf.facility_id AND uaf.user_id = p_user_id
+  WHERE c.doc ->> 'place_id' IS NOT NULL
+    AND NOT COALESCE(c._deleted, false)
+    AND (
+      uaf.depth <= (SELECT report_depth FROM v1.user_settings WHERE user_id = p_user_id)
+      OR (SELECT report_depth FROM v1.user_settings WHERE user_id = p_user_id) < 0
+    )
+  ON CONFLICT (user_id, facility_id) DO NOTHING;
 END;
 $$;
 

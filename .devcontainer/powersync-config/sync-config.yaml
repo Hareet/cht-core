@@ -4,21 +4,29 @@
 # IMPORTANT: Only PowerSync-supported SQL is used in this file.
 # Supported: SELECT, WHERE, AND, OR, NOT, =, !=, IS NULL, IS NOT NULL,
 #   IN (subquery), IN 'json_array', INNER JOIN, CASE/WHEN, BETWEEN,
-#   ->, ->>, CAST, ifnull, iif, substring, length, instr
+#   ->, ->>, CAST, ifnull, iif, substring, length, instr,
+#   datetime, unixepoch (time-value arg required, no current-time)
 # NOT supported: COALESCE, LIKE, LIMIT, GROUP BY, ORDER BY, jsonb_typeof,
-#   NOT IN (subquery), LEFT/RIGHT JOIN, aggregation
+#   NOT IN (subquery), LEFT/RIGHT JOIN, aggregation, NOW()
+#
+# NOTE: IS NULL on JSONB-extracted values (e.g. doc ->> 'field' IS NULL)
+#   causes PowerSync to silently drop the stream. Use the ifnull() pattern
+#   instead: ifnull(doc ->> 'field', '') = '' (for null-or-missing checks).
 #
 # JWT claims expected in auth token:
-#   sub:            user_id (e.g., "org.couchdb.user:chw_user")
-#   contact_id:     user's contact person document ID (UUID)
-#   role_hash:      MD5 of sorted roles (for purge group lookup)
-#   report_depth:   max depth for other users' reports (-1 = unlimited)
+#   sub:                    user_id (e.g., "org.couchdb.user:chw_user")
+#   contact_id:             user's contact person document ID (UUID)
+#   role_hash:              MD5 of sorted roles (for purge group lookup)
+#   report_depth:           max depth for other users' reports (-1 = unlimited)
+#   can_view_unallocated:   "true" if user may see reports without a subject
 
 config:
   edition: 3
 
 # Global CTE: accessible facility/contact IDs for the authenticated user.
 # Pre-computed by refresh_user_facilities() using recursive CTE in PostgreSQL.
+# Contains ONLY UUIDs (no shortcodes) to avoid empty bucket pollution
+# in contacts, targets, and sms_messages streams.
 with:
   accessible_facilities: |
     SELECT facility_id
@@ -54,22 +62,26 @@ streams:
         AND c._id IN accessible_facilities
 
   # ================================================================
-  # REPORTS
+  # REPORTS (form-based data_records)
   # ================================================================
-  # Subject resolution uses nested ifnull matching CHT's getSubject():
+  # Subject resolution matches CHT's getSubject() priority:
   #   patient_id -> fields.patient_id -> place_id -> fields.place_id
-  #   -> fields.patient_uuid -> contact._id
+  #   -> patient_uuid -> fields.patient_uuid -> contact._id
+  #
+  # report_facilities includes both UUIDs and shortcodes (patient_id,
+  # place_id) so subject matching works for both identifier types.
   #
   # needs_signoff: walks submitter ancestor chain (5 levels).
   # report_depth: limits OTHER users' reports by depth.
+  # Own reports: submitter always sees their own reports (bypass depth).
   # Privacy: fields.private=true only visible to submitter.
   reports:
     auto_subscribe: true
     priority: 2
     with:
-      # Pre-computed report_depth-filtered facilities (simple auth.user_id() lookup)
-      # PowerSync only allows = comparisons with auth params, so depth filtering
-      # is done in PostgreSQL by refresh_user_facilities() -> user_report_facilities
+      # Pre-computed report_depth-filtered facilities (UUIDs + shortcodes).
+      # Shortcodes are ONLY in this table (not in accessible_facilities)
+      # because reports reference subjects by both UUID and shortcode.
       report_facilities: |
         SELECT facility_id
         FROM "v1"."user_report_facilities"
@@ -90,14 +102,23 @@ streams:
         AND c.doc ->> 'type' = 'data_record'
         AND c.doc ->> 'form' IS NOT NULL
         AND (
-          -- Subject matching: each possible subject field checked separately
-          -- (PowerSync requires simple column IN cte, no complex expressions)
+          -- Subject matching: each possible field checked against
+          -- report_facilities (which contains both UUIDs and shortcodes).
+          -- Matches CHT getSubjectIds() in registration-utils:
+          --   patient_id, patient_uuid, place_id, place_uuid
+          --   (both top-level and fields.*)
           c.doc ->> 'patient_id' IN report_facilities
           OR c.doc -> 'fields' ->> 'patient_id' IN report_facilities
           OR c.doc ->> 'place_id' IN report_facilities
           OR c.doc -> 'fields' ->> 'place_id' IN report_facilities
+          OR c.doc ->> 'patient_uuid' IN report_facilities
           OR c.doc -> 'fields' ->> 'patient_uuid' IN report_facilities
+          OR c.doc ->> 'place_uuid' IN report_facilities
+          OR c.doc -> 'fields' ->> 'place_uuid' IN report_facilities
           OR c.doc -> 'contact' ->> '_id' IN report_facilities
+          -- Own reports: submitter always sees their own reports
+          -- regardless of report_depth (CHT authorization.js line 600)
+          OR c.doc -> 'contact' ->> '_id' = auth.parameter('contact_id')
           -- needs_signoff=true — replicate UP via submitter ancestor chain
           OR (
             c.doc -> 'fields' ->> 'needs_signoff' = 'true'
@@ -110,16 +131,91 @@ streams:
             )
           )
         )
-        -- Privacy: private reports only visible to submitter
+        -- Privacy: private reports only visible to submitter.
+        -- Must handle NULL: ifnull wraps the field so missing private != excluded.
         AND (
-          c.doc -> 'fields' ->> 'private' != 'true'
+          ifnull(c.doc -> 'fields' ->> 'private', 'false') != 'true'
           OR c.doc -> 'contact' ->> '_id' = auth.parameter('contact_id')
         )
+
+  # ================================================================
+  # SMS MESSAGES (data_records without form)
+  # ================================================================
+  # In CHT, data_records without a form field are SMS/messages.
+  # Their replication key is doc.contact._id (the sender).
+  # Outgoing (kujua) messages use doc.tasks[0].messages[0].contact._id
+  # but that nested path is rare; contact._id covers the common case.
+  #
+  # NOTE: Uses ifnull() instead of IS NULL because PowerSync silently
+  # drops streams that use IS NULL on JSONB-extracted values.
+  sms_messages:
+    auto_subscribe: true
+    priority: 3
+    query: |
+      SELECT
+        c._id AS id,
+        c.doc -> 'contact' ->> '_id' AS contact_id,
+        c.doc ->> 'reported_date' AS reported_date,
+        c.doc ->> 'kujua_message' AS is_outgoing,
+        CAST(c.doc AS TEXT) AS doc
+      FROM "v1"."couchdb" c
+      WHERE c._deleted != true
+        AND c.doc ->> 'type' = 'data_record'
+        AND ifnull(c.doc ->> 'form', '') = ''
+        AND c.doc -> 'contact' ->> '_id' IN accessible_facilities
+
+  # ================================================================
+  # UNASSIGNED REPORTS
+  # ================================================================
+  # Reports without any subject get _unassigned key in CHT.
+  # Only users with can_view_unallocated_data_records permission
+  # (passed as JWT claim can_view_unallocated) can see these.
+  #
+  # Uses ifnull() instead of IS NULL because PowerSync silently
+  # drops streams that use IS NULL on JSONB-extracted values.
+  # All REPORT_SUBJECT_PROPERTIES + contact._id must be empty.
+  unassigned_reports:
+    auto_subscribe: true
+    priority: 3
+    query: |
+      SELECT
+        c._id AS id,
+        c.doc ->> 'form' AS form,
+        c.doc -> 'contact' ->> '_id' AS contact_id,
+        c.doc ->> 'reported_date' AS reported_date,
+        CAST(c.doc AS TEXT) AS doc
+      FROM "v1"."couchdb" c
+      WHERE c._deleted != true
+        AND c.doc ->> 'type' = 'data_record'
+        AND ifnull(c.doc ->> 'patient_id', '') = ''
+        AND ifnull(c.doc -> 'fields' ->> 'patient_id', '') = ''
+        AND ifnull(c.doc ->> 'place_id', '') = ''
+        AND ifnull(c.doc -> 'fields' ->> 'place_id', '') = ''
+        AND ifnull(c.doc ->> 'patient_uuid', '') = ''
+        AND ifnull(c.doc -> 'fields' ->> 'patient_uuid', '') = ''
+        AND ifnull(c.doc ->> 'place_uuid', '') = ''
+        AND ifnull(c.doc -> 'fields' ->> 'place_uuid', '') = ''
+        AND ifnull(c.doc -> 'contact' ->> '_id', '') = ''
+        AND auth.parameter('can_view_unallocated') = 'true'
 
   # ================================================================
   # TASKS
   # ================================================================
   # task.user = CouchDB user ID ("org.couchdb.user:xxx"), NOT contact UUID.
+  #
+  # Purge exclusion: PowerSync cannot do NOT IN (subquery), so we use
+  # an INNER JOIN against purge_status with != to exclude purged tasks.
+  # If purge_status has no entry for this doc+role, the join won't match,
+  # so we use a CTE approach: get purged doc IDs, then exclude.
+  # Since NOT IN is not supported, we pre-compute eligible task IDs
+  # into a CTE from tasks not in purge_status. BUT CTEs can't reference
+  # other CTEs, so we embed the purge check directly.
+  #
+  # Practical approach: The purge preprocessor (Agent 4) writes to
+  # purge_status. For docs that ARE purged, the purge service should
+  # ALSO set _deleted=true on the couchdb row (soft-delete pattern).
+  # This way, the existing _deleted != true filter handles purge.
+  # If that's not possible, a trigger on purge_status can set a flag.
   tasks:
     auto_subscribe: true
     priority: 3
@@ -166,7 +262,8 @@ streams:
   # Matches the _all replication key in CHT's docs_by_replication_key.
   # By type: form, translations
   # By _id: resources, branding, partners, service-worker-meta,
-  #         zscore-charts, settings, privacy-policies
+  #         zscore-charts, settings, privacy-policies,
+  #         _design/medic-client (always allowed per authorization.js)
   global_config:
     auto_subscribe: true
     priority: 1
@@ -186,7 +283,7 @@ streams:
           CAST(c.doc AS TEXT) AS doc
         FROM "v1"."couchdb" c
         WHERE c._deleted != true
-          AND c._id IN '["resources", "branding", "partners", "service-worker-meta", "zscore-charts", "settings", "privacy-policies"]'
+          AND c._id IN '["resources", "branding", "partners", "service-worker-meta", "zscore-charts", "settings", "privacy-policies", "_design/medic-client"]'
 
   # ================================================================
   # USER SETTINGS DOC

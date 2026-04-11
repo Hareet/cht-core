@@ -11,10 +11,12 @@
  *   node generate-test-token.js county_admin
  *
  * The token includes claims that match user_settings rows in PostgreSQL:
- *   sub:          "org.couchdb.user:<username>"
- *   role_hash:    MD5 of sorted roles
- *   contact_id:   user's contact person doc ID
- *   aud:          "cht-powersync-dev"
+ *   sub:                    "org.couchdb.user:<username>"
+ *   role_hash:              MD5 of sorted roles
+ *   contact_id:             user's contact person doc ID
+ *   report_depth:           max depth for other users' reports
+ *   can_view_unallocated:   "true" if user can see unassigned reports
+ *   aud:                    "cht-powersync-dev"
  */
 
 const crypto = require('crypto');
@@ -40,6 +42,7 @@ const USERS = {
     contact_id: null,
     roles: ['national_admin'],
     report_depth: -1,
+    can_view_unallocated: true,  // admins can see unassigned reports
   },
 };
 
@@ -86,6 +89,7 @@ function generateToken(username) {
     role_hash: md5(user.roles.sort().join(',')),
     contact_id: user.contact_id,
     report_depth: user.report_depth,
+    can_view_unallocated: user.can_view_unallocated ? 'true' : 'false',
     roles: user.roles,
   };
 
