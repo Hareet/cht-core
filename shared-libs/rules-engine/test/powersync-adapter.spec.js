@@ -350,6 +350,16 @@ const evaluateWhere = (row, where, params, state) => {
     return row[eqMatch[1]] === val;
   }
 
+  // Handle != 'literal' (SQL semantics: NULL != 'x' → NULL → falsy)
+  const neqLitMatch = trimmed.match(/^(\w+)\s*!=\s*'([^']*)'/);
+  if (neqLitMatch) {
+    const val = row[neqLitMatch[1]];
+    if (val == null) {
+      return false; // SQL: NULL != anything → NULL → falsy
+    }
+    return val !== neqLitMatch[2];
+  }
+
   // Handle = 'literal'
   const eqLitMatch = trimmed.match(/^(\w+)\s*=\s*'([^']*)'/);
   if (eqLitMatch) {
@@ -497,6 +507,24 @@ describe('powersync-adapter', () => {
       expect(ids).to.include('draftTask');
       expect(ids).to.include('taskNoOwnerNoState');
     });
+
+    it('for requester excludes tasks with empty-string requester (PouchDB parity)', async () => {
+      // CouchDB view uses `if (doc.requester)` — empty strings are falsy in JS,
+      // so tasks with requester='' should NOT be emitted. SQL IS NOT NULL alone
+      // would include them; the adapter must also check != ''.
+      const taskWithEmptyRequester = {
+        _id: 'taskEmptyRequester',
+        type: 'task',
+        requester: '',
+        owner: 'patient',
+      };
+      seedTasks(db, [taskRequestedByChtContact, taskWithEmptyRequester]);
+
+      const result = await powersyncProvider(db).allTasks('requester');
+      const ids = result.map(d => d._id);
+      expect(ids).to.include('taskRequestedBy');
+      expect(ids).to.not.include('taskEmptyRequester');
+    });
   });
 
   describe('allTaskData', () => {
@@ -587,6 +615,91 @@ describe('powersync-adapter', () => {
       const ids = result.taskDocs.map(d => d._id);
       expect(ids).to.include('headlessTask');
       expect(ids).to.include('taskRequestedBy');
+    });
+
+    it('excludes reports with empty-string form (PouchDB parity)', async () => {
+      // CouchDB reports_by_subject view uses `if (doc.form)` — empty string is falsy in JS.
+      // SQL `form IS NOT NULL` alone would accept empty strings. The adapter must also
+      // check `form != ''` to match CouchDB view behavior.
+      const reportWithEmptyForm = {
+        _id: 'emptyFormReport',
+        type: 'data_record',
+        form: '',
+        patient_id: 'patient_id',
+        reported_date: 500,
+      };
+      const reportWithValidForm = {
+        _id: 'validFormReport',
+        type: 'data_record',
+        form: 'pregnancy',
+        patient_id: 'patient_id',
+        reported_date: 600,
+      };
+      seedReports(db, [reportWithEmptyForm, reportWithValidForm]);
+
+      const result = await powersyncProvider(db).allTaskData(mockUserSettingsDoc);
+      const ids = result.reportDocs.map(d => d._id);
+      expect(ids).to.include('validFormReport');
+      expect(ids).to.not.include('emptyFormReport');
+    });
+
+    it('excludes reports with empty-string subject identifiers (PouchDB parity)', async () => {
+      // CouchDB view uses `if (obj[field])` for each subject field — empty strings are falsy.
+      // A report where all subject columns are empty strings should be excluded, just like
+      // a report where all are NULL. The SQL must check both IS NOT NULL and != ''.
+      const reportEmptySubjects = {
+        _id: 'emptySubjectReport',
+        type: 'data_record',
+        form: 'visit',
+        patient_id: '',
+        place_id: '',
+        reported_date: 700,
+      };
+      seedReports(db, [reportEmptySubjects]);
+
+      const result = await powersyncProvider(db).allTaskData(mockUserSettingsDoc);
+      const ids = result.reportDocs.map(d => d._id);
+      expect(ids).to.not.include('emptySubjectReport');
+    });
+
+    it('includes reports where at least one subject is non-empty (mixed empty/non-empty)', async () => {
+      // If patient_id is empty but place_id is valid, the report should still be included.
+      const reportMixedSubjects = {
+        _id: 'mixedSubjectReport',
+        type: 'data_record',
+        form: 'visit',
+        patient_id: '',
+        place_id: 'place_id',
+        reported_date: 800,
+      };
+      seedReports(db, [reportMixedSubjects]);
+
+      const result = await powersyncProvider(db).allTaskData(mockUserSettingsDoc);
+      const ids = result.reportDocs.map(d => d._id);
+      expect(ids).to.include('mixedSubjectReport');
+    });
+
+    it('excludes tasks with empty-string requester from allTaskData (PouchDB parity)', async () => {
+      // allTaskData calls allTasks('requester') internally. Tasks with requester=''
+      // should be excluded because the CouchDB view checks `if (doc.requester)`.
+      const taskWithEmptyRequester = {
+        _id: 'emptyRequesterTask',
+        type: 'task',
+        requester: '',
+        owner: 'patient',
+      };
+      const taskWithValidRequester = {
+        _id: 'validRequesterTask',
+        type: 'task',
+        requester: 'patient',
+        owner: 'patient',
+      };
+      seedTasks(db, [taskWithEmptyRequester, taskWithValidRequester]);
+
+      const result = await powersyncProvider(db).allTaskData(mockUserSettingsDoc);
+      const ids = result.taskDocs.map(d => d._id);
+      expect(ids).to.include('validRequesterTask');
+      expect(ids).to.not.include('emptyRequesterTask');
     });
   });
 
@@ -1020,6 +1133,24 @@ describe('powersync-adapter', () => {
       expect(result.reportDocs).to.be.empty;
       expect(result.taskDocs).to.be.empty;
       expect(result.userSettingsId).to.equal('org.couchdb.user:username');
+    });
+
+    it('excludes reports with empty-string form in taskDataFor (PouchDB parity)', async () => {
+      // CouchDB reports_by_subject view requires `doc.form` to be truthy.
+      // Reports with form='' should not be returned even if they match subject IDs.
+      const emptyFormReport = {
+        _id: 'emptyFormReport',
+        type: 'data_record',
+        form: '',
+        patient_id: 'patient_id',
+        reported_date: 500,
+      };
+      seedReports(db, [emptyFormReport, pregnancyReport]);
+
+      const result = await powersyncProvider(db).taskDataFor(['patient'], mockUserSettingsDoc);
+      const reportIds = result.reportDocs.map(d => d._id);
+      expect(reportIds).to.include('pregReport');
+      expect(reportIds).to.not.include('emptyFormReport');
     });
   });
 

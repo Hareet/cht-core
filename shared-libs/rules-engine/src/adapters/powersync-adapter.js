@@ -114,10 +114,12 @@ const powersyncProvider = (db) => {
                WHERE type = 'task'
                  AND (state IS NULL OR state NOT IN ('Cancelled', 'Completed', 'Failed'))`;
       } else {
-        // 'requester' prefix: emitted for all tasks with a requester, regardless of state
+        // 'requester' prefix: emitted for all tasks with a requester, regardless of state.
+        // CouchDB view uses `if (doc.requester)` — falsy values (including empty strings)
+        // are excluded. SQL IS NOT NULL would accept empty strings, so we add != ''.
         sql = `SELECT doc FROM tasks
                WHERE type = 'task'
-                 AND requester IS NOT NULL`;
+                 AND requester IS NOT NULL AND requester != ''`;
       }
       const rows = await db.getAll(sql);
       return parseDocs(rows);
@@ -134,11 +136,16 @@ const powersyncProvider = (db) => {
         db.getAll(`SELECT doc FROM contacts WHERE type = 'contact' OR type IN ('district_hospital', 'health_center', 'clinic', 'person')`)
           .then(parseDocs),
         // reports_by_subject: all reports (data_records with a form) that have at least one subject identifier.
-        // The CouchDB view only emits rows for reports with subject fields (patient_id, place_id,
-        // patient_uuid, place_uuid, case_id). Reports with none of these produce zero view emissions
-        // and are excluded. We mirror this by requiring at least one denormalized column to be non-NULL.
-        db.getAll(`SELECT doc FROM reports WHERE type = 'data_record' AND form IS NOT NULL
-                   AND (patient_id IS NOT NULL OR place_id IS NOT NULL OR subject_id IS NOT NULL OR case_id IS NOT NULL)`)
+        // The CouchDB view uses JavaScript truthiness: `if (doc.form)` and `if (obj[field])`.
+        // Empty strings are falsy in JS but non-NULL in SQL, so we must exclude them explicitly
+        // with `!= ''` to match view behavior. This ensures reports with empty form names or
+        // empty subject identifiers are excluded, matching PouchDB parity.
+        db.getAll(`SELECT doc FROM reports WHERE type = 'data_record'
+                   AND form IS NOT NULL AND form != ''
+                   AND ((patient_id IS NOT NULL AND patient_id != '')
+                     OR (place_id IS NOT NULL AND place_id != '')
+                     OR (subject_id IS NOT NULL AND subject_id != '')
+                     OR (case_id IS NOT NULL AND case_id != ''))`)
           .then(parseDocs),
         self.allTasks('requester'),
       ]);
@@ -403,10 +410,12 @@ const powersyncProvider = (db) => {
       // and patient_id, patient_uuid, place_id, place_uuid (reports). case_id is NOT a subject
       // property, so contact subject IDs never include case_id values. Reports matched solely
       // by case_id would not appear in PouchDB either. subject_id column covers patient_uuid/place_uuid.
+      //
+      // CouchDB view requires `doc.form` to be truthy — exclude empty-string forms for parity.
       const [reportRows, taskDocs] = await Promise.all([
         chunkedQuery(subjectIdArray, async (chunk) => {
           const sql = `SELECT doc FROM reports
-                       WHERE type = 'data_record' AND form IS NOT NULL
+                       WHERE type = 'data_record' AND form IS NOT NULL AND form != ''
                          AND (patient_id IN (${placeholders(chunk)})
                            OR place_id IN (${placeholders(chunk)})
                            OR subject_id IN (${placeholders(chunk)}))`;
