@@ -19,7 +19,8 @@ const logger = require('@medic/logger');
 const POLL_INTERVAL_MS = 5000;       // 5s fallback poll
 const NOTIFY_DEBOUNCE_MS = 100;      // Debounce rapid notifications
 const BATCH_SIZE = 100;              // Max changes per poll
-const RECONNECT_DELAY_MS = 5000;     // Delay before reconnecting listener
+const RECONNECT_DELAY_MS = 5000;     // Initial delay before reconnecting listener
+const RECONNECT_MAX_DELAY_MS = 60000; // Cap backoff at 60 seconds
 
 const IDS_TO_IGNORE = /^_design\/|-info$/;
 
@@ -45,6 +46,9 @@ class NotifyListener extends EventEmitter {
     this._client = null;
     this._running = false;
     this._wasConnected = false;
+    this._reconnectDelay = RECONNECT_DELAY_MS;
+    this._consecutiveFailures = 0;
+    this._reconnectTimer = null;
   }
 
   async start() {
@@ -87,6 +91,10 @@ class NotifyListener extends EventEmitter {
       await this._client.connect();
       await this._client.query('LISTEN couchdb_changes');
 
+      // Reset backoff on successful connection
+      this._reconnectDelay = RECONNECT_DELAY_MS;
+      this._consecutiveFailures = 0;
+
       if (this._wasConnected) {
         logger.info('pg-changes: LISTEN connection re-established — triggering catch-up poll');
         this.emit('reconnected');
@@ -95,7 +103,11 @@ class NotifyListener extends EventEmitter {
       }
       this._wasConnected = true;
     } catch (err) {
-      logger.error('pg-changes: Failed to establish LISTEN connection: %o', err);
+      this._consecutiveFailures++;
+      logger.error(
+        'pg-changes: Failed to establish LISTEN connection (attempt %d, next retry in %dms): %o',
+        this._consecutiveFailures, this._reconnectDelay, err
+      );
       this._reconnect();
     }
   }
@@ -103,11 +115,21 @@ class NotifyListener extends EventEmitter {
   _reconnect() {
     this._cleanup();
     if (this._running) {
-      setTimeout(() => this._connect(), RECONNECT_DELAY_MS);
+      const delay = this._reconnectDelay;
+      this._reconnectTimer = setTimeout(() => {
+        this._reconnectTimer = null;
+        this._connect();
+      }, delay);
+      // Exponential backoff: double the delay, capped at max
+      this._reconnectDelay = Math.min(this._reconnectDelay * 2, RECONNECT_MAX_DELAY_MS);
     }
   }
 
   _cleanup() {
+    if (this._reconnectTimer) {
+      clearTimeout(this._reconnectTimer);
+      this._reconnectTimer = null;
+    }
     if (this._client) {
       try {
         this._client.removeAllListeners();
@@ -122,6 +144,8 @@ class NotifyListener extends EventEmitter {
   stop() {
     this._running = false;
     this._cleanup();
+    this._reconnectDelay = RECONNECT_DELAY_MS;
+    this._consecutiveFailures = 0;
   }
 }
 
@@ -227,6 +251,10 @@ class PgChangesFeed extends EventEmitter {
     }
 
     if (this._live) {
+      // Verify the NOTIFY trigger exists — without it, LISTEN succeeds but
+      // NOTIFY never fires, silently degrading to poll-only mode.
+      await this._checkNotifyTrigger();
+
       this._listener = new NotifyListener(this._config);
       this._listener.on('notification', () => this._onNotification());
       this._listener.on('reconnected', () => this._onReconnected());
@@ -241,6 +269,35 @@ class PgChangesFeed extends EventEmitter {
     }
 
     return this;
+  }
+
+  async _checkNotifyTrigger() {
+    const client = await this._pool.connect();
+    try {
+      const { rows } = await client.query(
+        `SELECT 1 FROM information_schema.triggers
+         WHERE event_object_schema = $1
+           AND event_object_table = $2
+           AND action_statement LIKE '%couchdb_change%'
+         LIMIT 1`,
+        [this._schema, this._table]
+      );
+      if (rows.length === 0) {
+        logger.warn(
+          'pg-changes: No NOTIFY trigger found on %s.%s for channel couchdb_changes — ' +
+          'real-time change detection is DEGRADED (falling back to %dms polling). ' +
+          'Create a trigger that calls NOTIFY couchdb_changes on INSERT/UPDATE.',
+          this._schema, this._table, this._pollInterval
+        );
+      } else {
+        logger.debug('pg-changes: NOTIFY trigger confirmed on %s.%s', this._schema, this._table);
+      }
+    } catch (err) {
+      // Non-fatal — trigger check is best-effort. Feed still works via polling.
+      logger.warn('pg-changes: Could not verify NOTIFY trigger existence: %o', err);
+    } finally {
+      client.release();
+    }
   }
 
   _onNotification() {

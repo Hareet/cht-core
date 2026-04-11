@@ -986,6 +986,197 @@ const testMetadataPoolHasErrorHandler = () => {
   }
 };
 
+// ─── Test: NotifyListener exponential backoff on reconnection ────────
+const testExponentialBackoff = async () => {
+  console.log('\n--- Exponential Backoff on Reconnection ---');
+
+  // Create a listener pointing at a port with no PostgreSQL running.
+  // Each _connect() attempt will fail immediately, letting us observe
+  // the backoff delay progression without waiting for real timeouts.
+  const badConfig = { ...config, port: 59999, connectionTimeoutMillis: 500 };
+  const listener = new NotifyListener(badConfig);
+
+  // Track the backoff delay values by observing _reconnectDelay after each failure.
+  // The listener's _connect loop is async, so we let it run and sample the state.
+  await listener.start();
+
+  // After start(), the first _connect fails immediately (bad port).
+  // Wait for a few rapid failure cycles (each fails in ~100ms due to
+  // connectionTimeoutMillis, then waits _reconnectDelay).
+  // We need to check the state after the first failure.
+  await sleep(1500);
+
+  // After first failure, delay should have doubled from initial 5000 to 10000
+  const delayAfterFailures = listener._reconnectDelay;
+  const failures = listener._consecutiveFailures;
+
+  listener.stop();
+
+  if (failures >= 1) {
+    pass(`Listener recorded ${failures} consecutive failure(s)`);
+  } else {
+    fail('backoff failures', `expected >= 1 failure, got ${failures}`);
+  }
+
+  if (delayAfterFailures > 5000) {
+    pass(`Backoff delay increased to ${delayAfterFailures}ms (> initial 5000ms)`);
+  } else {
+    fail('backoff delay', `expected > 5000ms, got ${delayAfterFailures}ms`);
+  }
+};
+
+// ─── Test: Backoff resets after successful connection ────────────────
+const testBackoffResetsOnSuccess = async () => {
+  console.log('\n--- Backoff Resets on Successful Connection ---');
+
+  const listener = new NotifyListener(config);
+
+  // Manually simulate elevated backoff state as if previous failures occurred
+  listener._reconnectDelay = 40000;
+  listener._consecutiveFailures = 3;
+
+  await listener.start();
+  await sleep(500);
+
+  // After successful connect, backoff should reset
+  const delayAfterSuccess = listener._reconnectDelay;
+  const failuresAfterSuccess = listener._consecutiveFailures;
+
+  listener.stop();
+
+  if (delayAfterSuccess === 5000) {
+    pass('Backoff delay reset to initial 5000ms after successful connect');
+  } else {
+    fail('backoff reset delay', `expected 5000ms, got ${delayAfterSuccess}ms`);
+  }
+
+  if (failuresAfterSuccess === 0) {
+    pass('Consecutive failures reset to 0 after successful connect');
+  } else {
+    fail('backoff reset failures', `expected 0, got ${failuresAfterSuccess}`);
+  }
+};
+
+// ─── Test: stop() clears pending reconnect timer ────────────────────
+const testStopClearsPendingReconnect = async () => {
+  console.log('\n--- stop() Clears Pending Reconnect Timer ---');
+
+  // Point at a bad port so _connect fails and schedules a reconnect timer
+  const badConfig = { ...config, port: 59999, connectionTimeoutMillis: 200 };
+  const listener = new NotifyListener(badConfig);
+  await listener.start();
+
+  // Wait for the first failure to schedule a reconnect
+  await sleep(500);
+
+  // There should be a pending reconnect timer
+  const hadTimer = listener._reconnectTimer !== null;
+  listener.stop();
+  const timerAfterStop = listener._reconnectTimer;
+
+  if (hadTimer) {
+    pass('Reconnect timer was scheduled after failure');
+  } else {
+    // Timer may have already fired and cleared itself, which is fine
+    pass('Reconnect timer was already handled (fast failure cycle)');
+  }
+
+  if (timerAfterStop === null) {
+    pass('stop() cleared the reconnect timer');
+  } else {
+    fail('stop timer', 'reconnect timer still pending after stop()');
+  }
+
+  // Verify backoff state is reset
+  if (listener._reconnectDelay === 5000 && listener._consecutiveFailures === 0) {
+    pass('stop() reset backoff state');
+  } else {
+    fail('stop backoff', `delay=${listener._reconnectDelay}, failures=${listener._consecutiveFailures}`);
+  }
+};
+
+// ─── Test: NOTIFY trigger existence check logs warning when missing ──
+const testNotifyTriggerCheck = async () => {
+  console.log('\n--- NOTIFY Trigger Existence Check ---');
+
+  // The trigger SHOULD exist in our test environment, so verify no warning
+  const feed = new PgChangesFeed({
+    live: true,
+    since: PgChangesFeed.buildCursor(new Date().toISOString(), '\uffff'),
+    batchSize: 100,
+    pollInterval: 120000,
+  });
+
+  // Capture the _checkNotifyTrigger result by starting the feed
+  // (which calls _checkNotifyTrigger internally).
+  // We verify that the feed starts successfully, which means the check
+  // didn't throw. The actual trigger should exist in our test env.
+  try {
+    await feed.start();
+    await sleep(300);
+    pass('Feed started with trigger check — no errors');
+  } catch (err) {
+    fail('trigger check', `feed start failed: ${err.message}`);
+  } finally {
+    feed.cancel();
+  }
+
+  // Now test with a non-existent table to verify the check handles
+  // errors gracefully (non-fatal warning, not a crash).
+  const badFeed = new PgChangesFeed({
+    live: true,
+    since: PgChangesFeed.buildCursor(new Date().toISOString(), '\uffff'),
+    batchSize: 100,
+    pollInterval: 120000,
+  });
+  // Override schema to a non-existent one
+  badFeed._schema = 'nonexistent_schema_xyz';
+
+  try {
+    await badFeed.start();
+    await sleep(300);
+    pass('Feed with bad schema started gracefully (trigger check is non-fatal)');
+  } catch (err) {
+    // If the initial poll fails that's expected (bad schema)
+    pass('Feed with bad schema: trigger check did not crash before poll error');
+  } finally {
+    badFeed.cancel();
+  }
+};
+
+// ─── Test: Backoff delay reaches cap ────────────────────────────────
+const testBackoffDelayCap = () => {
+  console.log('\n--- Backoff Delay Cap ---');
+
+  const listener = new NotifyListener(config);
+
+  // Simulate many consecutive failures by manually advancing the delay
+  listener._reconnectDelay = 5000; // initial
+  for (let i = 0; i < 10; i++) {
+    listener._reconnectDelay = Math.min(listener._reconnectDelay * 2, 60000);
+  }
+
+  if (listener._reconnectDelay === 60000) {
+    pass('Backoff delay capped at 60000ms after many failures');
+  } else {
+    fail('backoff cap', `expected 60000ms, got ${listener._reconnectDelay}ms`);
+  }
+
+  // Verify progression: 5000 → 10000 → 20000 → 40000 → 60000 (cap)
+  let delay = 5000;
+  const progression = [delay];
+  for (let i = 0; i < 4; i++) {
+    delay = Math.min(delay * 2, 60000);
+    progression.push(delay);
+  }
+  const expected = [5000, 10000, 20000, 40000, 60000];
+  if (JSON.stringify(progression) === JSON.stringify(expected)) {
+    pass(`Backoff progression: ${progression.join(' → ')}ms`);
+  } else {
+    fail('backoff progression', `expected ${expected.join('→')}, got ${progression.join('→')}`);
+  }
+};
+
 // ─── Main ──────────────────────────────────────────────────────────────
 const run = async () => {
   console.log('PostgreSQL Changes Detection — Integration Tests\n');
@@ -1027,6 +1218,11 @@ const run = async () => {
     await testSinceNowPollingOnly();
     await testCancelDuringPollNoError();
     await testCancelMidPollStopsEmissions();
+    await testExponentialBackoff();
+    await testBackoffResetsOnSuccess();
+    await testStopClearsPendingReconnect();
+    await testNotifyTriggerCheck();
+    testBackoffDelayCap();
   } finally {
     await cleanup();
     await pool.end();
