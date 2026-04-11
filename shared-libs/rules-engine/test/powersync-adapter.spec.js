@@ -553,6 +553,41 @@ describe('powersync-adapter', () => {
       const ids = result.reportDocs.map(d => d._id);
       expect(ids).to.include('reportCaseOnly');
     });
+
+    it('includes headless reports — reports whose subject has no contact doc (PouchDB parity)', async () => {
+      // In PouchDB, allTaskData returns ALL reports from reports_by_subject, including
+      // "headless" reports whose patient_id doesn't match any contact. These are used by
+      // refreshForAllContacts to compute headlessSubjectIds for the state store.
+      const headlessReport = {
+        _id: 'headlessReport',
+        type: 'data_record',
+        form: 'form',
+        patient_id: 'headless', // no contact has this as _id or shortcode
+        reported_date: 1000,
+      };
+      seedContacts(db, [contactDoc]);
+      seedReports(db, [pregnancyReport, headlessReport]);
+
+      const result = await powersyncProvider(db).allTaskData(mockUserSettingsDoc);
+      const ids = result.reportDocs.map(d => d._id);
+      expect(ids).to.include('headlessReport');
+      expect(ids).to.include('pregReport');
+    });
+
+    it('includes headless tasks — tasks whose requester has no contact doc (PouchDB parity)', async () => {
+      const headlessTask = {
+        _id: 'headlessTask',
+        type: 'task',
+        requester: 'headless',
+        owner: 'headless',
+      };
+      seedTasks(db, [taskRequestedByChtContact, headlessTask]);
+
+      const result = await powersyncProvider(db).allTaskData(mockUserSettingsDoc);
+      const ids = result.taskDocs.map(d => d._id);
+      expect(ids).to.include('headlessTask');
+      expect(ids).to.include('taskRequestedBy');
+    });
   });
 
   describe('contactsBySubjectId', () => {
@@ -578,6 +613,19 @@ describe('powersync-adapter', () => {
       const result = await powersyncProvider(db).contactsBySubjectId(['patient_id', 'some_uuid']);
       expect(result).to.include('patient');
       expect(result).to.include('some_uuid');
+    });
+
+    it('place_id shortcode yields contact id (PouchDB parity)', async () => {
+      const result = await powersyncProvider(db).contactsBySubjectId(['place_id']);
+      expect(result).to.include('place');
+    });
+
+    it('uuid and patient_id for same contact (PouchDB parity)', async () => {
+      // PouchDB returns duplicates: ['patient', 'patient'] — uuid resolves as shortcode match
+      // then also passes through. The duplication is harmless (downstream deduplicates).
+      const result = await powersyncProvider(db).contactsBySubjectId(['patient', 'patient_id']);
+      expect(result).to.include('patient');
+      expect(result.filter(id => id === 'patient')).to.have.length(2);
     });
   });
 
@@ -609,6 +657,49 @@ describe('powersync-adapter', () => {
       const args = db.execute.firstCall.args;
       expect(args[0]).to.include('INSERT OR REPLACE');
       expect(args[0]).to.include('rules_state_store');
+    });
+
+    it('serializes baseDoc at write-time, not call-time (PouchDB parity)', async () => {
+      // PouchDB's db.put(baseDoc) reads the object at execution time.
+      // If two stateChangeCallback calls queue synchronously, PouchDB's first write
+      // sees the LATEST baseDoc mutations (because put reads at execution time).
+      // The PowerSync adapter must match: JSON.stringify inside the promise chain.
+      const provider = powersyncProvider(db);
+      const baseDoc = { _id: 'local' };
+
+      // Call twice synchronously — second overwrites first's assigned value
+      const p1 = provider.stateChangeCallback(baseDoc, { rulesStateStore: { contact1: 'fresh' } });
+      const p2 = provider.stateChangeCallback(baseDoc, { rulesStateStore: { contact1: 'fresh', contact2: 'fresh' } });
+
+      await p1;
+      await p2;
+
+      // Both writes should see the LATEST baseDoc state (with contact2).
+      // The first write executes after both Object.assign calls have run synchronously,
+      // so baseDoc already has { contact1, contact2 } when the first write serializes.
+      const calls = db.execute.getCalls().filter(c => c.args[0].includes('rules_state_store'));
+      expect(calls).to.have.length(2);
+
+      // Both writes should contain the final state (contact1 + contact2)
+      const firstWriteData = JSON.parse(calls[0].args[1][1]);
+      const secondWriteData = JSON.parse(calls[1].args[1][1]);
+      expect(firstWriteData.rulesStateStore).to.deep.equal({ contact1: 'fresh', contact2: 'fresh' });
+      expect(secondWriteData.rulesStateStore).to.deep.equal({ contact1: 'fresh', contact2: 'fresh' });
+    });
+
+    it('chains sequential writes without conflicts', async () => {
+      const provider = powersyncProvider(db);
+      const baseDoc = { _id: 'local' };
+
+      await provider.stateChangeCallback(baseDoc, { rulesStateStore: { step: 1 } });
+      await provider.stateChangeCallback(baseDoc, { rulesStateStore: { step: 2 } });
+      await provider.stateChangeCallback(baseDoc, { rulesStateStore: { step: 3 } });
+
+      // The final write should contain step: 3
+      const calls = db.execute.getCalls().filter(c => c.args[0].includes('rules_state_store'));
+      expect(calls).to.have.length(3);
+      const finalData = JSON.parse(calls[2].args[1][1]);
+      expect(finalData.rulesStateStore).to.deep.equal({ step: 3 });
     });
   });
 
@@ -653,6 +744,47 @@ describe('powersync-adapter', () => {
       // Should have called execute with UPDATE
       const updateCall = db.execute.getCalls().find(c => c.args[0].includes('UPDATE'));
       expect(updateCall).to.exist;
+    });
+
+    it('create → skip → update round-trip preserves all fields (PouchDB parity)', async () => {
+      // Matches PouchDB pouchdb-provider.spec.js: "create and update a doc"
+      const docTag = '2019-07';
+      const provider = powersyncProvider(db);
+
+      // Step 1: Create
+      await provider.commitTargetDoc(targets, docTag, { userContactDoc, userSettingsDoc });
+
+      expect(db._tables.targets).to.have.length(1);
+      const created = db._tables.targets[0]._doc;
+      expect(created).to.deep.include({
+        _id: 'target~2019-07~user~org.couchdb.user:username',
+        type: 'target',
+        owner: 'user',
+        user: 'org.couchdb.user:username',
+        reporting_period: '2019-07',
+      });
+      expect(created.targets).to.deep.equal(targets);
+      expect(created.updated_date).to.be.a('number');
+
+      // Step 2: No-update when updatedTargets is falsy (matches PouchDB _rev check)
+      const nextTargets = [{ id: 'target', score: 1 }];
+      const skipResult = await provider.commitTargetDoc(
+        nextTargets, docTag, { userContactDoc, userSettingsDoc }
+      );
+      expect(skipResult).to.equal(false);
+      // Data unchanged
+      expect(db._tables.targets[0]._doc.targets).to.deep.equal(targets);
+
+      // Step 3: Update with updatedTargets=true
+      await provider.commitTargetDoc(
+        nextTargets, docTag, { userContactDoc, userSettingsDoc }, true
+      );
+      const updated = db._tables.targets[0]._doc;
+      expect(updated.targets).to.deep.equal(nextTargets);
+      expect(updated.type).to.equal('target');
+      expect(updated.owner).to.equal('user');
+      expect(updated.user).to.equal('org.couchdb.user:username');
+      expect(updated.reporting_period).to.equal('2019-07');
     });
   });
 

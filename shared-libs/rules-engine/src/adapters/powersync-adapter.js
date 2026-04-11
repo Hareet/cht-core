@@ -192,12 +192,16 @@ const powersyncProvider = (db) => {
       let previousResult = Promise.resolve();
       return (baseDoc, assigned) => {
         Object.assign(baseDoc, assigned);
-        const data = JSON.stringify(baseDoc);
 
+        // Serialize baseDoc inside the promise chain (at write-time, not call-time).
+        // PouchDB's db.put(baseDoc) reads the object when the put executes, so if
+        // multiple stateChangeCallback calls queue up synchronously, the first PouchDB
+        // write sees the LATEST mutations. Capturing JSON.stringify here (before the
+        // .then) would snapshot a stale intermediate state for earlier queued writes.
         previousResult = previousResult
           .then(() => db.execute(
             `INSERT OR REPLACE INTO ${LOCAL_STATE_TABLE} (id, data) VALUES (?, ?)`,
-            [RULES_STATE_DOCID, data]
+            [RULES_STATE_DOCID, JSON.stringify(baseDoc)]
           ))
           .catch(err => console.error(`Error updating rules state store: ${err}`))
           .then(() => {
@@ -267,7 +271,7 @@ const powersyncProvider = (db) => {
             await tx.execute(
               `INSERT OR REPLACE INTO tasks (id, type, state, owner, requester, user, authored_on, doc)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-              [id, 'task', taskDoc.state, taskDoc.owner ?? null, taskDoc.requester ?? null,
+              [id, 'task', taskDoc.state ?? null, taskDoc.owner ?? null, taskDoc.requester ?? null,
                 taskDoc.user ?? null, taskDoc.authoredOn ?? null, doc]
             );
           }
