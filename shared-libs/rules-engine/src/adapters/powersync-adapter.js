@@ -7,7 +7,7 @@
  * PowerSync table schema assumptions (synced from server via Sync Streams):
  *   - contacts: id, type, contact_type, name, parent_id, patient_id, place_id, date_of_death, muted, doc (JSONB text)
  *   - reports: id, type, form, patient_id, place_id, case_id, subject_id, reported_date, fields (JSON text), doc (JSONB)
- *   - tasks: id, type, state, owner, requester, emission (JSON text), user, authored_on, state_history (JSON text), doc
+ *   - tasks: id, type, state, owner, requester, user, authored_on, doc (JSONB — contains emission, stateHistory, etc.)
  *   - targets: id, type, owner, user, reporting_period, targets (JSON text), updated_date
  *   - rules_state_store: local-only table, id, data (JSON text)
  *

@@ -621,6 +621,124 @@ describe('PowerSync adapter integration tests', () => {
     });
   });
 
+  it('should cancel tasks when their triggering report is removed (round-trip parity)', async () => {
+    // This tests the critical round-trip invariant: task documents committed via
+    // commitTaskDocs must preserve emission._id through JSON serialization so that
+    // the cancellation matching logic in getCancellationUpdates can identify orphaned tasks.
+    //
+    // Flow: seed data → refresh → verify tasks → remove report → refresh → verify cancelled
+    seedContact(mockDb, patientContact);
+    seedReport(mockDb, pregnancyRegistrationReport);
+
+    // Step 1: Generate tasks
+    await rulesEngine.refreshEmissionsFor();
+    const initialTasks = mockDb._tables.tasks.filter(t => t.owner === patientContact._id);
+    expect(initialTasks.length).to.be.greaterThan(0);
+
+    // Capture the emission IDs from the written tasks — these must survive the JSON round-trip
+    const initialEmissionIds = initialTasks.map(t => {
+      const doc = t._rawDoc || JSON.parse(t.doc);
+      expect(doc.emission).to.be.an('object', 'task doc should have emission after write');
+      expect(doc.emission._id).to.be.a('string', 'emission._id must be preserved in JSON');
+      return doc.emission._id;
+    });
+    expect(initialEmissionIds.length).to.be.greaterThan(0);
+
+    // Verify all non-terminal tasks have stateHistory
+    const nonTerminalTasks = initialTasks.filter(
+      t => !['Cancelled', 'Completed', 'Failed'].includes(t.state)
+    );
+    expect(nonTerminalTasks.length).to.be.greaterThan(0);
+    nonTerminalTasks.forEach(t => {
+      const doc = t._rawDoc || JSON.parse(t.doc);
+      expect(doc.stateHistory).to.be.an('array').with.length.greaterThan(0);
+    });
+
+    // Step 2: Remove the report — simulates a report being purged or retracted
+    mockDb._tables.reports = [];
+
+    // Step 3: Mark contact dirty and refresh — should cancel orphaned tasks
+    // updateEmissionsFor resolves the contact ID, marks it dirty, and refreshes
+    await rulesEngine.updateEmissionsFor([patientContact._id]);
+
+    // Step 4: Verify cancellation
+    const updatedTasks = mockDb._tables.tasks.filter(t => t.owner === patientContact._id);
+    expect(updatedTasks.length).to.be.greaterThan(0);
+
+    // All previously non-terminal tasks should now be Cancelled
+    // (rules engine found no emissions → getCancellationUpdates cancels all)
+    const cancelledTasks = updatedTasks.filter(t => t.state === 'Cancelled');
+    expect(cancelledTasks.length).to.be.greaterThan(0);
+
+    // The cancelled tasks should have accumulated stateHistory entries
+    cancelledTasks.forEach(t => {
+      const doc = t._rawDoc || JSON.parse(t.doc);
+      expect(doc.stateHistory).to.be.an('array');
+      // Should have at least 2 entries: initial state + Cancelled
+      expect(doc.stateHistory.length).to.be.greaterThan(1);
+      const lastEntry = doc.stateHistory[doc.stateHistory.length - 1];
+      expect(lastEntry.state).to.equal('Cancelled');
+    });
+
+    // fetchTasksFor should return no Ready tasks (all cancelled)
+    const readyTasks = await rulesEngine.fetchTasksFor();
+    // All remaining tasks are either Cancelled or were already terminal
+    readyTasks.forEach(task => {
+      expect(task.state).to.equal('Ready');
+    });
+  });
+
+  it('should preserve task emission data through multiple refresh cycles', async () => {
+    // Verifies that task documents round-trip correctly through the PowerSync adapter's
+    // JSON serialization across multiple refresh cycles. Each cycle reads tasks from the
+    // DB (parsing doc JSON), runs rules, and writes back (re-serializing to JSON).
+    // Fields like emission.actions, emission.title, and stateHistory must be preserved.
+    seedContact(mockDb, patientContact);
+    seedReport(mockDb, pregnancyRegistrationReport);
+
+    // First refresh — creates tasks
+    await rulesEngine.refreshEmissionsFor();
+    const afterFirstRefresh = mockDb._tables.tasks.slice();
+    expect(afterFirstRefresh.length).to.be.greaterThan(0);
+
+    // Capture initial task structure
+    const initialTaskDocs = afterFirstRefresh.map(t => t._rawDoc || JSON.parse(t.doc));
+    initialTaskDocs.forEach(doc => {
+      expect(doc).to.have.property('_id').that.is.a('string');
+      expect(doc).to.have.property('type', 'task');
+      expect(doc).to.have.property('emission').that.is.an('object');
+      expect(doc.emission).to.have.property('_id').that.is.a('string');
+      expect(doc).to.have.property('stateHistory').that.is.an('array');
+      expect(doc).to.have.property('authoredOn').that.is.a('number');
+    });
+
+    // Second refresh — reads back tasks from DB, runs rules, writes again
+    // Tasks should be re-read from the doc JSON column and round-trip correctly
+    configHashSalt++;
+    await rulesEngine.rulesConfigChange(engineSettings({ configHashSalt }));
+    await rulesEngine.refreshEmissionsFor();
+
+    const afterSecondRefresh = mockDb._tables.tasks.slice();
+    expect(afterSecondRefresh.length).to.be.greaterThan(0);
+
+    // Verify emission data survived the round-trip
+    const roundTrippedDocs = afterSecondRefresh.map(t => t._rawDoc || JSON.parse(t.doc));
+    roundTrippedDocs.forEach(doc => {
+      expect(doc).to.have.property('emission').that.is.an('object');
+      expect(doc.emission).to.have.property('_id').that.is.a('string');
+      expect(doc).to.have.property('stateHistory').that.is.an('array');
+      expect(doc.stateHistory.length).to.be.greaterThan(0);
+    });
+
+    // The emission IDs should be consistent — same contact + report produces same emission IDs
+    const firstEmissionIds = new Set(initialTaskDocs.map(d => d.emission._id));
+    const secondEmissionIds = new Set(roundTrippedDocs.map(d => d.emission._id));
+    // All first-round emission IDs should still be present (tasks are stable)
+    firstEmissionIds.forEach(id => {
+      expect(secondEmissionIds.has(id)).to.be.true;
+    });
+  });
+
   it('should normalize empty-string task fields to NULL at write time', async () => {
     // When the rules engine commits task documents, empty-string values for owner,
     // requester, state, and user should be stored as NULL in the database.

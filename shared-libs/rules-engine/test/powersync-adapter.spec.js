@@ -1017,6 +1017,111 @@ describe('powersync-adapter', () => {
     });
   });
 
+  describe('commitTaskDocs → read round-trip', () => {
+    it('preserves emission and stateHistory through JSON round-trip', async () => {
+      // Task documents must survive: commitTaskDocs(JSON.stringify) → SELECT doc → JSON.parse
+      // The emission._id field is critical for getCancellationUpdates matching.
+      const taskWithFullStructure = {
+        _id: 'task~user~emission1~100',
+        type: 'task',
+        state: 'Draft',
+        owner: 'patient',
+        requester: 'patient',
+        user: 'org.couchdb.user:user',
+        authoredOn: 100,
+        emission: {
+          _id: 'emission1',
+          title: 'task.pregnancy.visit',
+          dueDate: '2026-04-15',
+          startDate: '2026-04-10',
+          endDate: '2026-04-20',
+          actions: [{ type: 'report', form: 'pregnancy_visit', content: { source: 'task' } }],
+        },
+        stateHistory: [{ state: 'Draft', timestamp: 100 }],
+      };
+
+      const provider = powersyncProvider(db);
+
+      // Write
+      await provider.commitTaskDocs([taskWithFullStructure]);
+      expect(db._tables.tasks).to.have.length(1);
+
+      // Read back via allTasks (the primary read path)
+      const readBack = await provider.allTasks('owner');
+      expect(readBack).to.have.length(1);
+
+      const doc = readBack[0];
+      expect(doc._id).to.equal('task~user~emission1~100');
+      expect(doc.type).to.equal('task');
+      expect(doc.state).to.equal('Draft');
+      expect(doc.owner).to.equal('patient');
+      expect(doc.requester).to.equal('patient');
+      expect(doc.authoredOn).to.equal(100);
+
+      // Critical: emission must be fully preserved
+      expect(doc.emission).to.be.an('object');
+      expect(doc.emission._id).to.equal('emission1');
+      expect(doc.emission.title).to.equal('task.pregnancy.visit');
+      expect(doc.emission.dueDate).to.equal('2026-04-15');
+      expect(doc.emission.startDate).to.equal('2026-04-10');
+      expect(doc.emission.endDate).to.equal('2026-04-20');
+      expect(doc.emission.actions).to.be.an('array').with.length(1);
+      expect(doc.emission.actions[0].form).to.equal('pregnancy_visit');
+
+      // stateHistory must be preserved
+      expect(doc.stateHistory).to.be.an('array').with.length(1);
+      expect(doc.stateHistory[0]).to.deep.equal({ state: 'Draft', timestamp: 100 });
+    });
+
+    it('preserves emission through update (INSERT OR REPLACE) round-trip', async () => {
+      // Simulate: write task → read → update state → write again → read → verify emission preserved
+      const originalTask = {
+        _id: 'task~user~em2~200',
+        type: 'task',
+        state: 'Draft',
+        owner: 'patient',
+        requester: 'patient',
+        user: 'u1',
+        authoredOn: 200,
+        emission: { _id: 'em2', title: 'task.follow_up', dueDate: '2026-05-01', startDate: '2026-04-28', endDate: '2026-05-05' },
+        stateHistory: [{ state: 'Draft', timestamp: 200 }],
+      };
+
+      const provider = powersyncProvider(db);
+
+      // Write original
+      await provider.commitTaskDocs([originalTask]);
+
+      // Read back
+      const readBack = await provider.tasksByRelation(['patient'], 'requester');
+      expect(readBack).to.have.length(1);
+
+      // Simulate temporal state update (as updateTemporalStates would do)
+      const updatedTask = readBack[0];
+      updatedTask.state = 'Ready';
+      updatedTask.stateHistory.push({ state: 'Ready', timestamp: 300 });
+
+      // Write updated task (INSERT OR REPLACE overwrites the row)
+      await provider.commitTaskDocs([updatedTask]);
+
+      // Read back again
+      const finalRead = await provider.allTasks('owner');
+      const finalDoc = finalRead.find(t => t._id === 'task~user~em2~200');
+      expect(finalDoc).to.exist;
+      expect(finalDoc.state).to.equal('Ready');
+
+      // Emission must survive the double round-trip
+      expect(finalDoc.emission._id).to.equal('em2');
+      expect(finalDoc.emission.title).to.equal('task.follow_up');
+      expect(finalDoc.emission.dueDate).to.equal('2026-05-01');
+
+      // stateHistory must accumulate
+      expect(finalDoc.stateHistory).to.have.length(2);
+      expect(finalDoc.stateHistory[0].state).to.equal('Draft');
+      expect(finalDoc.stateHistory[1].state).to.equal('Ready');
+    });
+  });
+
   describe('tasksByRelation', () => {
     beforeEach(() => {
       seedTasks(db, [
