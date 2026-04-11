@@ -861,6 +861,131 @@ const testSinceNowPollingOnly = async () => {
   }
 };
 
+// ─── Test: parseCursor handles doc IDs containing '::' ───────────────
+const testParseCursorWithDoubleColonInDocId = () => {
+  console.log('\n--- parseCursor with :: in doc ID ---');
+
+  // Doc IDs could theoretically contain '::' (CouchDB allows arbitrary strings).
+  // The old split('::') approach would break these; indexOf-based parsing should not.
+  const cursor = '2026-04-10T12:00:00.123456Z::org.couchdb.user::admin::extra';
+  const { timestamp, id } = PgChangesFeed.parseCursor(cursor);
+  if (timestamp === '2026-04-10T12:00:00.123456Z' && id === 'org.couchdb.user::admin::extra') {
+    pass('parseCursor preserves :: in doc ID');
+  } else {
+    fail('parseCursor ::', `timestamp="${timestamp}" id="${id}"`);
+  }
+
+  // Verify single :: still works (common case)
+  const cursor2 = '2026-04-10T12:00:00.000000Z::simple-doc-id';
+  const parsed2 = PgChangesFeed.parseCursor(cursor2);
+  if (parsed2.timestamp === '2026-04-10T12:00:00.000000Z' && parsed2.id === 'simple-doc-id') {
+    pass('parseCursor still works for normal doc IDs');
+  } else {
+    fail('parseCursor normal', `timestamp="${parsed2.timestamp}" id="${parsed2.id}"`);
+  }
+
+  // Verify empty doc ID after separator
+  const cursor3 = '2026-04-10T12:00:00.000000Z::';
+  const parsed3 = PgChangesFeed.parseCursor(cursor3);
+  if (parsed3.timestamp === '2026-04-10T12:00:00.000000Z' && parsed3.id === '') {
+    pass('parseCursor handles empty doc ID after ::');
+  } else {
+    fail('parseCursor empty id', `timestamp="${parsed3.timestamp}" id="${parsed3.id}"`);
+  }
+
+  // Verify round-trip: buildCursor → parseCursor with :: in doc ID
+  const built = PgChangesFeed.buildCursor('2026-04-10T00:00:00.000000Z', 'a::b::c');
+  const roundTripped = PgChangesFeed.parseCursor(built);
+  if (roundTripped.timestamp === '2026-04-10T00:00:00.000000Z' && roundTripped.id === 'a::b::c') {
+    pass('buildCursor/parseCursor round-trips doc ID with ::');
+  } else {
+    fail('round-trip ::', `timestamp="${roundTripped.timestamp}" id="${roundTripped.id}"`);
+  }
+};
+
+// ─── Test: cancel() mid-poll stops further change emissions ──────────
+const testCancelMidPollStopsEmissions = async () => {
+  console.log('\n--- Cancel Mid-Poll Stops Emissions ---');
+
+  // Insert several docs so the poll has multiple rows to iterate
+  const prefix = `test:cancel-mid:${Date.now()}`;
+  const ids = [];
+  for (let i = 0; i < 20; i++) {
+    const id = `${prefix}:${String(i).padStart(3, '0')}`;
+    ids.push(id);
+    await insertTestDoc(id, 'data_record');
+  }
+  await sleep(200);
+
+  // Start a non-live feed from the beginning with a large batch
+  // so all 20 docs are fetched in one poll
+  const feed = new PgChangesFeed({
+    live: false,
+    since: null,
+    batchSize: 10000,
+  });
+
+  const changes = [];
+  let cancelledAfter = null;
+  feed.on('change', (change) => {
+    changes.push(change);
+    // Cancel after receiving the 3rd test doc
+    const testChanges = changes.filter(c => c.id.startsWith(prefix));
+    if (testChanges.length === 3 && !cancelledAfter) {
+      cancelledAfter = changes.length;
+      feed.cancel();
+    }
+  });
+
+  await feed.start();
+  await sleep(500);
+
+  // After cancel, we should have stopped receiving changes.
+  // The exact count depends on timing, but we should NOT have
+  // received all 20 test docs if cancel worked mid-loop.
+  const testChangesReceived = changes.filter(c => c.id.startsWith(prefix));
+
+  if (cancelledAfter !== null) {
+    // We did cancel. The key assertion: no changes were emitted
+    // AFTER the cancel() call within the same poll iteration.
+    // Since cancel sets _running=false and the loop checks it,
+    // the total changes should be close to cancelledAfter.
+    if (changes.length <= cancelledAfter + 1) {
+      pass(`Cancel stopped emissions (got ${changes.length} total, cancelled after ${cancelledAfter})`);
+    } else {
+      // Even a few extra is OK (the check happens at loop top, so
+      // the emit that triggered cancel counts). But getting ALL
+      // remaining rows means the fix isn't working.
+      if (testChangesReceived.length < ids.length) {
+        pass(`Cancel reduced emissions: ${testChangesReceived.length}/${ids.length} test docs (cancelled after change #${cancelledAfter})`);
+      } else {
+        fail('cancel mid-poll',
+          `all ${testChangesReceived.length} test docs emitted despite cancel after #${cancelledAfter}`);
+      }
+    }
+  } else {
+    // Cancel was never triggered — test setup issue
+    fail('cancel mid-poll', `cancel never triggered. Got ${testChangesReceived.length} test changes`);
+  }
+};
+
+// ─── Test: metadataPool has error handler (no process crash) ─────────
+const testMetadataPoolHasErrorHandler = () => {
+  console.log('\n--- Metadata Pool Error Handler ---');
+  const pgChanges = require('../../src/lib/pg-changes');
+
+  // Verify the pool has at least one 'error' listener.
+  // Without this, an idle connection error from PostgreSQL would
+  // crash the process as an unhandled 'error' event.
+  const listenerCount = pgChanges._metadataPool.listenerCount('error');
+  if (listenerCount >= 1) {
+    pass(`metadataPool has ${listenerCount} error listener(s) — no process crash risk`);
+  } else {
+    fail('metadata pool error handler',
+      `expected >= 1 error listener, got ${listenerCount}`);
+  }
+};
+
 // ─── Main ──────────────────────────────────────────────────────────────
 const run = async () => {
   console.log('PostgreSQL Changes Detection — Integration Tests\n');
@@ -896,9 +1021,12 @@ const run = async () => {
     await testMicrosecondPrecisionInCursor();
     await testLiveFeedNoDuplicateOnScheduledPoll();
     testParseCursorNowSafetyNet();
+    testParseCursorWithDoubleColonInDocId();
+    testMetadataPoolHasErrorHandler();
     await testSinceNowCursorResolution();
     await testSinceNowPollingOnly();
     await testCancelDuringPollNoError();
+    await testCancelMidPollStopsEmissions();
   } finally {
     await cleanup();
     await pool.end();

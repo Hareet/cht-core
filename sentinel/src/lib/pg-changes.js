@@ -170,18 +170,24 @@ class PgChangesFeed extends EventEmitter {
     if (seq === 'now') {
       return { timestamp: null, id: '' };
     }
-    const parts = String(seq).split('::');
-    const timestamp = parts[0];
+    const seqStr = String(seq);
+    const sepIdx = seqStr.indexOf('::');
+    if (sepIdx === -1) {
+      // Backwards compat: plain timestamp with no '::' separator
+      const timestamp = seqStr;
+      if (!timestamp || timestamp === 'null' || timestamp === 'undefined') {
+        return { timestamp: null, id: '' };
+      }
+      return { timestamp, id: '' };
+    }
+    const timestamp = seqStr.substring(0, sepIdx);
+    const id = seqStr.substring(sepIdx + 2);
     // Guard against cursors built from rows with NULL saved_timestamp,
     // which produce the literal string "null" instead of a valid ISO date.
     if (!timestamp || timestamp === 'null' || timestamp === 'undefined') {
       return { timestamp: null, id: '' };
     }
-    if (parts.length === 2) {
-      return { timestamp, id: parts[1] };
-    }
-    // Backwards compat: plain timestamp
-    return { timestamp, id: '' };
+    return { timestamp, id };
   }
 
   /**
@@ -341,6 +347,16 @@ class PgChangesFeed extends EventEmitter {
         }
 
         for (const row of result.rows) {
+          // A listener may call cancel() during a 'change' emission
+          // (e.g. feed.js cancels when its queue is full). Stop
+          // emitting immediately to avoid pushing changes into a
+          // cancelled consumer. The cursor is advanced past ALL rows
+          // after the loop regardless, so no changes are lost on
+          // the next feed start.
+          if (!this._running) {
+            break;
+          }
+
           if (row._id.match(IDS_TO_IGNORE)) {
             continue;
           }
@@ -437,6 +453,9 @@ class PgChangesFeed extends EventEmitter {
  * Replaces sentinel/src/lib/metadata.js get/set on sentinel CouchDB.
  */
 const metadataPool = new Pool(getConnectionConfig());
+metadataPool.on('error', (err) => {
+  logger.error('pg-changes: Metadata pool error: %o', err);
+});
 
 let metadataInitialized = false;
 
