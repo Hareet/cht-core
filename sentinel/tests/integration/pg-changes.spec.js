@@ -363,6 +363,89 @@ const testRapidFireNotifications = async () => {
   }
 };
 
+// ─── Test: Backlog draining — full batches trigger immediate re-polls ─
+const testBacklogDraining = async () => {
+  console.log('\n--- Backlog Draining (multi-batch catch-up) ---');
+
+  // Insert more docs than BATCH_SIZE *before* starting the feed.
+  // This simulates Sentinel starting up after downtime with a large
+  // backlog of unprocessed changes.
+  const batchSize = 10; // small batch to keep the test fast
+  const totalDocs = 35; // 3.5x batch → requires 4 polls to drain
+  const prefix = `test:backlog:${Date.now()}`;
+  const ids = [];
+
+  for (let i = 0; i < totalDocs; i++) {
+    const id = `${prefix}:${String(i).padStart(3, '0')}`;
+    ids.push(id);
+    await insertTestDoc(id, 'data_record');
+  }
+  await sleep(200);
+
+  // Get a cursor from just before the inserts so the feed starts
+  // behind the backlog.
+  const cursorClient = await pool.connect();
+  let beforeCursor;
+  try {
+    const res = await cursorClient.query(
+      `SELECT to_char(MIN(saved_timestamp) AT TIME ZONE 'UTC',
+              'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS ts
+       FROM v1.couchdb WHERE _id = $1`,
+      [ids[0]]
+    );
+    // Build a cursor just before the first test doc so all of them
+    // are "new" to the feed. Use a _id that sorts before any test ID
+    // to ensure the composite cursor comparison includes the first doc.
+    beforeCursor = PgChangesFeed.buildCursor(res.rows[0].ts, '');
+  } finally {
+    cursorClient.release();
+  }
+
+  // Start a NON-live feed with a small batch size.
+  // With the fix, the feed should drain all 35 docs in one start()
+  // call via consecutive re-polls. Without the fix, it would only
+  // fetch 10 docs (one batch) and stop.
+  const feed = new PgChangesFeed({
+    live: false,
+    since: beforeCursor,
+    batchSize: batchSize,
+  });
+
+  const changes = [];
+  feed.on('change', c => changes.push(c));
+  await feed.start();
+
+  // Give time for the chain of re-polls to complete.
+  // 4 re-polls × ~50ms each should be well within 2 seconds.
+  await sleep(2000);
+  feed.cancel();
+
+  const found = ids.filter(id => changes.some(c => c.id === id));
+  if (found.length === totalDocs) {
+    pass(`All ${totalDocs} backlog docs drained across ${Math.ceil(totalDocs / batchSize)} batches`);
+  } else {
+    fail('backlog draining',
+      `only ${found.length}/${totalDocs} docs detected — ` +
+      `missing: ${ids.filter(id => !changes.some(c => c.id === id)).slice(0, 5).join(', ')}...`);
+  }
+
+  // Verify no duplicates
+  const seen = new Set();
+  const dupes = changes.filter(c => {
+    if (seen.has(c.id)) {
+      return true;
+    }
+    seen.add(c.id);
+    return false;
+  });
+
+  if (dupes.length === 0) {
+    pass('No duplicate changes during backlog drain');
+  } else {
+    fail('backlog no-dupes', `${dupes.length} duplicates: ${dupes.slice(0, 3).map(c => c.id).join(', ')}`);
+  }
+};
+
 // ─── Test: Reconnection catch-up poll after LISTEN connection drop ────
 const testReconnectionCatchUp = async () => {
   console.log('\n--- Reconnection Catch-Up Poll ---');
@@ -483,6 +566,150 @@ const testMetadataAutoInit = async () => {
   }
 };
 
+// ─── Test: Consecutive polls produce no duplicate changes ─────────────
+const testNoDuplicatesOnConsecutivePolls = async () => {
+  console.log('\n--- No Duplicates on Consecutive Polls ---');
+
+  // Insert a doc so we have something to poll
+  const docId = `test:no-dup:${Date.now()}`;
+  await insertTestDoc(docId, 'data_record');
+  await sleep(200);
+
+  // First poll: non-live, fetch everything up to our doc
+  const feed1 = new PgChangesFeed({ live: false, since: null, batchSize: 10000 });
+  const changes1 = [];
+  feed1.on('change', c => changes1.push(c));
+  await feed1.start();
+  await sleep(500);
+  const cursor = feed1.seq;
+  feed1.cancel();
+
+  if (!changes1.some(c => c.id === docId)) {
+    fail('no-dup setup', `doc ${docId} not found in first poll`);
+    return;
+  }
+  pass(`First poll found test doc (${changes1.length} total, cursor: ${cursor.substring(0, 50)}...)`);
+
+  // Second poll from the cursor — should return zero changes
+  // (no new docs inserted between polls)
+  const feed2 = new PgChangesFeed({ live: false, since: cursor, batchSize: 10000 });
+  const changes2 = [];
+  feed2.on('change', c => changes2.push(c));
+  await feed2.start();
+  await sleep(500);
+  feed2.cancel();
+
+  if (changes2.length === 0) {
+    pass('Second poll from same cursor returned zero changes (no duplicates)');
+  } else {
+    fail('no-dup', `expected 0 changes, got ${changes2.length}: ${changes2.map(c => c.id).join(', ')}`);
+  }
+
+  // Third poll — also should return zero
+  const feed3 = new PgChangesFeed({ live: false, since: cursor, batchSize: 10000 });
+  const changes3 = [];
+  feed3.on('change', c => changes3.push(c));
+  await feed3.start();
+  await sleep(500);
+  feed3.cancel();
+
+  if (changes3.length === 0) {
+    pass('Third poll from same cursor also returned zero (stable cursor)');
+  } else {
+    fail('no-dup-3rd', `expected 0, got ${changes3.length}: ${changes3.map(c => c.id).join(', ')}`);
+  }
+};
+
+// ─── Test: Cursor preserves microsecond precision ─────────────────────
+const testMicrosecondPrecisionInCursor = async () => {
+  console.log('\n--- Microsecond Precision in Cursor ---');
+
+  // Insert a doc and verify the cursor timestamp has > 3 decimal places
+  const docId = `test:usec:${Date.now()}`;
+  await insertTestDoc(docId, 'data_record');
+  await sleep(200);
+
+  const feed = new PgChangesFeed({ live: false, since: null, batchSize: 10000 });
+  const changes = [];
+  feed.on('change', c => changes.push(c));
+  await feed.start();
+  await sleep(500);
+  feed.cancel();
+
+  const change = changes.find(c => c.id === docId);
+  if (!change) {
+    fail('usec setup', `doc ${docId} not found`);
+    return;
+  }
+
+  const { timestamp } = PgChangesFeed.parseCursor(change.seq);
+  // Microsecond-format timestamp: 2026-04-10T03:00:00.123456Z (6 decimal places)
+  // Millisecond-format (old bug): 2026-04-10T03:00:00.123Z (3 decimal places)
+  const decimals = timestamp.split('.')[1]?.replace('Z', '') || '';
+  if (decimals.length === 6) {
+    pass(`Cursor has microsecond precision: ...${decimals}Z`);
+  } else if (decimals.length > 3) {
+    pass(`Cursor has sub-millisecond precision: ${decimals.length} digits`);
+  } else {
+    fail('usec precision', `expected 6 decimal digits, got ${decimals.length}: ${timestamp}`);
+  }
+
+  // Verify the timestamp round-trips correctly through PostgreSQL
+  const client = await pool.connect();
+  try {
+    const res = await client.query(
+      `SELECT ($1::timestamptz = (
+         SELECT saved_timestamp FROM v1.couchdb WHERE _id = $2
+       )) as matches`,
+      [timestamp, docId]
+    );
+    if (res.rows[0].matches) {
+      pass('Cursor timestamp round-trips exactly through PostgreSQL');
+    } else {
+      fail('usec round-trip', 'cursor timestamp does not match stored value');
+    }
+  } finally {
+    client.release();
+  }
+};
+
+// ─── Test: Live feed does not re-emit same change on scheduled polls ──
+const testLiveFeedNoDuplicateOnScheduledPoll = async () => {
+  console.log('\n--- Live Feed: No Duplicate on Scheduled Poll ---');
+
+  const docId = `test:live-nodup:${Date.now()}`;
+
+  // Start live feed with a SHORT poll interval so we exercise the
+  // scheduled poll path multiple times
+  const feed = new PgChangesFeed({
+    live: true,
+    since: PgChangesFeed.buildCursor(new Date().toISOString(), '\uffff'),
+    batchSize: 100,
+    pollInterval: 500, // Short: 500ms — will fire several times during the test
+  });
+
+  const changes = [];
+  feed.on('change', c => changes.push(c));
+  await feed.start();
+  await sleep(300);
+
+  // Insert a single doc
+  await insertTestDoc(docId, 'data_record');
+
+  // Wait for several scheduled poll cycles (500ms * ~6 = 3s)
+  await sleep(3000);
+  feed.cancel();
+
+  const matches = changes.filter(c => c.id === docId);
+  if (matches.length === 1) {
+    pass(`Live feed emitted doc exactly once across ${Math.floor(3000 / 500)} poll cycles`);
+  } else if (matches.length === 0) {
+    fail('live-nodup', 'doc never detected');
+  } else {
+    fail('live-nodup', `doc emitted ${matches.length} times (expected exactly 1) — cursor precision bug`);
+  }
+};
+
 // ─── Main ──────────────────────────────────────────────────────────────
 const run = async () => {
   console.log('PostgreSQL Changes Detection — Integration Tests\n');
@@ -510,9 +737,13 @@ const run = async () => {
     await testMetadata();
     await testPendingPoll();
     await testRapidFireNotifications();
+    await testBacklogDraining();
     await testReconnectionCatchUp();
     await testReconnectedEventNotOnFirstConnect();
     await testMetadataAutoInit();
+    await testNoDuplicatesOnConsecutivePolls();
+    await testMicrosecondPrecisionInCursor();
+    await testLiveFeedNoDuplicateOnScheduledPoll();
   } finally {
     await cleanup();
     await pool.end();

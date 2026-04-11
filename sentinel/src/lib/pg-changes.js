@@ -164,11 +164,17 @@ class PgChangesFeed extends EventEmitter {
       return { timestamp: null, id: '' };
     }
     const parts = String(seq).split('::');
+    const timestamp = parts[0];
+    // Guard against cursors built from rows with NULL saved_timestamp,
+    // which produce the literal string "null" instead of a valid ISO date.
+    if (!timestamp || timestamp === 'null' || timestamp === 'undefined') {
+      return { timestamp: null, id: '' };
+    }
     if (parts.length === 2) {
-      return { timestamp: parts[0], id: parts[1] };
+      return { timestamp, id: parts[1] };
     }
     // Backwards compat: plain timestamp
-    return { timestamp: parts[0], id: '' };
+    return { timestamp, id: '' };
   }
 
   /**
@@ -272,21 +278,37 @@ class PgChangesFeed extends EventEmitter {
       try {
         let result;
 
+        // Use to_char() to preserve microsecond precision that JavaScript
+        // Date objects would truncate to milliseconds. Without this, the
+        // cursor's truncated timestamp can re-match the last row on every
+        // poll, causing infinite duplicate emissions.
+        const selectCols = `_id, _deleted,
+             to_char(saved_timestamp AT TIME ZONE 'UTC',
+                     'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS saved_ts,
+             doc->>'_rev' as rev`;
+
         if (!timestamp) {
-          // No cursor — fetch from the beginning
+          // No cursor — fetch from the beginning.
+          // Exclude NULL saved_timestamp rows — they cannot participate
+          // in deterministic cursor-based ordering and would produce
+          // invalid cursors (the literal string "null") that crash the
+          // next poll.
           result = await client.query(
-            `SELECT _id, _deleted, saved_timestamp, doc->>'_rev' as rev
+            `SELECT ${selectCols}
              FROM ${this._schema}.${this._table}
+             WHERE saved_timestamp IS NOT NULL
              ORDER BY saved_timestamp, _id
              LIMIT $1`,
             [this._batchSize]
           );
         } else {
-          // Composite cursor: get rows after (timestamp, id)
+          // Composite cursor: get rows after (timestamp, id).
+          // The WHERE clause implicitly excludes NULL saved_timestamp
+          // rows since NULL never satisfies comparison operators.
           result = await client.query(
-            `SELECT _id, _deleted, saved_timestamp, doc->>'_rev' as rev
+            `SELECT ${selectCols}
              FROM ${this._schema}.${this._table}
-             WHERE (saved_timestamp, _id) > ($1::timestamp, $2)
+             WHERE (saved_timestamp, _id) > ($1::timestamptz, $2)
              ORDER BY saved_timestamp, _id
              LIMIT $3`,
             [timestamp, id, this._batchSize]
@@ -298,7 +320,7 @@ class PgChangesFeed extends EventEmitter {
             continue;
           }
 
-          const seq = PgChangesFeed.buildCursor(row.saved_timestamp.toISOString(), row._id);
+          const seq = PgChangesFeed.buildCursor(row.saved_ts, row._id);
           this._since = seq;
 
           this.emit('change', {
@@ -309,12 +331,24 @@ class PgChangesFeed extends EventEmitter {
           });
         }
 
+        // Always advance cursor past the last fetched row (including
+        // ignored ones like _design docs) so they aren't re-fetched.
         if (result.rows.length > 0) {
           const lastRow = result.rows[result.rows.length - 1];
           this._since = PgChangesFeed.buildCursor(
-            lastRow.saved_timestamp.toISOString(),
+            lastRow.saved_ts,
             lastRow._id
           );
+        }
+
+        // When the result is a full batch, there are likely more rows
+        // waiting. Flag a pending poll so the backlog is drained
+        // immediately rather than waiting for the next scheduled poll
+        // or NOTIFY. This is critical for catch-up after Sentinel
+        // downtime or large data imports.
+        if (result.rows.length === this._batchSize) {
+          this._pendingPoll = true;
+          logger.debug('pg-changes: Full batch (%d rows) — will re-poll immediately to drain backlog', this._batchSize);
         }
       } finally {
         client.release();
@@ -326,7 +360,8 @@ class PgChangesFeed extends EventEmitter {
       this._polling = false;
       if (this._pendingPoll && this._running) {
         this._pendingPoll = false;
-        // Re-poll immediately for notifications received during the previous poll
+        // Re-poll immediately to drain backlog or pick up changes
+        // that arrived during the previous poll.
         this._poll().catch(err => {
           logger.error('pg-changes: Pending re-poll error: %o', err);
         });
