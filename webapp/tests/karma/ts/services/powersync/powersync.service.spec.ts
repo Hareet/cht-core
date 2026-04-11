@@ -981,5 +981,130 @@ describe('PowerSync Service', () => {
         expect((service as any).initialized).to.be.false;
       });
     });
+
+    describe('reconnect / disconnectAndClear race', () => {
+      it('should not crash when disconnectAndClear runs during reconnect await', async () => {
+        // Simulate: disconnect() yields, and during that yield disconnectAndClear()
+        // runs to completion, setting this.db = null. Without the post-yield guard,
+        // reconnect() would call this.db.connect() on null → TypeError.
+        mockDb.disconnect = sinon.stub().callsFake(async () => {
+          // While reconnect is awaiting disconnect(), a logout triggers disconnectAndClear
+          await service.disconnectAndClear();
+        });
+
+        // Should NOT throw TypeError: Cannot read properties of null
+        await service.reconnect();
+
+        // Service should be fully cleaned up
+        expect((service as any).db).to.be.null;
+        expect((service as any).connector).to.be.null;
+        expect((service as any).initialized).to.be.false;
+        expect((service as any).reconnecting).to.be.false;
+      });
+
+      it('should not call connect when db is cleared during reconnect', async () => {
+        const originalConnectStub = mockDb.connect;
+
+        mockDb.disconnect = sinon.stub().callsFake(async () => {
+          await service.disconnectAndClear();
+        });
+
+        await service.reconnect();
+
+        // connect() should NOT have been called since db was nulled
+        expect(originalConnectStub.called).to.be.false;
+      });
+
+      it('should reset reconnecting flag even when db is cleared mid-reconnect', async () => {
+        mockDb.disconnect = sinon.stub().callsFake(async () => {
+          await service.disconnectAndClear();
+        });
+
+        await service.reconnect();
+
+        // reconnecting must be false so future reconnects aren't permanently blocked
+        expect((service as any).reconnecting).to.be.false;
+      });
+
+      it('should reset status to disconnected after race', async () => {
+        mockDb.disconnect = sinon.stub().callsFake(async () => {
+          await service.disconnectAndClear();
+        });
+
+        await service.reconnect();
+
+        const status = service.getCurrentStatus();
+        expect(status.connected).to.be.false;
+        expect(status.hasSynced).to.be.false;
+        expect(status.uploading).to.be.false;
+        expect(status.downloading).to.be.false;
+      });
+
+      it('should handle disconnectAndClear when reconnecting flag is set', async () => {
+        // Start a slow reconnect
+        mockDb.disconnect = sinon.stub().callsFake(
+          () => new Promise(resolve => setTimeout(resolve, 50))
+        );
+
+        const reconnectPromise = service.reconnect();
+
+        // disconnectAndClear runs while reconnect is in progress
+        await service.disconnectAndClear();
+
+        // Wait for reconnect to finish
+        await reconnectPromise;
+
+        // Service should be cleaned up, reconnect flag cleared
+        expect((service as any).db).to.be.null;
+        expect((service as any).reconnecting).to.be.false;
+      });
+    });
+
+    describe('ngOnDestroy', () => {
+      it('should call disconnectAndClear on destroy', async () => {
+        const spy = sinon.spy(service, 'disconnectAndClear');
+
+        service.ngOnDestroy();
+
+        expect(spy.calledOnce).to.be.true;
+      });
+
+      it('should complete the destroyed$ subject on destroy', () => {
+        const destroyed$ = (service as any).destroyed$;
+        let completed = false;
+        destroyed$.subscribe({ complete: () => { completed = true; } });
+
+        service.ngOnDestroy();
+
+        expect(completed).to.be.true;
+      });
+
+      it('should be safe to call ngOnDestroy when not initialized', () => {
+        (service as any).db = null;
+        (service as any).connector = null;
+        (service as any).initialized = false;
+
+        // Should not throw
+        service.ngOnDestroy();
+      });
+
+      it('should reset status after destroy', async () => {
+        // Set a "connected" status first
+        (service as any).statusSubject.next({
+          ...service.getCurrentStatus(),
+          connected: true,
+          hasSynced: true,
+        });
+
+        service.ngOnDestroy();
+
+        // Allow the async disconnectAndClear to settle
+        await new Promise(resolve => setTimeout(resolve, 10));
+
+        const status = service.getCurrentStatus();
+        expect(status.connected).to.be.false;
+        expect(status.hasSynced).to.be.false;
+      });
+    });
   });
 });

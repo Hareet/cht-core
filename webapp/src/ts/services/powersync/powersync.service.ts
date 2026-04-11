@@ -451,6 +451,12 @@ export class PowerSyncService implements OnDestroy {
       } catch (err) {
         console.warn('PowerSync: disconnect failed during reconnect, attempting connect anyway:', err);
       }
+      // Re-check after async yield: disconnectAndClear() may have run during
+      // the await above, nullifying db/connector. Without this guard, calling
+      // connect() on a null reference throws a TypeError.
+      if (!this.db || !this.connector) {
+        return;
+      }
       // connect() is fire-and-forget; sync resumes in the background
       this.db.connect(this.connector);
     } finally {
