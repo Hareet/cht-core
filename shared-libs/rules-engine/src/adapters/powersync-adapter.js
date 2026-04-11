@@ -275,11 +275,15 @@ const powersyncProvider = (db) => {
           for (const taskDoc of taskDocs) {
             const id = taskDoc._id;
             const doc = JSON.stringify(taskDoc);
+            // Use || for string fields to normalize falsy values (empty string, undefined, null)
+            // to NULL, matching CouchDB's JavaScript truthiness semantics.
+            // The tasks_by_contact view uses `doc.owner || '_unassigned'` and `if (doc.requester)`,
+            // treating empty strings as falsy. Keep ?? for authoredOn since 0 is a valid timestamp.
             await tx.execute(
               `INSERT OR REPLACE INTO tasks (id, type, state, owner, requester, user, authored_on, doc)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-              [id, 'task', taskDoc.state ?? null, taskDoc.owner ?? null, taskDoc.requester ?? null,
-                taskDoc.user ?? null, taskDoc.authoredOn ?? null, doc]
+              [id, 'task', taskDoc.state || null, taskDoc.owner || null, taskDoc.requester || null,
+                taskDoc.user || null, taskDoc.authoredOn ?? null, doc]
             );
           }
         });

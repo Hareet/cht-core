@@ -924,6 +924,97 @@ describe('powersync-adapter', () => {
       // Should not throw
       await powersyncProvider(db).commitTaskDocs([{ _id: 'task1', type: 'task' }]);
     });
+
+    it('normalizes empty-string owner/requester/state/user to NULL (PouchDB parity)', async () => {
+      // CouchDB tasks_by_contact view uses JavaScript truthiness:
+      //   doc.owner || '_unassigned'  — empty string is falsy, treated as unassigned
+      //   if (doc.requester)           — empty string is falsy, no emit
+      // PowerSync must normalize empty strings to NULL at write time so that
+      // SQL IS NULL checks match the CouchDB behavior.
+      const taskDocs = [
+        { _id: 'emptyFields', type: 'task', state: '', owner: '', requester: '', user: '', authoredOn: 100 },
+      ];
+
+      await powersyncProvider(db).commitTaskDocs(taskDocs);
+      expect(db._tables.tasks).to.have.length(1);
+
+      const written = db._tables.tasks[0];
+      // String fields should be normalized to null (empty string is falsy in JS)
+      expect(written.state).to.be.null;
+      expect(written.owner).to.be.null;
+      expect(written.requester).to.be.null;
+      expect(written.user).to.be.null;
+      // authoredOn uses ?? (not ||) so 0 is preserved as a valid timestamp
+      expect(written.authored_on).to.equal(100);
+    });
+
+    it('preserves valid string field values', async () => {
+      const taskDocs = [
+        { _id: 'validFields', type: 'task', state: 'Ready', owner: 'p1', requester: 'p1', user: 'u1', authoredOn: 0 },
+      ];
+
+      await powersyncProvider(db).commitTaskDocs(taskDocs);
+      const written = db._tables.tasks[0];
+      expect(written.state).to.equal('Ready');
+      expect(written.owner).to.equal('p1');
+      expect(written.requester).to.equal('p1');
+      expect(written.user).to.equal('u1');
+      // authoredOn: 0 is a valid epoch timestamp and must be preserved
+      expect(written.authored_on).to.equal(0);
+    });
+
+    it('normalizes undefined fields to NULL', async () => {
+      const taskDocs = [
+        { _id: 'undefinedFields', type: 'task' },
+      ];
+
+      await powersyncProvider(db).commitTaskDocs(taskDocs);
+      const written = db._tables.tasks[0];
+      expect(written.state).to.be.null;
+      expect(written.owner).to.be.null;
+      expect(written.requester).to.be.null;
+      expect(written.user).to.be.null;
+      expect(written.authored_on).to.be.null;
+    });
+
+    it('tasks with normalized empty owner are included by allTasks owner query', async () => {
+      // Write a task with empty-string owner via commitTaskDocs
+      await powersyncProvider(db).commitTaskDocs([
+        { _id: 'emptyOwnerTask', type: 'task', state: 'Ready', owner: '', requester: 'p1' },
+      ]);
+
+      // The empty owner was normalized to NULL at write time.
+      // allTasks('owner') returns all non-terminal tasks regardless of owner.
+      const result = await powersyncProvider(db).allTasks('owner');
+      const ids = result.map(d => d._id);
+      expect(ids).to.include('emptyOwnerTask');
+    });
+
+    it('tasks with normalized empty requester are excluded by allTasks requester query', async () => {
+      // Write a task with empty-string requester via commitTaskDocs
+      await powersyncProvider(db).commitTaskDocs([
+        { _id: 'emptyReqTask', type: 'task', owner: 'p1', requester: '' },
+      ]);
+
+      // The empty requester was normalized to NULL at write time.
+      // allTasks('requester') filters: requester IS NOT NULL AND requester != ''
+      // NULL requester correctly excluded — matches PouchDB (view checks `if (doc.requester)`).
+      const result = await powersyncProvider(db).allTasks('requester');
+      const ids = result.map(d => d._id);
+      expect(ids).to.not.include('emptyReqTask');
+    });
+
+    it('tasks with normalized empty owner map to _unassigned in allTaskRows', async () => {
+      await powersyncProvider(db).commitTaskDocs([
+        { _id: 'emptyOwnerTask2', type: 'task', state: 'Draft', owner: '' },
+      ]);
+
+      const rows = await powersyncProvider(db).allTaskRows();
+      const row = rows.find(r => r.id === 'emptyOwnerTask2');
+      expect(row).to.exist;
+      // NULL owner maps to '_unassigned' in key (PouchDB parity: view uses doc.owner || '_unassigned')
+      expect(row.key).to.deep.equal(['owner', 'all', '_unassigned']);
+    });
   });
 
   describe('tasksByRelation', () => {

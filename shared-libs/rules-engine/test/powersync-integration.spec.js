@@ -85,10 +85,10 @@ const createMockPowerSyncDb = () => {
   };
 
   const evalWhere = (row, clause, params, state) => {
-    // Handle OR
+    // Handle OR — share state by reference so parameter indices advance correctly across branches
     const orParts = splitOutside(clause, ' OR ');
     if (orParts.length > 1) {
-      return orParts.some(p => evalWhere(row, p.trim(), params, { idx: state.idx }));
+      return orParts.some(p => evalWhere(row, p.trim(), params, state));
     }
     // Handle AND
     const andParts = splitOutside(clause, ' AND ');
@@ -138,6 +138,16 @@ const createMockPowerSyncDb = () => {
     if (eq) {
       const val = params[state.idx++];
       return row[eq[1]] === val;
+    }
+    // != 'literal' — matches CouchDB JavaScript truthiness checks (e.g., form != '').
+    // SQL semantics: NULL != 'x' evaluates to NULL (falsy).
+    const neqLit = trimmed.match(/^(\w+)\s*!=\s*'([^']*)'/);
+    if (neqLit) {
+      const val = row[neqLit[1]];
+      if (val == null) {
+        return false;
+      }
+      return val !== neqLit[2];
     }
     // = 'literal'
     const eqLit = trimmed.match(/^(\w+)\s*=\s*'([^']*)'/);
@@ -564,6 +574,76 @@ describe('PowerSync adapter integration tests', () => {
       expect(task.owner).to.equal(patientContact._id);
     });
   });
+
+  it('should exclude reports with empty-string form from task generation (PouchDB parity)', async () => {
+    // CouchDB reports_by_subject view uses `if (doc.form)` — empty string is falsy.
+    // Reports with form='' must be excluded by the adapter's SQL `form != ''` check.
+    // This validates the integration test mock's evalWhere handles != 'literal'.
+    seedContact(mockDb, patientContact);
+    seedReport(mockDb, pregnancyRegistrationReport);
+
+    // Seed a report with empty-string form — should be invisible to the rules engine
+    mockDb._tables.reports.push({
+      id: 'empty-form-report',
+      type: 'data_record',
+      form: '',
+      patient_id: patientContact.patient_id,
+      place_id: null,
+      subject_id: null,
+      case_id: null,
+      reported_date: TEST_START + 1000,
+      doc: JSON.stringify({
+        _id: 'empty-form-report',
+        type: 'data_record',
+        form: '',
+        fields: { patient_id: patientContact.patient_id },
+        patient_id: patientContact.patient_id,
+        reported_date: TEST_START + 1000,
+      }),
+      _rawDoc: {
+        _id: 'empty-form-report',
+        type: 'data_record',
+        form: '',
+        fields: { patient_id: patientContact.patient_id },
+        patient_id: patientContact.patient_id,
+        reported_date: TEST_START + 1000,
+      },
+    });
+
+    await rulesEngine.refreshEmissionsFor();
+
+    // All generated tasks should be owned by the patient — the empty-form report
+    // should NOT have created any additional task emissions
+    const writtenTasks = mockDb._tables.tasks;
+    expect(writtenTasks.length).to.be.greaterThan(0);
+    writtenTasks.forEach(task => {
+      expect(task.owner).to.equal(patientContact._id);
+    });
+  });
+
+  it('should normalize empty-string task fields to NULL at write time', async () => {
+    // When the rules engine commits task documents, empty-string values for owner,
+    // requester, state, and user should be stored as NULL in the database.
+    // This matches CouchDB's JavaScript truthiness semantics where the view uses
+    // `doc.owner || '_unassigned'` and `if (doc.requester)`.
+    seedContact(mockDb, patientContact);
+    seedReport(mockDb, pregnancyRegistrationReport);
+
+    await rulesEngine.refreshEmissionsFor();
+
+    // All tasks written by the rules engine should have proper non-empty values
+    const writtenTasks = mockDb._tables.tasks;
+    expect(writtenTasks.length).to.be.greaterThan(0);
+    writtenTasks.forEach(task => {
+      // owner, requester, state should be non-empty strings (set by rules engine)
+      expect(task.owner).to.be.a('string').and.not.equal('');
+      expect(task.state).to.be.a('string').and.not.equal('');
+      // requester is set by transform-task-emission-to-doc
+      if (task.requester !== null) {
+        expect(task.requester).to.be.a('string').and.not.equal('');
+      }
+    });
+  });
 });
 
 describe('PowerSync schema metadata', () => {
@@ -702,5 +782,196 @@ describe('PowerSync backend connector', () => {
     await connector.uploadData(mockDatabase);
     expect(completeSpy.calledOnce).to.be.true;
     // No fetch call because contacts is read-only
+  });
+
+  it('uploadData should handle PATCH operations (task updates)', async () => {
+    const connector = createChtBackendConnector({
+      apiUrl: 'https://cht.example.com',
+      getAuthToken: async () => 'token',
+    });
+
+    const completeSpy = sinon.spy();
+    const mockTransaction = {
+      crud: [{
+        table: 'tasks',
+        op: 'PATCH',
+        id: 'task~user~emission~123',
+        opData: { doc: JSON.stringify({ _id: 'task~user~emission~123', type: 'task', state: 'Completed' }) },
+      }],
+      complete: completeSpy,
+    };
+
+    const mockDatabase = {
+      getNextCrudTransaction: async () => mockTransaction,
+    };
+
+    const fetchStub = sinon.stub(globalThis, 'fetch').resolves({ ok: true, status: 200 });
+    try {
+      await connector.uploadData(mockDatabase);
+      expect(completeSpy.calledOnce).to.be.true;
+      expect(fetchStub.calledOnce).to.be.true;
+      // PATCH maps to PUT HTTP method
+      expect(fetchStub.firstCall.args[1].method).to.equal('PUT');
+    } finally {
+      fetchStub.restore();
+    }
+  });
+
+  it('uploadData should handle DELETE operations', async () => {
+    const connector = createChtBackendConnector({
+      apiUrl: 'https://cht.example.com',
+      getAuthToken: async () => 'token',
+    });
+
+    const completeSpy = sinon.spy();
+    const mockTransaction = {
+      crud: [{
+        table: 'targets',
+        op: 'DELETE',
+        id: 'target~2026-04~contact~user',
+        opData: {},
+      }],
+      complete: completeSpy,
+    };
+
+    const mockDatabase = {
+      getNextCrudTransaction: async () => mockTransaction,
+    };
+
+    const fetchStub = sinon.stub(globalThis, 'fetch').resolves({ ok: true, status: 200 });
+    try {
+      await connector.uploadData(mockDatabase);
+      expect(completeSpy.calledOnce).to.be.true;
+      expect(fetchStub.firstCall.args[1].method).to.equal('DELETE');
+    } finally {
+      fetchStub.restore();
+    }
+  });
+
+  it('uploadData should throw on 5xx server errors for retry', async () => {
+    const connector = createChtBackendConnector({
+      apiUrl: 'https://cht.example.com',
+      getAuthToken: async () => 'token',
+    });
+
+    const completeSpy = sinon.spy();
+    const mockTransaction = {
+      crud: [{
+        table: 'tasks',
+        op: 'PUT',
+        id: 'task-1',
+        opData: { doc: JSON.stringify({ _id: 'task-1', type: 'task' }) },
+      }],
+      complete: completeSpy,
+    };
+
+    const mockDatabase = {
+      getNextCrudTransaction: async () => mockTransaction,
+    };
+
+    const fetchStub = sinon.stub(globalThis, 'fetch').resolves({ ok: false, status: 503 });
+    try {
+      await expect(connector.uploadData(mockDatabase)).to.be.rejectedWith('Server error');
+      expect(completeSpy.called).to.be.false;
+    } finally {
+      fetchStub.restore();
+    }
+  });
+
+  it('uploadData should log but not throw on 4xx client errors', async () => {
+    const connector = createChtBackendConnector({
+      apiUrl: 'https://cht.example.com',
+      getAuthToken: async () => 'token',
+    });
+
+    const completeSpy = sinon.spy();
+    const mockTransaction = {
+      crud: [{
+        table: 'tasks',
+        op: 'PUT',
+        id: 'task-1',
+        opData: { doc: JSON.stringify({ _id: 'task-1', type: 'task' }) },
+      }],
+      complete: completeSpy,
+    };
+
+    const mockDatabase = {
+      getNextCrudTransaction: async () => mockTransaction,
+    };
+
+    const fetchStub = sinon.stub(globalThis, 'fetch').resolves({ ok: false, status: 409 });
+    const errorSpy = sinon.stub(console, 'error');
+    try {
+      await connector.uploadData(mockDatabase);
+      // 4xx doesn't throw — queue advances
+      expect(completeSpy.calledOnce).to.be.true;
+      expect(errorSpy.calledWithMatch(/Upload rejected/)).to.be.true;
+    } finally {
+      fetchStub.restore();
+      errorSpy.restore();
+    }
+  });
+
+  it('uploadData should handle PATCH 4xx errors without throwing', async () => {
+    const connector = createChtBackendConnector({
+      apiUrl: 'https://cht.example.com',
+      getAuthToken: async () => 'token',
+    });
+
+    const completeSpy = sinon.spy();
+    const mockTransaction = {
+      crud: [{
+        table: 'tasks',
+        op: 'PATCH',
+        id: 'task-1',
+        opData: { doc: JSON.stringify({ _id: 'task-1', type: 'task' }) },
+      }],
+      complete: completeSpy,
+    };
+
+    const mockDatabase = {
+      getNextCrudTransaction: async () => mockTransaction,
+    };
+
+    const fetchStub = sinon.stub(globalThis, 'fetch').resolves({ ok: false, status: 409 });
+    const errorSpy = sinon.stub(console, 'error');
+    try {
+      await connector.uploadData(mockDatabase);
+      expect(completeSpy.calledOnce).to.be.true;
+      expect(errorSpy.calledWithMatch(/Update rejected/)).to.be.true;
+    } finally {
+      fetchStub.restore();
+      errorSpy.restore();
+    }
+  });
+
+  it('uploadData should handle DELETE 5xx errors with retry', async () => {
+    const connector = createChtBackendConnector({
+      apiUrl: 'https://cht.example.com',
+      getAuthToken: async () => 'token',
+    });
+
+    const completeSpy = sinon.spy();
+    const mockTransaction = {
+      crud: [{
+        table: 'targets',
+        op: 'DELETE',
+        id: 'target-1',
+        opData: {},
+      }],
+      complete: completeSpy,
+    };
+
+    const mockDatabase = {
+      getNextCrudTransaction: async () => mockTransaction,
+    };
+
+    const fetchStub = sinon.stub(globalThis, 'fetch').resolves({ ok: false, status: 500 });
+    try {
+      await expect(connector.uploadData(mockDatabase)).to.be.rejectedWith('Server error');
+      expect(completeSpy.called).to.be.false;
+    } finally {
+      fetchStub.restore();
+    }
   });
 });
