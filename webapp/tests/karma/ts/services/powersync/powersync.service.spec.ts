@@ -267,6 +267,23 @@ describe('PowerSync Service', () => {
 
         expect(mockDb.disconnect.called).to.be.false;
       });
+
+      it('should still call connect when disconnect throws', async () => {
+        mockDb.disconnect.rejects(new Error('DB locked'));
+
+        await service.reconnect();
+
+        expect(mockDb.disconnect.calledOnce).to.be.true;
+        expect(mockDb.connect.calledOnce).to.be.true;
+        expect(mockDb.connect.calledWith(mockConnector)).to.be.true;
+      });
+
+      it('should not throw when disconnect throws', async () => {
+        mockDb.disconnect.rejects(new Error('WebSocket closed'));
+
+        // Should not throw
+        await service.reconnect();
+      });
     });
 
     describe('getPendingUploadCount', () => {

@@ -431,12 +431,19 @@ export class PowerSyncService implements OnDestroy {
    * Reconnect to the PowerSync service.
    * Use when sync appears stuck or after recovering from a network outage.
    * Tears down the current sync stream and re-establishes it with fresh credentials.
+   *
+   * If disconnect() fails (e.g. DB locked), connect() is still attempted to avoid
+   * leaving the service stuck in a disconnected state with no recovery path.
    */
   async reconnect(): Promise<void> {
     if (!this.db || !this.connector) {
       return;
     }
-    await this.db.disconnect();
+    try {
+      await this.db.disconnect();
+    } catch (err) {
+      console.warn('PowerSync: disconnect failed during reconnect, attempting connect anyway:', err);
+    }
     // connect() is fire-and-forget; sync resumes in the background
     this.db.connect(this.connector);
   }
