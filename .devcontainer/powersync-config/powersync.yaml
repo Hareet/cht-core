@@ -23,8 +23,8 @@ api:
     - !env PS_ADMIN_TOKEN
 
 # Sync config inlined to avoid file path issues across container mounts.
-# No global `with` block — each stream defines its own to avoid
-# PowerSync v1.20.x circular reference errors when mixing global and local `with`.
+# Uses JOINs instead of WITH/IN CTEs to avoid PowerSync's 1,000 parameter limit.
+# Each table alias matches the stream name (PowerSync uses alias as client row_type).
 sync_config:
   content: |
     config:
@@ -34,13 +34,8 @@ sync_config:
       contacts:
         auto_subscribe: true
         priority: 1
-        with:
-          accessible_facilities: |
-            SELECT facility_id
-            FROM "v1"."user_accessible_facilities"
-            WHERE user_id = auth.user_id()
         query: |
-          SELECT
+          SELECT DISTINCT
             contacts._id AS id,
             contacts.doc ->> 'name' AS name,
             ifnull(contacts.doc ->> 'contact_type', contacts.doc ->> 'type') AS contact_type,
@@ -53,80 +48,110 @@ sync_config:
             contacts.doc ->> 'reported_date' AS reported_date,
             CAST(contacts.doc AS TEXT) AS doc
           FROM "v1"."couchdb" contacts
+          INNER JOIN "v1"."user_accessible_facilities" uaf
+            ON uaf.user_id = auth.user_id()
+            AND (
+              contacts._id = uaf.facility_id
+              OR ifnull(contacts.doc -> 'parent' ->> '_id', contacts.doc ->> 'parent') = uaf.facility_id
+            )
           WHERE contacts._deleted != true
             AND contacts.doc ->> 'type' IN '["contact", "person", "clinic", "health_center", "district_hospital"]'
-            AND (
-              contacts._id IN accessible_facilities
-              OR ifnull(contacts.doc -> 'parent' ->> '_id', contacts.doc ->> 'parent') IN accessible_facilities
-            )
 
       reports:
         auto_subscribe: true
         priority: 2
-        with:
-          report_facilities: |
-            SELECT facility_id
-            FROM "v1"."user_report_facilities"
-            WHERE user_id = auth.user_id()
-          accessible_facilities: |
-            SELECT facility_id
-            FROM "v1"."user_accessible_facilities"
-            WHERE user_id = auth.user_id()
-        query: |
-          SELECT
-            reports._id AS id,
-            reports.doc ->> 'form' AS form,
-            reports.doc ->> 'patient_id' AS patient_id,
-            reports.doc -> 'contact' ->> '_id' AS submitter_id,
-            reports.doc ->> 'reported_date' AS reported_date,
-            reports.doc -> 'fields' ->> 'private' AS is_private,
-            reports.doc -> 'fields' ->> 'needs_signoff' AS needs_signoff,
-            CAST(reports.doc -> 'fields' AS TEXT) AS fields,
-            CAST(reports.doc AS TEXT) AS doc
-          FROM "v1"."couchdb" reports
-          WHERE reports._deleted != true
-            AND reports.doc ->> 'type' = 'data_record'
-            AND reports.doc ->> 'form' IS NOT NULL
-            AND (
-              reports.doc ->> 'patient_id' IN report_facilities
-              OR reports.doc -> 'fields' ->> 'patient_id' IN report_facilities
-              OR reports.doc ->> 'place_id' IN report_facilities
-              OR reports.doc -> 'fields' ->> 'place_id' IN report_facilities
-              OR reports.doc -> 'contact' ->> '_id' IN report_facilities
-              OR reports.doc -> 'contact' ->> '_id' = auth.parameter('contact_id')
-              OR (
-                reports.doc -> 'fields' ->> 'needs_signoff' = 'true'
-                AND (
-                  reports.doc -> 'contact' ->> '_id' IN accessible_facilities
-                  OR reports.doc -> 'contact' -> 'parent' ->> '_id' IN accessible_facilities
-                )
+        queries:
+          # Query 1: Reports whose subject matches report_facilities (depth-filtered)
+          - |
+            SELECT DISTINCT
+              reports._id AS id,
+              reports.doc ->> 'form' AS form,
+              reports.doc ->> 'patient_id' AS patient_id,
+              reports.doc -> 'contact' ->> '_id' AS submitter_id,
+              reports.doc ->> 'reported_date' AS reported_date,
+              reports.doc -> 'fields' ->> 'private' AS is_private,
+              reports.doc -> 'fields' ->> 'needs_signoff' AS needs_signoff,
+              CAST(reports.doc -> 'fields' AS TEXT) AS fields,
+              CAST(reports.doc AS TEXT) AS doc
+            FROM "v1"."couchdb" reports
+            INNER JOIN "v1"."user_report_facilities" urf
+              ON urf.user_id = auth.user_id()
+              AND (
+                reports.doc ->> 'patient_id' = urf.facility_id
+                OR reports.doc -> 'fields' ->> 'patient_id' = urf.facility_id
+                OR reports.doc ->> 'place_id' = urf.facility_id
+                OR reports.doc -> 'fields' ->> 'place_id' = urf.facility_id
+                OR reports.doc -> 'contact' ->> '_id' = urf.facility_id
               )
-            )
-            AND (
-              ifnull(reports.doc -> 'fields' ->> 'private', 'false') != 'true'
-              OR reports.doc -> 'contact' ->> '_id' = auth.parameter('contact_id')
-            )
+            WHERE reports._deleted != true
+              AND reports.doc ->> 'type' = 'data_record'
+              AND reports.doc ->> 'form' IS NOT NULL
+              AND (
+                ifnull(reports.doc -> 'fields' ->> 'private', 'false') != 'true'
+                OR reports.doc -> 'contact' ->> '_id' = auth.parameter('contact_id')
+              )
+          # Query 2: User's own reports (submitter = user's contact_id)
+          - |
+            SELECT
+              reports._id AS id,
+              reports.doc ->> 'form' AS form,
+              reports.doc ->> 'patient_id' AS patient_id,
+              reports.doc -> 'contact' ->> '_id' AS submitter_id,
+              reports.doc ->> 'reported_date' AS reported_date,
+              reports.doc -> 'fields' ->> 'private' AS is_private,
+              reports.doc -> 'fields' ->> 'needs_signoff' AS needs_signoff,
+              CAST(reports.doc -> 'fields' AS TEXT) AS fields,
+              CAST(reports.doc AS TEXT) AS doc
+            FROM "v1"."couchdb" reports
+            WHERE reports._deleted != true
+              AND reports.doc ->> 'type' = 'data_record'
+              AND reports.doc ->> 'form' IS NOT NULL
+              AND reports.doc -> 'contact' ->> '_id' = auth.parameter('contact_id')
+          # Query 3: needs_signoff reports visible via submitter ancestor chain
+          - |
+            SELECT DISTINCT
+              reports._id AS id,
+              reports.doc ->> 'form' AS form,
+              reports.doc ->> 'patient_id' AS patient_id,
+              reports.doc -> 'contact' ->> '_id' AS submitter_id,
+              reports.doc ->> 'reported_date' AS reported_date,
+              reports.doc -> 'fields' ->> 'private' AS is_private,
+              reports.doc -> 'fields' ->> 'needs_signoff' AS needs_signoff,
+              CAST(reports.doc -> 'fields' AS TEXT) AS fields,
+              CAST(reports.doc AS TEXT) AS doc
+            FROM "v1"."couchdb" reports
+            INNER JOIN "v1"."user_accessible_facilities" uaf
+              ON uaf.user_id = auth.user_id()
+              AND (
+                reports.doc -> 'contact' ->> '_id' = uaf.facility_id
+                OR reports.doc -> 'contact' -> 'parent' ->> '_id' = uaf.facility_id
+              )
+            WHERE reports._deleted != true
+              AND reports.doc ->> 'type' = 'data_record'
+              AND reports.doc ->> 'form' IS NOT NULL
+              AND reports.doc -> 'fields' ->> 'needs_signoff' = 'true'
+              AND (
+                ifnull(reports.doc -> 'fields' ->> 'private', 'false') != 'true'
+                OR reports.doc -> 'contact' ->> '_id' = auth.parameter('contact_id')
+              )
 
       sms_messages:
         auto_subscribe: true
         priority: 3
-        with:
-          accessible_facilities: |
-            SELECT facility_id
-            FROM "v1"."user_accessible_facilities"
-            WHERE user_id = auth.user_id()
         query: |
-          SELECT
+          SELECT DISTINCT
             sms_messages._id AS id,
             sms_messages.doc -> 'contact' ->> '_id' AS contact_id,
             sms_messages.doc ->> 'reported_date' AS reported_date,
             sms_messages.doc ->> 'kujua_message' AS is_outgoing,
             CAST(sms_messages.doc AS TEXT) AS doc
           FROM "v1"."couchdb" sms_messages
+          INNER JOIN "v1"."user_accessible_facilities" uaf
+            ON uaf.user_id = auth.user_id()
+            AND sms_messages.doc -> 'contact' ->> '_id' = uaf.facility_id
           WHERE sms_messages._deleted != true
             AND sms_messages.doc ->> 'type' = 'data_record'
             AND ifnull(sms_messages.doc ->> 'form', '') = ''
-            AND sms_messages.doc -> 'contact' ->> '_id' IN accessible_facilities
 
       tasks:
         auto_subscribe: true
@@ -151,22 +176,19 @@ sync_config:
       targets:
         auto_subscribe: true
         priority: 3
-        with:
-          accessible_facilities: |
-            SELECT facility_id
-            FROM "v1"."user_accessible_facilities"
-            WHERE user_id = auth.user_id()
         query: |
-          SELECT
+          SELECT DISTINCT
             targets._id AS id,
             targets.doc ->> 'owner' AS owner,
             targets.doc ->> 'reporting_period' AS reporting_period,
             CAST(targets.doc -> 'targets' AS TEXT) AS targets_data,
             CAST(targets.doc AS TEXT) AS doc
           FROM "v1"."couchdb" targets
+          INNER JOIN "v1"."user_accessible_facilities" uaf
+            ON uaf.user_id = auth.user_id()
+            AND targets.doc ->> 'owner' = uaf.facility_id
           WHERE targets._deleted != true
             AND targets.doc ->> 'type' = 'target'
-            AND targets.doc ->> 'owner' IN accessible_facilities
 
       global_config:
         auto_subscribe: true
