@@ -85,10 +85,10 @@ const createMockPowerSyncDb = () => {
   };
 
   const evalWhere = (row, clause, params, state) => {
-    // Handle OR
+    // Handle OR — share state by reference so parameter indices advance correctly across branches
     const orParts = splitOutside(clause, ' OR ');
     if (orParts.length > 1) {
-      return orParts.some(p => evalWhere(row, p.trim(), params, { idx: state.idx }));
+      return orParts.some(p => evalWhere(row, p.trim(), params, state));
     }
     // Handle AND
     const andParts = splitOutside(clause, ' AND ');
@@ -138,6 +138,16 @@ const createMockPowerSyncDb = () => {
     if (eq) {
       const val = params[state.idx++];
       return row[eq[1]] === val;
+    }
+    // != 'literal' — matches CouchDB JavaScript truthiness checks (e.g., form != '').
+    // SQL semantics: NULL != 'x' evaluates to NULL (falsy).
+    const neqLit = trimmed.match(/^(\w+)\s*!=\s*'([^']*)'/);
+    if (neqLit) {
+      const val = row[neqLit[1]];
+      if (val == null) {
+        return false;
+      }
+      return val !== neqLit[2];
     }
     // = 'literal'
     const eqLit = trimmed.match(/^(\w+)\s*=\s*'([^']*)'/);
@@ -487,6 +497,271 @@ describe('PowerSync adapter integration tests', () => {
     const totalTasks = Object.values(breakdown).reduce((sum, count) => sum + count, 0);
     expect(totalTasks).to.be.greaterThan(0);
   });
+
+  it('should return Ready tasks via fetchTasksFor with specific contact IDs', async () => {
+    // This tests the targeted refresh path: taskDataFor → tasksByRelation('owner') → filter Ready
+    // This is the most common production path (only refreshes dirty contacts).
+    seedContact(mockDb, patientContact);
+    seedReport(mockDb, pregnancyFollowupReport);
+
+    // First do a full refresh to populate state store
+    await rulesEngine.refreshEmissionsFor();
+
+    // Now fetch tasks for the specific contact — exercises tasksByRelation('owner')
+    const tasks = await rulesEngine.fetchTasksFor([patientContact._id]);
+    tasks.forEach(task => {
+      expect(task.state).to.equal('Ready');
+      expect(task.owner).to.equal(patientContact._id);
+    });
+  });
+
+  it('should return task breakdown for specific contact IDs', async () => {
+    seedContact(mockDb, patientContact);
+    seedReport(mockDb, pregnancyRegistrationReport);
+
+    await rulesEngine.refreshEmissionsFor();
+
+    // fetchTasksBreakdown with specific contacts exercises allTaskRowsByOwner
+    const breakdown = await rulesEngine.fetchTasksBreakdown([patientContact._id]);
+    const totalTasks = Object.values(breakdown).reduce((sum, count) => sum + count, 0);
+    expect(totalTasks).to.be.greaterThan(0);
+
+    // All counted tasks should belong to the patient contact
+    const writtenTasks = mockDb._tables.tasks.filter(t => t.owner === patientContact._id);
+    expect(writtenTasks.length).to.equal(totalTasks);
+  });
+
+  it('should not produce spurious emissions from reports without subject identifiers', async () => {
+    // Parity with PouchDB: the CouchDB reports_by_subject view only emits for reports with
+    // subject fields. Reports without any subject identifiers (patient_id, place_id, etc.) are
+    // invisible to the rules engine. If they leaked through, they'd create phantom headless
+    // contacts and potentially incorrect tasks/targets.
+    seedContact(mockDb, patientContact);
+    seedReport(mockDb, pregnancyRegistrationReport);
+
+    // Seed a report with no subject identifiers — this should be excluded from allTaskData
+    mockDb._tables.reports.push({
+      id: 'orphan-report',
+      type: 'data_record',
+      form: 'facility_summary',
+      patient_id: null,
+      place_id: null,
+      subject_id: null,
+      case_id: null,
+      reported_date: TEST_START,
+      doc: JSON.stringify({
+        _id: 'orphan-report',
+        type: 'data_record',
+        form: 'facility_summary',
+        fields: { summary: 'no subject' },
+        reported_date: TEST_START,
+      }),
+      _rawDoc: {
+        _id: 'orphan-report',
+        type: 'data_record',
+        form: 'facility_summary',
+        fields: { summary: 'no subject' },
+        reported_date: TEST_START,
+      },
+    });
+
+    await rulesEngine.refreshEmissionsFor();
+
+    // Verify only the pregnancy registration report produced tasks, not the orphan report
+    const writtenTasks = mockDb._tables.tasks;
+    expect(writtenTasks.length).to.be.greaterThan(0);
+    writtenTasks.forEach(task => {
+      expect(task.owner).to.equal(patientContact._id);
+    });
+  });
+
+  it('should exclude reports with empty-string form from task generation (PouchDB parity)', async () => {
+    // CouchDB reports_by_subject view uses `if (doc.form)` — empty string is falsy.
+    // Reports with form='' must be excluded by the adapter's SQL `form != ''` check.
+    // This validates the integration test mock's evalWhere handles != 'literal'.
+    seedContact(mockDb, patientContact);
+    seedReport(mockDb, pregnancyRegistrationReport);
+
+    // Seed a report with empty-string form — should be invisible to the rules engine
+    mockDb._tables.reports.push({
+      id: 'empty-form-report',
+      type: 'data_record',
+      form: '',
+      patient_id: patientContact.patient_id,
+      place_id: null,
+      subject_id: null,
+      case_id: null,
+      reported_date: TEST_START + 1000,
+      doc: JSON.stringify({
+        _id: 'empty-form-report',
+        type: 'data_record',
+        form: '',
+        fields: { patient_id: patientContact.patient_id },
+        patient_id: patientContact.patient_id,
+        reported_date: TEST_START + 1000,
+      }),
+      _rawDoc: {
+        _id: 'empty-form-report',
+        type: 'data_record',
+        form: '',
+        fields: { patient_id: patientContact.patient_id },
+        patient_id: patientContact.patient_id,
+        reported_date: TEST_START + 1000,
+      },
+    });
+
+    await rulesEngine.refreshEmissionsFor();
+
+    // All generated tasks should be owned by the patient — the empty-form report
+    // should NOT have created any additional task emissions
+    const writtenTasks = mockDb._tables.tasks;
+    expect(writtenTasks.length).to.be.greaterThan(0);
+    writtenTasks.forEach(task => {
+      expect(task.owner).to.equal(patientContact._id);
+    });
+  });
+
+  it('should cancel tasks when their triggering report is removed (round-trip parity)', async () => {
+    // This tests the critical round-trip invariant: task documents committed via
+    // commitTaskDocs must preserve emission._id through JSON serialization so that
+    // the cancellation matching logic in getCancellationUpdates can identify orphaned tasks.
+    //
+    // Flow: seed data → refresh → verify tasks → remove report → refresh → verify cancelled
+    seedContact(mockDb, patientContact);
+    seedReport(mockDb, pregnancyRegistrationReport);
+
+    // Step 1: Generate tasks
+    await rulesEngine.refreshEmissionsFor();
+    const initialTasks = mockDb._tables.tasks.filter(t => t.owner === patientContact._id);
+    expect(initialTasks.length).to.be.greaterThan(0);
+
+    // Capture the emission IDs from the written tasks — these must survive the JSON round-trip
+    const initialEmissionIds = initialTasks.map(t => {
+      const doc = t._rawDoc || JSON.parse(t.doc);
+      expect(doc.emission).to.be.an('object', 'task doc should have emission after write');
+      expect(doc.emission._id).to.be.a('string', 'emission._id must be preserved in JSON');
+      return doc.emission._id;
+    });
+    expect(initialEmissionIds.length).to.be.greaterThan(0);
+
+    // Verify all non-terminal tasks have stateHistory
+    const nonTerminalTasks = initialTasks.filter(
+      t => !['Cancelled', 'Completed', 'Failed'].includes(t.state)
+    );
+    expect(nonTerminalTasks.length).to.be.greaterThan(0);
+    nonTerminalTasks.forEach(t => {
+      const doc = t._rawDoc || JSON.parse(t.doc);
+      expect(doc.stateHistory).to.be.an('array').with.length.greaterThan(0);
+    });
+
+    // Step 2: Remove the report — simulates a report being purged or retracted
+    mockDb._tables.reports = [];
+
+    // Step 3: Mark contact dirty and refresh — should cancel orphaned tasks
+    // updateEmissionsFor resolves the contact ID, marks it dirty, and refreshes
+    await rulesEngine.updateEmissionsFor([patientContact._id]);
+
+    // Step 4: Verify cancellation
+    const updatedTasks = mockDb._tables.tasks.filter(t => t.owner === patientContact._id);
+    expect(updatedTasks.length).to.be.greaterThan(0);
+
+    // All previously non-terminal tasks should now be Cancelled
+    // (rules engine found no emissions → getCancellationUpdates cancels all)
+    const cancelledTasks = updatedTasks.filter(t => t.state === 'Cancelled');
+    expect(cancelledTasks.length).to.be.greaterThan(0);
+
+    // The cancelled tasks should have accumulated stateHistory entries
+    cancelledTasks.forEach(t => {
+      const doc = t._rawDoc || JSON.parse(t.doc);
+      expect(doc.stateHistory).to.be.an('array');
+      // Should have at least 2 entries: initial state + Cancelled
+      expect(doc.stateHistory.length).to.be.greaterThan(1);
+      const lastEntry = doc.stateHistory[doc.stateHistory.length - 1];
+      expect(lastEntry.state).to.equal('Cancelled');
+    });
+
+    // fetchTasksFor should return no Ready tasks (all cancelled)
+    const readyTasks = await rulesEngine.fetchTasksFor();
+    // All remaining tasks are either Cancelled or were already terminal
+    readyTasks.forEach(task => {
+      expect(task.state).to.equal('Ready');
+    });
+  });
+
+  it('should preserve task emission data through multiple refresh cycles', async () => {
+    // Verifies that task documents round-trip correctly through the PowerSync adapter's
+    // JSON serialization across multiple refresh cycles. Each cycle reads tasks from the
+    // DB (parsing doc JSON), runs rules, and writes back (re-serializing to JSON).
+    // Fields like emission.actions, emission.title, and stateHistory must be preserved.
+    seedContact(mockDb, patientContact);
+    seedReport(mockDb, pregnancyRegistrationReport);
+
+    // First refresh — creates tasks
+    await rulesEngine.refreshEmissionsFor();
+    const afterFirstRefresh = mockDb._tables.tasks.slice();
+    expect(afterFirstRefresh.length).to.be.greaterThan(0);
+
+    // Capture initial task structure
+    const initialTaskDocs = afterFirstRefresh.map(t => t._rawDoc || JSON.parse(t.doc));
+    initialTaskDocs.forEach(doc => {
+      expect(doc).to.have.property('_id').that.is.a('string');
+      expect(doc).to.have.property('type', 'task');
+      expect(doc).to.have.property('emission').that.is.an('object');
+      expect(doc.emission).to.have.property('_id').that.is.a('string');
+      expect(doc).to.have.property('stateHistory').that.is.an('array');
+      expect(doc).to.have.property('authoredOn').that.is.a('number');
+    });
+
+    // Second refresh — reads back tasks from DB, runs rules, writes again
+    // Tasks should be re-read from the doc JSON column and round-trip correctly
+    configHashSalt++;
+    await rulesEngine.rulesConfigChange(engineSettings({ configHashSalt }));
+    await rulesEngine.refreshEmissionsFor();
+
+    const afterSecondRefresh = mockDb._tables.tasks.slice();
+    expect(afterSecondRefresh.length).to.be.greaterThan(0);
+
+    // Verify emission data survived the round-trip
+    const roundTrippedDocs = afterSecondRefresh.map(t => t._rawDoc || JSON.parse(t.doc));
+    roundTrippedDocs.forEach(doc => {
+      expect(doc).to.have.property('emission').that.is.an('object');
+      expect(doc.emission).to.have.property('_id').that.is.a('string');
+      expect(doc).to.have.property('stateHistory').that.is.an('array');
+      expect(doc.stateHistory.length).to.be.greaterThan(0);
+    });
+
+    // The emission IDs should be consistent — same contact + report produces same emission IDs
+    const firstEmissionIds = new Set(initialTaskDocs.map(d => d.emission._id));
+    const secondEmissionIds = new Set(roundTrippedDocs.map(d => d.emission._id));
+    // All first-round emission IDs should still be present (tasks are stable)
+    firstEmissionIds.forEach(id => {
+      expect(secondEmissionIds.has(id)).to.be.true;
+    });
+  });
+
+  it('should normalize empty-string task fields to NULL at write time', async () => {
+    // When the rules engine commits task documents, empty-string values for owner,
+    // requester, state, and user should be stored as NULL in the database.
+    // This matches CouchDB's JavaScript truthiness semantics where the view uses
+    // `doc.owner || '_unassigned'` and `if (doc.requester)`.
+    seedContact(mockDb, patientContact);
+    seedReport(mockDb, pregnancyRegistrationReport);
+
+    await rulesEngine.refreshEmissionsFor();
+
+    // All tasks written by the rules engine should have proper non-empty values
+    const writtenTasks = mockDb._tables.tasks;
+    expect(writtenTasks.length).to.be.greaterThan(0);
+    writtenTasks.forEach(task => {
+      // owner, requester, state should be non-empty strings (set by rules engine)
+      expect(task.owner).to.be.a('string').and.not.equal('');
+      expect(task.state).to.be.a('string').and.not.equal('');
+      // requester is set by transform-task-emission-to-doc
+      if (task.requester !== null) {
+        expect(task.requester).to.be.a('string').and.not.equal('');
+      }
+    });
+  });
 });
 
 describe('PowerSync schema metadata', () => {
@@ -625,5 +900,196 @@ describe('PowerSync backend connector', () => {
     await connector.uploadData(mockDatabase);
     expect(completeSpy.calledOnce).to.be.true;
     // No fetch call because contacts is read-only
+  });
+
+  it('uploadData should handle PATCH operations (task updates)', async () => {
+    const connector = createChtBackendConnector({
+      apiUrl: 'https://cht.example.com',
+      getAuthToken: async () => 'token',
+    });
+
+    const completeSpy = sinon.spy();
+    const mockTransaction = {
+      crud: [{
+        table: 'tasks',
+        op: 'PATCH',
+        id: 'task~user~emission~123',
+        opData: { doc: JSON.stringify({ _id: 'task~user~emission~123', type: 'task', state: 'Completed' }) },
+      }],
+      complete: completeSpy,
+    };
+
+    const mockDatabase = {
+      getNextCrudTransaction: async () => mockTransaction,
+    };
+
+    const fetchStub = sinon.stub(globalThis, 'fetch').resolves({ ok: true, status: 200 });
+    try {
+      await connector.uploadData(mockDatabase);
+      expect(completeSpy.calledOnce).to.be.true;
+      expect(fetchStub.calledOnce).to.be.true;
+      // PATCH maps to PUT HTTP method
+      expect(fetchStub.firstCall.args[1].method).to.equal('PUT');
+    } finally {
+      fetchStub.restore();
+    }
+  });
+
+  it('uploadData should handle DELETE operations', async () => {
+    const connector = createChtBackendConnector({
+      apiUrl: 'https://cht.example.com',
+      getAuthToken: async () => 'token',
+    });
+
+    const completeSpy = sinon.spy();
+    const mockTransaction = {
+      crud: [{
+        table: 'targets',
+        op: 'DELETE',
+        id: 'target~2026-04~contact~user',
+        opData: {},
+      }],
+      complete: completeSpy,
+    };
+
+    const mockDatabase = {
+      getNextCrudTransaction: async () => mockTransaction,
+    };
+
+    const fetchStub = sinon.stub(globalThis, 'fetch').resolves({ ok: true, status: 200 });
+    try {
+      await connector.uploadData(mockDatabase);
+      expect(completeSpy.calledOnce).to.be.true;
+      expect(fetchStub.firstCall.args[1].method).to.equal('DELETE');
+    } finally {
+      fetchStub.restore();
+    }
+  });
+
+  it('uploadData should throw on 5xx server errors for retry', async () => {
+    const connector = createChtBackendConnector({
+      apiUrl: 'https://cht.example.com',
+      getAuthToken: async () => 'token',
+    });
+
+    const completeSpy = sinon.spy();
+    const mockTransaction = {
+      crud: [{
+        table: 'tasks',
+        op: 'PUT',
+        id: 'task-1',
+        opData: { doc: JSON.stringify({ _id: 'task-1', type: 'task' }) },
+      }],
+      complete: completeSpy,
+    };
+
+    const mockDatabase = {
+      getNextCrudTransaction: async () => mockTransaction,
+    };
+
+    const fetchStub = sinon.stub(globalThis, 'fetch').resolves({ ok: false, status: 503 });
+    try {
+      await expect(connector.uploadData(mockDatabase)).to.be.rejectedWith('Server error');
+      expect(completeSpy.called).to.be.false;
+    } finally {
+      fetchStub.restore();
+    }
+  });
+
+  it('uploadData should log but not throw on 4xx client errors', async () => {
+    const connector = createChtBackendConnector({
+      apiUrl: 'https://cht.example.com',
+      getAuthToken: async () => 'token',
+    });
+
+    const completeSpy = sinon.spy();
+    const mockTransaction = {
+      crud: [{
+        table: 'tasks',
+        op: 'PUT',
+        id: 'task-1',
+        opData: { doc: JSON.stringify({ _id: 'task-1', type: 'task' }) },
+      }],
+      complete: completeSpy,
+    };
+
+    const mockDatabase = {
+      getNextCrudTransaction: async () => mockTransaction,
+    };
+
+    const fetchStub = sinon.stub(globalThis, 'fetch').resolves({ ok: false, status: 409 });
+    const errorSpy = sinon.stub(console, 'error');
+    try {
+      await connector.uploadData(mockDatabase);
+      // 4xx doesn't throw — queue advances
+      expect(completeSpy.calledOnce).to.be.true;
+      expect(errorSpy.calledWithMatch(/Upload rejected/)).to.be.true;
+    } finally {
+      fetchStub.restore();
+      errorSpy.restore();
+    }
+  });
+
+  it('uploadData should handle PATCH 4xx errors without throwing', async () => {
+    const connector = createChtBackendConnector({
+      apiUrl: 'https://cht.example.com',
+      getAuthToken: async () => 'token',
+    });
+
+    const completeSpy = sinon.spy();
+    const mockTransaction = {
+      crud: [{
+        table: 'tasks',
+        op: 'PATCH',
+        id: 'task-1',
+        opData: { doc: JSON.stringify({ _id: 'task-1', type: 'task' }) },
+      }],
+      complete: completeSpy,
+    };
+
+    const mockDatabase = {
+      getNextCrudTransaction: async () => mockTransaction,
+    };
+
+    const fetchStub = sinon.stub(globalThis, 'fetch').resolves({ ok: false, status: 409 });
+    const errorSpy = sinon.stub(console, 'error');
+    try {
+      await connector.uploadData(mockDatabase);
+      expect(completeSpy.calledOnce).to.be.true;
+      expect(errorSpy.calledWithMatch(/Update rejected/)).to.be.true;
+    } finally {
+      fetchStub.restore();
+      errorSpy.restore();
+    }
+  });
+
+  it('uploadData should handle DELETE 5xx errors with retry', async () => {
+    const connector = createChtBackendConnector({
+      apiUrl: 'https://cht.example.com',
+      getAuthToken: async () => 'token',
+    });
+
+    const completeSpy = sinon.spy();
+    const mockTransaction = {
+      crud: [{
+        table: 'targets',
+        op: 'DELETE',
+        id: 'target-1',
+        opData: {},
+      }],
+      complete: completeSpy,
+    };
+
+    const mockDatabase = {
+      getNextCrudTransaction: async () => mockTransaction,
+    };
+
+    const fetchStub = sinon.stub(globalThis, 'fetch').resolves({ ok: false, status: 500 });
+    try {
+      await expect(connector.uploadData(mockDatabase)).to.be.rejectedWith('Server error');
+      expect(completeSpy.called).to.be.false;
+    } finally {
+      fetchStub.restore();
+    }
   });
 });

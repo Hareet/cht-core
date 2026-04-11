@@ -7,7 +7,7 @@
  * PowerSync table schema assumptions (synced from server via Sync Streams):
  *   - contacts: id, type, contact_type, name, parent_id, patient_id, place_id, date_of_death, muted, doc (JSONB text)
  *   - reports: id, type, form, patient_id, place_id, case_id, subject_id, reported_date, fields (JSON text), doc (JSONB)
- *   - tasks: id, type, state, owner, requester, emission (JSON text), user, authored_on, state_history (JSON text), doc
+ *   - tasks: id, type, state, owner, requester, user, authored_on, doc (JSONB — contains emission, stateHistory, etc.)
  *   - targets: id, type, owner, user, reporting_period, targets (JSON text), updated_date
  *   - rules_state_store: local-only table, id, data (JSON text)
  *
@@ -28,6 +28,15 @@ const uniqBy = require('lodash/uniqBy');
 
 const RULES_STATE_DOCID = 'local';
 const LOCAL_STATE_TABLE = 'rules_state_store';
+
+/**
+ * Maximum number of items to use in a single SQL IN clause.
+ * SQLite has a default limit of 999 bound parameters (SQLITE_MAX_VARIABLE_NUMBER).
+ * Some queries expand items into multiple IN clauses (e.g., taskDataFor uses 3x),
+ * so we use a conservative limit to stay well within bounds.
+ * The PouchDB adapter has a similar limit (MAX_QUERY_KEYS = 500).
+ */
+const MAX_SQL_ITEMS = 300;
 
 /**
  * Parse a JSON doc column, returning the parsed object or the row itself as fallback.
@@ -58,6 +67,27 @@ const parseDocs = (rows) => {
  */
 const placeholders = (arr) => arr.map(() => '?').join(', ');
 
+/**
+ * Execute a query function in chunks when the item list would exceed SQLite's parameter limit.
+ * Concatenates results from all chunks. Callers must deduplicate if needed (parseDocs handles this).
+ *
+ * @param {Array} items The full list of items to query for
+ * @param {Function} queryFn Async function that takes a chunk of items and returns rows
+ * @returns {Promise<Array>} Concatenated rows from all chunks
+ */
+const chunkedQuery = async (items, queryFn) => {
+  if (items.length <= MAX_SQL_ITEMS) {
+    return queryFn(items);
+  }
+  const results = [];
+  for (let i = 0; i < items.length; i += MAX_SQL_ITEMS) {
+    const chunk = items.slice(i, i + MAX_SQL_ITEMS);
+    const rows = await queryFn(chunk);
+    results.push(...rows);
+  }
+  return results;
+};
+
 const powersyncProvider = (db) => {
   const self = {
     /**
@@ -84,10 +114,12 @@ const powersyncProvider = (db) => {
                WHERE type = 'task'
                  AND (state IS NULL OR state NOT IN ('Cancelled', 'Completed', 'Failed'))`;
       } else {
-        // 'requester' prefix: emitted for all tasks with a requester, regardless of state
+        // 'requester' prefix: emitted for all tasks with a requester, regardless of state.
+        // CouchDB view uses `if (doc.requester)` — falsy values (including empty strings)
+        // are excluded. SQL IS NOT NULL would accept empty strings, so we add != ''.
         sql = `SELECT doc FROM tasks
                WHERE type = 'task'
-                 AND requester IS NOT NULL`;
+                 AND requester IS NOT NULL AND requester != ''`;
       }
       const rows = await db.getAll(sql);
       return parseDocs(rows);
@@ -103,8 +135,17 @@ const powersyncProvider = (db) => {
         // contacts_by_type: all contacts (person, clinic, health_center, district_hospital, or contact_type)
         db.getAll(`SELECT doc FROM contacts WHERE type = 'contact' OR type IN ('district_hospital', 'health_center', 'clinic', 'person')`)
           .then(parseDocs),
-        // reports_by_subject: all reports (data_records with a form)
-        db.getAll(`SELECT doc FROM reports WHERE type = 'data_record' AND form IS NOT NULL`)
+        // reports_by_subject: all reports (data_records with a form) that have at least one subject identifier.
+        // The CouchDB view uses JavaScript truthiness: `if (doc.form)` and `if (obj[field])`.
+        // Empty strings are falsy in JS but non-NULL in SQL, so we must exclude them explicitly
+        // with `!= ''` to match view behavior. This ensures reports with empty form names or
+        // empty subject identifiers are excluded, matching PouchDB parity.
+        db.getAll(`SELECT doc FROM reports WHERE type = 'data_record'
+                   AND form IS NOT NULL AND form != ''
+                   AND ((patient_id IS NOT NULL AND patient_id != '')
+                     OR (place_id IS NOT NULL AND place_id != '')
+                     OR (subject_id IS NOT NULL AND subject_id != '')
+                     OR (case_id IS NOT NULL AND case_id != ''))`)
           .then(parseDocs),
         self.allTasks('requester'),
       ]);
@@ -124,30 +165,26 @@ const powersyncProvider = (db) => {
         return [];
       }
 
-      const sql = `SELECT id, patient_id, place_id FROM contacts
-                   WHERE patient_id IN (${placeholders(subjectIds)})
-                      OR place_id IN (${placeholders(subjectIds)})`;
-      const params = [...subjectIds, ...subjectIds];
-      const rows = await db.getAll(sql, params);
+      // Uses 2x params (patient_id IN + place_id IN), so chunk to stay within SQLite limits
+      const rows = await chunkedQuery(subjectIds, async (chunk) => {
+        const sql = `SELECT id, patient_id, place_id FROM contacts
+                     WHERE patient_id IN (${placeholders(chunk)})
+                        OR place_id IN (${placeholders(chunk)})`;
+        return db.getAll(sql, [...chunk, ...chunk]);
+      });
 
-      // Build a map of shortcode -> contact id
-      const shortcodeToId = {};
+      // Track which input IDs matched shortcodes so the rest pass through as UUIDs
       const matchedShortcodes = new Set();
       for (const row of rows) {
         if (row.patient_id && subjectIds.includes(row.patient_id)) {
-          shortcodeToId[row.patient_id] = row.id;
           matchedShortcodes.add(row.patient_id);
         }
         if (row.place_id && subjectIds.includes(row.place_id)) {
-          shortcodeToId[row.place_id] = row.id;
           matchedShortcodes.add(row.place_id);
         }
       }
 
-      const resolvedIds = [];
-      for (const row of rows) {
-        resolvedIds.push(row.id);
-      }
+      const resolvedIds = rows.map(row => row.id);
 
       // IDs that weren't shortcodes pass through as-is (they may be UUIDs)
       const passthroughIds = subjectIds.filter(id => !matchedShortcodes.has(id));
@@ -162,12 +199,16 @@ const powersyncProvider = (db) => {
       let previousResult = Promise.resolve();
       return (baseDoc, assigned) => {
         Object.assign(baseDoc, assigned);
-        const data = JSON.stringify(baseDoc);
 
+        // Serialize baseDoc inside the promise chain (at write-time, not call-time).
+        // PouchDB's db.put(baseDoc) reads the object when the put executes, so if
+        // multiple stateChangeCallback calls queue up synchronously, the first PouchDB
+        // write sees the LATEST mutations. Capturing JSON.stringify here (before the
+        // .then) would snapshot a stale intermediate state for earlier queued writes.
         previousResult = previousResult
           .then(() => db.execute(
             `INSERT OR REPLACE INTO ${LOCAL_STATE_TABLE} (id, data) VALUES (?, ?)`,
-            [RULES_STATE_DOCID, data]
+            [RULES_STATE_DOCID, JSON.stringify(baseDoc)]
           ))
           .catch(err => console.error(`Error updating rules state store: ${err}`))
           .then(() => {
@@ -234,11 +275,15 @@ const powersyncProvider = (db) => {
           for (const taskDoc of taskDocs) {
             const id = taskDoc._id;
             const doc = JSON.stringify(taskDoc);
+            // Use || for string fields to normalize falsy values (empty string, undefined, null)
+            // to NULL, matching CouchDB's JavaScript truthiness semantics.
+            // The tasks_by_contact view uses `doc.owner || '_unassigned'` and `if (doc.requester)`,
+            // treating empty strings as falsy. Keep ?? for authoredOn since 0 is a valid timestamp.
             await tx.execute(
               `INSERT OR REPLACE INTO tasks (id, type, state, owner, requester, user, authored_on, doc)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-              [id, 'task', taskDoc.state, taskDoc.owner || null, taskDoc.requester || null,
-                taskDoc.user || null, taskDoc.authoredOn || null, doc]
+              [id, 'task', taskDoc.state || null, taskDoc.owner || null, taskDoc.requester || null,
+                taskDoc.user || null, taskDoc.authoredOn ?? null, doc]
             );
           }
         });
@@ -277,21 +322,23 @@ const powersyncProvider = (db) => {
         return [];
       }
 
-      let sql;
-      if (prefix === 'owner') {
-        // CouchDB view emits 'owner-{id}' only for non-terminal tasks.
-        // NULL/undefined state is non-terminal in CouchDB (indexOf(undefined) === -1).
-        // SQL NOT IN excludes NULLs, so we explicitly handle NULL state.
-        sql = `SELECT doc FROM tasks
-               WHERE type = 'task'
-                 AND (state IS NULL OR state NOT IN ('Cancelled', 'Completed', 'Failed'))
-                 AND owner IN (${placeholders(contactIds)})`;
-      } else {
-        sql = `SELECT doc FROM tasks
-               WHERE type = 'task'
-                 AND requester IN (${placeholders(contactIds)})`;
-      }
-      const rows = await db.getAll(sql, contactIds);
+      const rows = await chunkedQuery(contactIds, async (chunk) => {
+        let sql;
+        if (prefix === 'owner') {
+          // CouchDB view emits 'owner-{id}' only for non-terminal tasks.
+          // NULL/undefined state is non-terminal in CouchDB (indexOf(undefined) === -1).
+          // SQL NOT IN excludes NULLs, so we explicitly handle NULL state.
+          sql = `SELECT doc FROM tasks
+                 WHERE type = 'task'
+                   AND (state IS NULL OR state NOT IN ('Cancelled', 'Completed', 'Failed'))
+                   AND owner IN (${placeholders(chunk)})`;
+        } else {
+          sql = `SELECT doc FROM tasks
+                 WHERE type = 'task'
+                   AND requester IN (${placeholders(chunk)})`;
+        }
+        return db.getAll(sql, chunk);
+      });
       return parseDocs(rows);
     },
 
@@ -305,10 +352,12 @@ const powersyncProvider = (db) => {
         return [];
       }
 
-      const sql = `SELECT id, owner, state FROM tasks
-                   WHERE type = 'task'
-                     AND owner IN (${placeholders(contactIds)})`;
-      const rows = await db.getAll(sql, contactIds);
+      const rows = await chunkedQuery(contactIds, async (chunk) => {
+        const sql = `SELECT id, owner, state FROM tasks
+                     WHERE type = 'task'
+                       AND owner IN (${placeholders(chunk)})`;
+        return db.getAll(sql, chunk);
+      });
 
       return uniqBy(rows, 'id').map(row => ({
         id: row.id,
@@ -341,11 +390,13 @@ const powersyncProvider = (db) => {
         return {};
       }
 
-      // Fetch contact documents
-      const contactRows = await db.getAll(
-        `SELECT doc FROM contacts WHERE id IN (${placeholders(contactIds)})`,
-        contactIds
-      );
+      // Fetch contact documents (1x params)
+      const contactRows = await chunkedQuery(contactIds, async (chunk) => {
+        return db.getAll(
+          `SELECT doc FROM contacts WHERE id IN (${placeholders(chunk)})`,
+          chunk
+        );
+      });
       const contactDocs = parseDocs(contactRows);
 
       // Build the set of subject IDs from contacts (includes UUIDs + shortcodes like patient_id)
@@ -356,21 +407,24 @@ const powersyncProvider = (db) => {
 
       const subjectIdArray = Array.from(subjectIds);
 
-      // Fetch reports by subject: the CouchDB view indexes by patient_id, place_id, case_id,
+      // Fetch reports by subject (3x params — most critical for chunking).
+      // The CouchDB view indexes by patient_id, place_id, case_id,
       // fields.patient_id, fields.place_id, fields.case_id, fields.patient_uuid, fields.place_uuid.
       // However, registrationUtils.getSubjectIds uses only: _id, patient_id, place_id (contacts)
       // and patient_id, patient_uuid, place_id, place_uuid (reports). case_id is NOT a subject
       // property, so contact subject IDs never include case_id values. Reports matched solely
       // by case_id would not appear in PouchDB either. subject_id column covers patient_uuid/place_uuid.
-      const reportSql = `SELECT doc FROM reports
-                         WHERE type = 'data_record' AND form IS NOT NULL
-                           AND (patient_id IN (${placeholders(subjectIdArray)})
-                             OR place_id IN (${placeholders(subjectIdArray)})
-                             OR subject_id IN (${placeholders(subjectIdArray)}))`;
-      const reportParams = [...subjectIdArray, ...subjectIdArray, ...subjectIdArray];
-
+      //
+      // CouchDB view requires `doc.form` to be truthy — exclude empty-string forms for parity.
       const [reportRows, taskDocs] = await Promise.all([
-        db.getAll(reportSql, reportParams),
+        chunkedQuery(subjectIdArray, async (chunk) => {
+          const sql = `SELECT doc FROM reports
+                       WHERE type = 'data_record' AND form IS NOT NULL AND form != ''
+                         AND (patient_id IN (${placeholders(chunk)})
+                           OR place_id IN (${placeholders(chunk)})
+                           OR subject_id IN (${placeholders(chunk)}))`;
+          return db.getAll(sql, [...chunk, ...chunk, ...chunk]);
+        }),
         self.tasksByRelation(contactIds, 'requester'),
       ]);
 
@@ -395,5 +449,6 @@ const powersyncProvider = (db) => {
 };
 
 powersyncProvider.RULES_STATE_DOCID = RULES_STATE_DOCID;
+powersyncProvider.MAX_SQL_ITEMS = MAX_SQL_ITEMS;
 
 module.exports = powersyncProvider;

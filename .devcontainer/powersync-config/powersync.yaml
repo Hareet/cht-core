@@ -17,6 +17,11 @@ storage:
 # API port
 port: 8080
 
+# Admin API for diagnostics and sync rule validation
+api:
+  tokens:
+    - !env PS_ADMIN_TOKEN
+
 # Sync config inlined to avoid file path issues across container mounts.
 # The canonical source is sync-config.yaml (kept for documentation/editing).
 sync_config:
@@ -24,6 +29,7 @@ sync_config:
     config:
       edition: 3
 
+    # Global CTE: UUIDs only (no shortcodes) to avoid empty bucket pollution.
     with:
       accessible_facilities: |
         SELECT facility_id
@@ -80,8 +86,12 @@ sync_config:
               OR c.doc -> 'fields' ->> 'patient_id' IN report_facilities
               OR c.doc ->> 'place_id' IN report_facilities
               OR c.doc -> 'fields' ->> 'place_id' IN report_facilities
+              OR c.doc ->> 'patient_uuid' IN report_facilities
               OR c.doc -> 'fields' ->> 'patient_uuid' IN report_facilities
+              OR c.doc ->> 'place_uuid' IN report_facilities
+              OR c.doc -> 'fields' ->> 'place_uuid' IN report_facilities
               OR c.doc -> 'contact' ->> '_id' IN report_facilities
+              OR c.doc -> 'contact' ->> '_id' = auth.parameter('contact_id')
               OR (
                 c.doc -> 'fields' ->> 'needs_signoff' = 'true'
                 AND (
@@ -94,9 +104,50 @@ sync_config:
               )
             )
             AND (
-              c.doc -> 'fields' ->> 'private' != 'true'
+              ifnull(c.doc -> 'fields' ->> 'private', 'false') != 'true'
               OR c.doc -> 'contact' ->> '_id' = auth.parameter('contact_id')
+              OR c.doc -> 'contact' ->> '_id' IN accessible_facilities
             )
+
+      sms_messages:
+        auto_subscribe: true
+        priority: 3
+        query: |
+          SELECT
+            c._id AS id,
+            c.doc -> 'contact' ->> '_id' AS contact_id,
+            c.doc ->> 'reported_date' AS reported_date,
+            c.doc ->> 'kujua_message' AS is_outgoing,
+            CAST(c.doc AS TEXT) AS doc
+          FROM "v1"."couchdb" c
+          WHERE c._deleted != true
+            AND c.doc ->> 'type' = 'data_record'
+            AND ifnull(c.doc ->> 'form', '') = ''
+            AND c.doc -> 'contact' ->> '_id' IN accessible_facilities
+
+      unassigned_reports:
+        auto_subscribe: true
+        priority: 3
+        query: |
+          SELECT
+            c._id AS id,
+            c.doc ->> 'form' AS form,
+            c.doc -> 'contact' ->> '_id' AS contact_id,
+            c.doc ->> 'reported_date' AS reported_date,
+            CAST(c.doc AS TEXT) AS doc
+          FROM "v1"."couchdb" c
+          WHERE c._deleted != true
+            AND c.doc ->> 'type' = 'data_record'
+            AND ifnull(c.doc ->> 'patient_id', '') = ''
+            AND ifnull(c.doc -> 'fields' ->> 'patient_id', '') = ''
+            AND ifnull(c.doc ->> 'place_id', '') = ''
+            AND ifnull(c.doc -> 'fields' ->> 'place_id', '') = ''
+            AND ifnull(c.doc ->> 'patient_uuid', '') = ''
+            AND ifnull(c.doc -> 'fields' ->> 'patient_uuid', '') = ''
+            AND ifnull(c.doc ->> 'place_uuid', '') = ''
+            AND ifnull(c.doc -> 'fields' ->> 'place_uuid', '') = ''
+            AND ifnull(c.doc -> 'contact' ->> '_id', '') = ''
+            AND auth.parameter('can_view_unallocated') = 'true'
 
       tasks:
         auto_subscribe: true
@@ -152,7 +203,7 @@ sync_config:
               CAST(c.doc AS TEXT) AS doc
             FROM "v1"."couchdb" c
             WHERE c._deleted != true
-              AND c._id IN '["resources", "branding", "partners", "service-worker-meta", "zscore-charts", "settings", "privacy-policies"]'
+              AND c._id IN '["resources", "branding", "partners", "service-worker-meta", "zscore-charts", "settings", "privacy-policies", "_design/medic-client"]'
 
       user_settings_doc:
         auto_subscribe: true
