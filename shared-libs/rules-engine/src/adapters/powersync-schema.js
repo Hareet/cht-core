@@ -77,7 +77,7 @@ const createChtSchema = ({ Table, column, Schema }) => {
    * The view indexes by patient_id, place_id, case_id, and nested fields variants.
    *
    * Denormalized columns for efficient SQL queries:
-   *   - patient_id: COALESCE(doc.patient_id, doc.fields.patient_id, doc.fields.patient_uuid)
+   *   - patient_id: COALESCE(doc.patient_id, doc.fields.patient_id)
    *   - place_id: COALESCE(doc.place_id, doc.fields.place_id)
    *   - subject_id: COALESCE(doc.fields.patient_uuid, doc.fields.place_uuid)
    *     Covers the UUID-based subject references that don't map to patient_id/place_id.
