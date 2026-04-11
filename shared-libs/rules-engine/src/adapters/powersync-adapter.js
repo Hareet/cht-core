@@ -30,6 +30,15 @@ const RULES_STATE_DOCID = 'local';
 const LOCAL_STATE_TABLE = 'rules_state_store';
 
 /**
+ * Maximum number of items to use in a single SQL IN clause.
+ * SQLite has a default limit of 999 bound parameters (SQLITE_MAX_VARIABLE_NUMBER).
+ * Some queries expand items into multiple IN clauses (e.g., taskDataFor uses 3x),
+ * so we use a conservative limit to stay well within bounds.
+ * The PouchDB adapter has a similar limit (MAX_QUERY_KEYS = 500).
+ */
+const MAX_SQL_ITEMS = 300;
+
+/**
  * Parse a JSON doc column, returning the parsed object or the row itself as fallback.
  * PowerSync stores full documents as JSON text in a `doc` column.
  */
@@ -57,6 +66,27 @@ const parseDocs = (rows) => {
  * Build SQL placeholders for an array of values: (?, ?, ?)
  */
 const placeholders = (arr) => arr.map(() => '?').join(', ');
+
+/**
+ * Execute a query function in chunks when the item list would exceed SQLite's parameter limit.
+ * Concatenates results from all chunks. Callers must deduplicate if needed (parseDocs handles this).
+ *
+ * @param {Array} items The full list of items to query for
+ * @param {Function} queryFn Async function that takes a chunk of items and returns rows
+ * @returns {Promise<Array>} Concatenated rows from all chunks
+ */
+const chunkedQuery = async (items, queryFn) => {
+  if (items.length <= MAX_SQL_ITEMS) {
+    return queryFn(items);
+  }
+  const results = [];
+  for (let i = 0; i < items.length; i += MAX_SQL_ITEMS) {
+    const chunk = items.slice(i, i + MAX_SQL_ITEMS);
+    const rows = await queryFn(chunk);
+    results.push(...rows);
+  }
+  return results;
+};
 
 const powersyncProvider = (db) => {
   const self = {
@@ -128,30 +158,26 @@ const powersyncProvider = (db) => {
         return [];
       }
 
-      const sql = `SELECT id, patient_id, place_id FROM contacts
-                   WHERE patient_id IN (${placeholders(subjectIds)})
-                      OR place_id IN (${placeholders(subjectIds)})`;
-      const params = [...subjectIds, ...subjectIds];
-      const rows = await db.getAll(sql, params);
+      // Uses 2x params (patient_id IN + place_id IN), so chunk to stay within SQLite limits
+      const rows = await chunkedQuery(subjectIds, async (chunk) => {
+        const sql = `SELECT id, patient_id, place_id FROM contacts
+                     WHERE patient_id IN (${placeholders(chunk)})
+                        OR place_id IN (${placeholders(chunk)})`;
+        return db.getAll(sql, [...chunk, ...chunk]);
+      });
 
-      // Build a map of shortcode -> contact id
-      const shortcodeToId = {};
+      // Track which input IDs matched shortcodes so the rest pass through as UUIDs
       const matchedShortcodes = new Set();
       for (const row of rows) {
         if (row.patient_id && subjectIds.includes(row.patient_id)) {
-          shortcodeToId[row.patient_id] = row.id;
           matchedShortcodes.add(row.patient_id);
         }
         if (row.place_id && subjectIds.includes(row.place_id)) {
-          shortcodeToId[row.place_id] = row.id;
           matchedShortcodes.add(row.place_id);
         }
       }
 
-      const resolvedIds = [];
-      for (const row of rows) {
-        resolvedIds.push(row.id);
-      }
+      const resolvedIds = rows.map(row => row.id);
 
       // IDs that weren't shortcodes pass through as-is (they may be UUIDs)
       const passthroughIds = subjectIds.filter(id => !matchedShortcodes.has(id));
@@ -281,21 +307,23 @@ const powersyncProvider = (db) => {
         return [];
       }
 
-      let sql;
-      if (prefix === 'owner') {
-        // CouchDB view emits 'owner-{id}' only for non-terminal tasks.
-        // NULL/undefined state is non-terminal in CouchDB (indexOf(undefined) === -1).
-        // SQL NOT IN excludes NULLs, so we explicitly handle NULL state.
-        sql = `SELECT doc FROM tasks
-               WHERE type = 'task'
-                 AND (state IS NULL OR state NOT IN ('Cancelled', 'Completed', 'Failed'))
-                 AND owner IN (${placeholders(contactIds)})`;
-      } else {
-        sql = `SELECT doc FROM tasks
-               WHERE type = 'task'
-                 AND requester IN (${placeholders(contactIds)})`;
-      }
-      const rows = await db.getAll(sql, contactIds);
+      const rows = await chunkedQuery(contactIds, async (chunk) => {
+        let sql;
+        if (prefix === 'owner') {
+          // CouchDB view emits 'owner-{id}' only for non-terminal tasks.
+          // NULL/undefined state is non-terminal in CouchDB (indexOf(undefined) === -1).
+          // SQL NOT IN excludes NULLs, so we explicitly handle NULL state.
+          sql = `SELECT doc FROM tasks
+                 WHERE type = 'task'
+                   AND (state IS NULL OR state NOT IN ('Cancelled', 'Completed', 'Failed'))
+                   AND owner IN (${placeholders(chunk)})`;
+        } else {
+          sql = `SELECT doc FROM tasks
+                 WHERE type = 'task'
+                   AND requester IN (${placeholders(chunk)})`;
+        }
+        return db.getAll(sql, chunk);
+      });
       return parseDocs(rows);
     },
 
@@ -309,10 +337,12 @@ const powersyncProvider = (db) => {
         return [];
       }
 
-      const sql = `SELECT id, owner, state FROM tasks
-                   WHERE type = 'task'
-                     AND owner IN (${placeholders(contactIds)})`;
-      const rows = await db.getAll(sql, contactIds);
+      const rows = await chunkedQuery(contactIds, async (chunk) => {
+        const sql = `SELECT id, owner, state FROM tasks
+                     WHERE type = 'task'
+                       AND owner IN (${placeholders(chunk)})`;
+        return db.getAll(sql, chunk);
+      });
 
       return uniqBy(rows, 'id').map(row => ({
         id: row.id,
@@ -345,11 +375,13 @@ const powersyncProvider = (db) => {
         return {};
       }
 
-      // Fetch contact documents
-      const contactRows = await db.getAll(
-        `SELECT doc FROM contacts WHERE id IN (${placeholders(contactIds)})`,
-        contactIds
-      );
+      // Fetch contact documents (1x params)
+      const contactRows = await chunkedQuery(contactIds, async (chunk) => {
+        return db.getAll(
+          `SELECT doc FROM contacts WHERE id IN (${placeholders(chunk)})`,
+          chunk
+        );
+      });
       const contactDocs = parseDocs(contactRows);
 
       // Build the set of subject IDs from contacts (includes UUIDs + shortcodes like patient_id)
@@ -360,21 +392,22 @@ const powersyncProvider = (db) => {
 
       const subjectIdArray = Array.from(subjectIds);
 
-      // Fetch reports by subject: the CouchDB view indexes by patient_id, place_id, case_id,
+      // Fetch reports by subject (3x params — most critical for chunking).
+      // The CouchDB view indexes by patient_id, place_id, case_id,
       // fields.patient_id, fields.place_id, fields.case_id, fields.patient_uuid, fields.place_uuid.
       // However, registrationUtils.getSubjectIds uses only: _id, patient_id, place_id (contacts)
       // and patient_id, patient_uuid, place_id, place_uuid (reports). case_id is NOT a subject
       // property, so contact subject IDs never include case_id values. Reports matched solely
       // by case_id would not appear in PouchDB either. subject_id column covers patient_uuid/place_uuid.
-      const reportSql = `SELECT doc FROM reports
-                         WHERE type = 'data_record' AND form IS NOT NULL
-                           AND (patient_id IN (${placeholders(subjectIdArray)})
-                             OR place_id IN (${placeholders(subjectIdArray)})
-                             OR subject_id IN (${placeholders(subjectIdArray)}))`;
-      const reportParams = [...subjectIdArray, ...subjectIdArray, ...subjectIdArray];
-
       const [reportRows, taskDocs] = await Promise.all([
-        db.getAll(reportSql, reportParams),
+        chunkedQuery(subjectIdArray, async (chunk) => {
+          const sql = `SELECT doc FROM reports
+                       WHERE type = 'data_record' AND form IS NOT NULL
+                         AND (patient_id IN (${placeholders(chunk)})
+                           OR place_id IN (${placeholders(chunk)})
+                           OR subject_id IN (${placeholders(chunk)}))`;
+          return db.getAll(sql, [...chunk, ...chunk, ...chunk]);
+        }),
         self.tasksByRelation(contactIds, 'requester'),
       ]);
 
@@ -399,5 +432,6 @@ const powersyncProvider = (db) => {
 };
 
 powersyncProvider.RULES_STATE_DOCID = RULES_STATE_DOCID;
+powersyncProvider.MAX_SQL_ITEMS = MAX_SQL_ITEMS;
 
 module.exports = powersyncProvider;

@@ -738,6 +738,179 @@ describe('powersync-adapter', () => {
     });
   });
 
+  describe('SQL parameter chunking', () => {
+    const { MAX_SQL_ITEMS } = powersyncProvider;
+
+    it('should not chunk when item count is within limit', async () => {
+      const contacts = [];
+      for (let i = 0; i < 10; i++) {
+        contacts.push({
+          _id: `contact-${i}`,
+          type: 'contact',
+          contact_type: 'person',
+          name: `Contact ${i}`,
+          patient_id: `shortcode-${i}`,
+        });
+      }
+      seedContacts(db, contacts);
+
+      const result = await powersyncProvider(db).contactsBySubjectId(
+        contacts.map(c => c.patient_id)
+      );
+      // Each shortcode should resolve to its contact ID
+      expect(result).to.have.length(10);
+      contacts.forEach(c => {
+        expect(result).to.include(c._id);
+      });
+
+      // getAll should have been called once (no chunking)
+      expect(db.getAll.callCount).to.equal(1);
+    });
+
+    it('should chunk contactsBySubjectId when exceeding MAX_SQL_ITEMS', async () => {
+      const count = MAX_SQL_ITEMS + 50;
+      const contacts = [];
+      for (let i = 0; i < count; i++) {
+        contacts.push({
+          _id: `contact-${i}`,
+          type: 'contact',
+          contact_type: 'person',
+          name: `Contact ${i}`,
+          patient_id: `shortcode-${i}`,
+        });
+      }
+      seedContacts(db, contacts);
+
+      const subjectIds = contacts.map(c => c.patient_id);
+      const result = await powersyncProvider(db).contactsBySubjectId(subjectIds);
+
+      // All shortcodes should resolve (chunked into 2 queries)
+      expect(result).to.have.length(count);
+      contacts.forEach(c => {
+        expect(result).to.include(c._id);
+      });
+
+      // Should have been called twice (chunked)
+      expect(db.getAll.callCount).to.equal(2);
+    });
+
+    it('should chunk tasksByRelation for large contact lists', async () => {
+      const count = MAX_SQL_ITEMS + 100;
+      const tasks = [];
+      for (let i = 0; i < count; i++) {
+        tasks.push({
+          _id: `task-${i}`,
+          type: 'task',
+          owner: `contact-${i}`,
+          requester: `contact-${i}`,
+          state: 'Ready',
+        });
+      }
+      seedTasks(db, tasks);
+
+      const contactIds = tasks.map(t => t.owner);
+      const result = await powersyncProvider(db).tasksByRelation(contactIds, 'owner');
+
+      expect(result).to.have.length(count);
+      // Should have been chunked into 2 calls
+      expect(db.getAll.callCount).to.equal(2);
+    });
+
+    it('should chunk allTaskRowsByOwner for large contact lists', async () => {
+      const count = MAX_SQL_ITEMS + 100;
+      const tasks = [];
+      for (let i = 0; i < count; i++) {
+        tasks.push({
+          _id: `task-${i}`,
+          type: 'task',
+          owner: `contact-${i}`,
+          state: 'Draft',
+        });
+      }
+      seedTasks(db, tasks);
+
+      const contactIds = tasks.map(t => t.owner);
+      const rows = await powersyncProvider(db).allTaskRowsByOwner(contactIds);
+
+      expect(rows).to.have.length(count);
+      rows.forEach(row => {
+        expect(row.key[0]).to.equal('owner');
+        expect(row.key[1]).to.equal('all');
+        expect(row.value).to.deep.equal({ state: 'Draft' });
+      });
+      // Should have been chunked into 2 calls
+      expect(db.getAll.callCount).to.equal(2);
+    });
+
+    it('should chunk taskDataFor contacts and reports queries', async () => {
+      const count = MAX_SQL_ITEMS + 50;
+      const contacts = [];
+      const reports = [];
+      for (let i = 0; i < count; i++) {
+        const contact = {
+          _id: `contact-${i}`,
+          type: 'contact',
+          contact_type: 'person',
+          name: `Contact ${i}`,
+          patient_id: `pid-${i}`,
+        };
+        contacts.push(contact);
+        reports.push({
+          _id: `report-${i}`,
+          type: 'data_record',
+          form: 'pregnancy',
+          patient_id: `pid-${i}`,
+          reported_date: i,
+        });
+      }
+      seedContacts(db, contacts);
+      seedReports(db, reports);
+
+      const contactIds = contacts.map(c => c._id);
+      const result = await powersyncProvider(db).taskDataFor(contactIds, { _id: 'user' });
+
+      expect(result.contactDocs).to.have.length(count);
+      expect(result.reportDocs).to.have.length(count);
+      // contacts query chunked (2 calls) + reports query chunked (2 calls) + tasksByRelation (1 call, empty)
+      // Total getAll calls >= 4
+      expect(db.getAll.callCount).to.be.at.least(4);
+    });
+
+    it('should deduplicate results across chunks when a doc matches multiple chunks', async () => {
+      // A report that matches subject IDs in different chunks should only appear once
+      const count = MAX_SQL_ITEMS + 10;
+      const contacts = [];
+      for (let i = 0; i < count; i++) {
+        contacts.push({
+          _id: `contact-${i}`,
+          type: 'contact',
+          contact_type: 'person',
+          name: `Contact ${i}`,
+          patient_id: `pid-${i}`,
+        });
+      }
+      seedContacts(db, contacts);
+
+      // This report matches patient_id from chunk 1 AND place_id from chunk 2
+      const crossChunkReport = {
+        _id: 'cross-chunk-report',
+        type: 'data_record',
+        form: 'visit',
+        patient_id: 'pid-0',
+        place_id: `pid-${MAX_SQL_ITEMS + 5}`,
+        reported_date: 999,
+      };
+      seedReports(db, [crossChunkReport]);
+
+      const contactIds = contacts.map(c => c._id);
+      const result = await powersyncProvider(db).taskDataFor(contactIds, { _id: 'user' });
+
+      // The cross-chunk report should appear exactly once (deduplicated by parseDocs)
+      const crossChunkResults = result.reportDocs.filter(r => r._id === 'cross-chunk-report');
+      expect(crossChunkResults).to.have.length(1);
+    });
+  });
+
   describe('adapter factory', () => {
     it('creates powersync provider via adapters index', () => {
       const adapters = require('../src/adapters');
