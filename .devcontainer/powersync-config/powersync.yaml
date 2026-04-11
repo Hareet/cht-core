@@ -41,23 +41,23 @@ sync_config:
             WHERE user_id = auth.user_id()
         query: |
           SELECT
-            c._id AS id,
-            c.doc ->> 'name' AS name,
-            ifnull(c.doc ->> 'contact_type', c.doc ->> 'type') AS contact_type,
-            ifnull(c.doc -> 'parent' ->> '_id', c.doc ->> 'parent') AS parent_id,
-            c.doc ->> 'patient_id' AS patient_id,
-            c.doc ->> 'place_id' AS place_id,
-            c.doc ->> 'phone' AS phone,
-            c.doc ->> 'date_of_birth' AS date_of_birth,
-            c.doc ->> 'sex' AS sex,
-            c.doc ->> 'reported_date' AS reported_date,
-            CAST(c.doc AS TEXT) AS doc
-          FROM "v1"."couchdb" c
-          WHERE c._deleted != true
-            AND c.doc ->> 'type' IN '["contact", "person", "clinic", "health_center", "district_hospital"]'
+            contacts._id AS id,
+            contacts.doc ->> 'name' AS name,
+            ifnull(contacts.doc ->> 'contact_type', contacts.doc ->> 'type') AS contact_type,
+            ifnull(contacts.doc -> 'parent' ->> '_id', contacts.doc ->> 'parent') AS parent_id,
+            contacts.doc ->> 'patient_id' AS patient_id,
+            contacts.doc ->> 'place_id' AS place_id,
+            contacts.doc ->> 'phone' AS phone,
+            contacts.doc ->> 'date_of_birth' AS date_of_birth,
+            contacts.doc ->> 'sex' AS sex,
+            contacts.doc ->> 'reported_date' AS reported_date,
+            CAST(contacts.doc AS TEXT) AS doc
+          FROM "v1"."couchdb" contacts
+          WHERE contacts._deleted != true
+            AND contacts.doc ->> 'type' IN '["contact", "person", "clinic", "health_center", "district_hospital"]'
             AND (
-              c._id IN accessible_facilities
-              OR ifnull(c.doc -> 'parent' ->> '_id', c.doc ->> 'parent') IN accessible_facilities
+              contacts._id IN accessible_facilities
+              OR ifnull(contacts.doc -> 'parent' ->> '_id', contacts.doc ->> 'parent') IN accessible_facilities
             )
 
       reports:
@@ -74,37 +74,37 @@ sync_config:
             WHERE user_id = auth.user_id()
         query: |
           SELECT
-            c._id AS id,
-            c.doc ->> 'form' AS form,
-            c.doc ->> 'patient_id' AS patient_id,
-            c.doc -> 'contact' ->> '_id' AS submitter_id,
-            c.doc ->> 'reported_date' AS reported_date,
-            c.doc -> 'fields' ->> 'private' AS is_private,
-            c.doc -> 'fields' ->> 'needs_signoff' AS needs_signoff,
-            CAST(c.doc -> 'fields' AS TEXT) AS fields,
-            CAST(c.doc AS TEXT) AS doc
-          FROM "v1"."couchdb" c
-          WHERE c._deleted != true
-            AND c.doc ->> 'type' = 'data_record'
-            AND c.doc ->> 'form' IS NOT NULL
+            reports._id AS id,
+            reports.doc ->> 'form' AS form,
+            reports.doc ->> 'patient_id' AS patient_id,
+            reports.doc -> 'contact' ->> '_id' AS submitter_id,
+            reports.doc ->> 'reported_date' AS reported_date,
+            reports.doc -> 'fields' ->> 'private' AS is_private,
+            reports.doc -> 'fields' ->> 'needs_signoff' AS needs_signoff,
+            CAST(reports.doc -> 'fields' AS TEXT) AS fields,
+            CAST(reports.doc AS TEXT) AS doc
+          FROM "v1"."couchdb" reports
+          WHERE reports._deleted != true
+            AND reports.doc ->> 'type' = 'data_record'
+            AND reports.doc ->> 'form' IS NOT NULL
             AND (
-              c.doc ->> 'patient_id' IN report_facilities
-              OR c.doc -> 'fields' ->> 'patient_id' IN report_facilities
-              OR c.doc ->> 'place_id' IN report_facilities
-              OR c.doc -> 'fields' ->> 'place_id' IN report_facilities
-              OR c.doc -> 'contact' ->> '_id' IN report_facilities
-              OR c.doc -> 'contact' ->> '_id' = auth.parameter('contact_id')
+              reports.doc ->> 'patient_id' IN report_facilities
+              OR reports.doc -> 'fields' ->> 'patient_id' IN report_facilities
+              OR reports.doc ->> 'place_id' IN report_facilities
+              OR reports.doc -> 'fields' ->> 'place_id' IN report_facilities
+              OR reports.doc -> 'contact' ->> '_id' IN report_facilities
+              OR reports.doc -> 'contact' ->> '_id' = auth.parameter('contact_id')
               OR (
-                c.doc -> 'fields' ->> 'needs_signoff' = 'true'
+                reports.doc -> 'fields' ->> 'needs_signoff' = 'true'
                 AND (
-                  c.doc -> 'contact' ->> '_id' IN accessible_facilities
-                  OR c.doc -> 'contact' -> 'parent' ->> '_id' IN accessible_facilities
+                  reports.doc -> 'contact' ->> '_id' IN accessible_facilities
+                  OR reports.doc -> 'contact' -> 'parent' ->> '_id' IN accessible_facilities
                 )
               )
             )
             AND (
-              ifnull(c.doc -> 'fields' ->> 'private', 'false') != 'true'
-              OR c.doc -> 'contact' ->> '_id' = auth.parameter('contact_id')
+              ifnull(reports.doc -> 'fields' ->> 'private', 'false') != 'true'
+              OR reports.doc -> 'contact' ->> '_id' = auth.parameter('contact_id')
             )
 
       sms_messages:
@@ -117,36 +117,36 @@ sync_config:
             WHERE user_id = auth.user_id()
         query: |
           SELECT
-            c._id AS id,
-            c.doc -> 'contact' ->> '_id' AS contact_id,
-            c.doc ->> 'reported_date' AS reported_date,
-            c.doc ->> 'kujua_message' AS is_outgoing,
-            CAST(c.doc AS TEXT) AS doc
-          FROM "v1"."couchdb" c
-          WHERE c._deleted != true
-            AND c.doc ->> 'type' = 'data_record'
-            AND ifnull(c.doc ->> 'form', '') = ''
-            AND c.doc -> 'contact' ->> '_id' IN accessible_facilities
+            sms_messages._id AS id,
+            sms_messages.doc -> 'contact' ->> '_id' AS contact_id,
+            sms_messages.doc ->> 'reported_date' AS reported_date,
+            sms_messages.doc ->> 'kujua_message' AS is_outgoing,
+            CAST(sms_messages.doc AS TEXT) AS doc
+          FROM "v1"."couchdb" sms_messages
+          WHERE sms_messages._deleted != true
+            AND sms_messages.doc ->> 'type' = 'data_record'
+            AND ifnull(sms_messages.doc ->> 'form', '') = ''
+            AND sms_messages.doc -> 'contact' ->> '_id' IN accessible_facilities
 
       tasks:
         auto_subscribe: true
         priority: 3
         query: |
           SELECT
-            c._id AS id,
-            c.doc ->> 'user' AS task_user,
-            c.doc ->> 'owner' AS owner,
-            c.doc ->> 'requester' AS requester,
-            c.doc ->> 'state' AS state,
-            c.doc ->> 'emission' AS emission_id,
-            c.doc ->> 'dueDate' AS due_date,
-            c.doc ->> 'startDate' AS start_date,
-            c.doc ->> 'endDate' AS end_date,
-            CAST(c.doc AS TEXT) AS doc
-          FROM "v1"."couchdb" c
-          WHERE c._deleted != true
-            AND c.doc ->> 'type' = 'task'
-            AND c.doc ->> 'user' = auth.user_id()
+            tasks._id AS id,
+            tasks.doc ->> 'user' AS task_user,
+            tasks.doc ->> 'owner' AS owner,
+            tasks.doc ->> 'requester' AS requester,
+            tasks.doc ->> 'state' AS state,
+            tasks.doc ->> 'emission' AS emission_id,
+            tasks.doc ->> 'dueDate' AS due_date,
+            tasks.doc ->> 'startDate' AS start_date,
+            tasks.doc ->> 'endDate' AS end_date,
+            CAST(tasks.doc AS TEXT) AS doc
+          FROM "v1"."couchdb" tasks
+          WHERE tasks._deleted != true
+            AND tasks.doc ->> 'type' = 'task'
+            AND tasks.doc ->> 'user' = auth.user_id()
 
       targets:
         auto_subscribe: true
@@ -158,15 +158,15 @@ sync_config:
             WHERE user_id = auth.user_id()
         query: |
           SELECT
-            c._id AS id,
-            c.doc ->> 'owner' AS owner,
-            c.doc ->> 'reporting_period' AS reporting_period,
-            CAST(c.doc -> 'targets' AS TEXT) AS targets_data,
-            CAST(c.doc AS TEXT) AS doc
-          FROM "v1"."couchdb" c
-          WHERE c._deleted != true
-            AND c.doc ->> 'type' = 'target'
-            AND c.doc ->> 'owner' IN accessible_facilities
+            targets._id AS id,
+            targets.doc ->> 'owner' AS owner,
+            targets.doc ->> 'reporting_period' AS reporting_period,
+            CAST(targets.doc -> 'targets' AS TEXT) AS targets_data,
+            CAST(targets.doc AS TEXT) AS doc
+          FROM "v1"."couchdb" targets
+          WHERE targets._deleted != true
+            AND targets.doc ->> 'type' = 'target'
+            AND targets.doc ->> 'owner' IN accessible_facilities
 
       global_config:
         auto_subscribe: true
@@ -174,50 +174,50 @@ sync_config:
         queries:
           - |
             SELECT
-              c._id AS id,
-              c.doc ->> 'type' AS doc_type,
-              CAST(c.doc AS TEXT) AS doc
-            FROM "v1"."couchdb" c
-            WHERE c._deleted != true
-              AND c.doc ->> 'type' IN '["form", "translations"]'
+              global_config._id AS id,
+              global_config.doc ->> 'type' AS doc_type,
+              CAST(global_config.doc AS TEXT) AS doc
+            FROM "v1"."couchdb" global_config
+            WHERE global_config._deleted != true
+              AND global_config.doc ->> 'type' IN '["form", "translations"]'
           - |
             SELECT
-              c._id AS id,
-              c.doc ->> 'type' AS doc_type,
-              CAST(c.doc AS TEXT) AS doc
-            FROM "v1"."couchdb" c
-            WHERE c._deleted != true
-              AND c._id IN '["resources", "branding", "partners", "service-worker-meta", "zscore-charts", "settings", "privacy-policies", "_design/medic-client"]'
+              global_config._id AS id,
+              global_config.doc ->> 'type' AS doc_type,
+              CAST(global_config.doc AS TEXT) AS doc
+            FROM "v1"."couchdb" global_config
+            WHERE global_config._deleted != true
+              AND global_config._id IN '["resources", "branding", "partners", "service-worker-meta", "zscore-charts", "settings", "privacy-policies", "_design/medic-client"]'
 
       user_settings_doc:
         auto_subscribe: true
         priority: 1
         query: |
           SELECT
-            c._id AS id,
-            c.doc ->> 'type' AS doc_type,
-            CAST(c.doc AS TEXT) AS doc
-          FROM "v1"."couchdb" c
-          WHERE c._deleted != true
-            AND c._id = auth.user_id()
+            user_settings_doc._id AS id,
+            user_settings_doc.doc ->> 'type' AS doc_type,
+            CAST(user_settings_doc.doc AS TEXT) AS doc
+          FROM "v1"."couchdb" user_settings_doc
+          WHERE user_settings_doc._deleted != true
+            AND user_settings_doc._id = auth.user_id()
 
       user_meta:
         auto_subscribe: true
         priority: 3
         query: |
           SELECT
-            c._id AS id,
-            c.doc ->> 'type' AS meta_type,
-            c.doc ->> 'user' AS user_id,
-            CAST(c.doc AS TEXT) AS doc
-          FROM "v1"."couchdb" c
-          WHERE c._deleted != true
+            user_meta._id AS id,
+            user_meta.doc ->> 'type' AS meta_type,
+            user_meta.doc ->> 'user' AS user_id,
+            CAST(user_meta.doc AS TEXT) AS doc
+          FROM "v1"."couchdb" user_meta
+          WHERE user_meta._deleted != true
             AND (
-              substring(c._id, 1, 10) = 'telemetry-'
-              OR substring(c._id, 1, 9) = 'feedback-'
-              OR substring(c._id, 1, 12) = 'read:report:'
+              substring(user_meta._id, 1, 10) = 'telemetry-'
+              OR substring(user_meta._id, 1, 9) = 'feedback-'
+              OR substring(user_meta._id, 1, 12) = 'read:report:'
             )
-            AND c.doc ->> 'user' = auth.user_id()
+            AND user_meta.doc ->> 'user' = auth.user_id()
 
 # Client authentication via JWT
 client_auth:
