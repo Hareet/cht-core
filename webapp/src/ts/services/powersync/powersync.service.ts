@@ -61,6 +61,7 @@ export class PowerSyncService implements OnDestroy {
   private db: PowerSyncDatabase | null = null;
   private connector: ChtPowerSyncConnector | null = null;
   private initialized = false;
+  private reconnecting = false;
   private destroyed$ = new Subject<void>();
 
   private statusSubject = new BehaviorSubject<PowerSyncStatus>({
@@ -421,6 +422,65 @@ export class PowerSyncService implements OnDestroy {
    */
   isReady(): boolean {
     return this.initialized && (this.statusSubject.value.hasSynced || false);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Error recovery & queue visibility
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Reconnect to the PowerSync service.
+   * Use when sync appears stuck or after recovering from a network outage.
+   * Tears down the current sync stream and re-establishes it with fresh credentials.
+   *
+   * Guarded against concurrent calls — if a reconnect is already in progress,
+   * subsequent calls are no-ops to prevent overlapping disconnect/connect sequences
+   * that could corrupt sync state or create duplicate streams.
+   *
+   * If disconnect() fails (e.g. DB locked), connect() is still attempted to avoid
+   * leaving the service stuck in a disconnected state with no recovery path.
+   */
+  async reconnect(): Promise<void> {
+    if (!this.db || !this.connector || this.reconnecting) {
+      return;
+    }
+    this.reconnecting = true;
+    try {
+      try {
+        await this.db.disconnect();
+      } catch (err) {
+        console.warn('PowerSync: disconnect failed during reconnect, attempting connect anyway:', err);
+      }
+      // Re-check after async yield: disconnectAndClear() may have run during
+      // the await above, nullifying db/connector. Without this guard, calling
+      // connect() on a null reference throws a TypeError.
+      if (!this.db || !this.connector) {
+        return;
+      }
+      // connect() is fire-and-forget; sync resumes in the background
+      this.db.connect(this.connector);
+    } finally {
+      this.reconnecting = false;
+    }
+  }
+
+  /**
+   * Get the number of pending upload operations in the offline queue.
+   * Returns 0 if not initialized.
+   */
+  async getPendingUploadCount(): Promise<number> {
+    if (!this.db) {
+      return 0;
+    }
+    const stats = await this.db.getUploadQueueStats();
+    return stats.count;
+  }
+
+  /**
+   * Check if there are any pending writes waiting to be uploaded.
+   */
+  async hasPendingWrites(): Promise<boolean> {
+    return (await this.getPendingUploadCount()) > 0;
   }
 
   /**
