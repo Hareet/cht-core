@@ -104,6 +104,32 @@ describe('feed', () => {
         });
     });
 
+    it('cancels the previous feed before restarting after db error', () => {
+      sinon.stub(metadata, 'getTransitionSeq')
+        .onCall(0).resolves('123')
+        .onCall(1).resolves('456');
+
+      return feed
+        .listen()
+        .then(() => {
+          chai.expect(handler.cancel.callCount).to.equal(0);
+          const errorFn = handler.on.args[1][1];
+          errorFn({ status: 500 });
+        })
+        .then(() => {
+          // The old feed must be cancelled to release its connection pool
+          // and LISTEN connection. Without this, each error leaks resources.
+          chai.expect(handler.cancel.callCount).to.equal(1);
+          clock.tick(65000);
+          return nextTick();
+        })
+        .then(() => {
+          // A new feed is created after the retry timeout
+          chai.expect(db.medic.changes.callCount).to.equal(2);
+          chai.expect(db.medic.changes.args[1][0]).to.deep.equal({ live: true, since: '456' });
+        });
+    });
+
   });
 
   describe('listener', () => {

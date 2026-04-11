@@ -62,6 +62,9 @@ const registerFeed = (seq) => {
     })
     .on('error', err => {
       logger.error('transitions: error from changes feed: %o', err);
+      if (request) {
+        request.cancel();
+      }
       request = null;
       setTimeout(() => resumeProcessing(), RETRY_TIMEOUT);
     });
