@@ -4,3 +4,6 @@ dev-private-key.pem
 
 # Generated tokens
 *.jwt
+
+# Temporary helper scripts
+parse-*.py
