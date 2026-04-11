@@ -136,3 +136,57 @@ await db.connect(connector, {
 ```
 
 The official Node.js example at `demos/example-node/src/main.ts` includes this pattern but doesn't document why it's necessary.
+
+---
+
+## 5. Parameter query CTE limited to 1,000 results
+
+**Severity:** Blocks sync for any user with >1,000 accessible facilities (production blocker)
+
+**Impact on CHT:** A county admin in eCHIS sees all facilities in their county. With Kenya's hierarchy (county → sub-county → facility → CHW area → household → patient), even a health_center supervisor with 20 CHW areas of 50 households each hits 1,000+. A county with 200+ facilities is common. This limit would block national-scale deployment with the `with`/`IN` pattern.
+
+When a Sync Streams `with` CTE returns more than 1,000 rows and is used in an `IN` clause, the service returns:
+
+```
+error: [PSYNC_S2305] Too many parameter query results: 9072 (limit of 1000)
+```
+
+The sync stream fails completely — zero data is sent to the client.
+
+**Root cause:** PowerSync expands `IN <cte_name>` into a parameterized `IN ($1, $2, ..., $N)` clause. The service enforces a 1,000 parameter limit on these expansions.
+
+**Affected pattern:**
+```yaml
+streams:
+  contacts:
+    with:
+      accessible_facilities: |
+        SELECT facility_id
+        FROM "v1"."user_accessible_facilities"
+        WHERE user_id = auth.user_id()
+    query: |
+      SELECT ... FROM "v1"."couchdb" contacts
+      WHERE contacts._id IN accessible_facilities  -- fails if >1000 rows
+```
+
+**Fix:** Replace `IN <cte>` with a direct JOIN against the source table:
+
+```yaml
+streams:
+  contacts:
+    query: |
+      SELECT contacts._id AS id, ...
+      FROM "v1"."couchdb" contacts
+      INNER JOIN "v1"."user_accessible_facilities" uaf
+        ON uaf.user_id = auth.user_id()
+        AND (
+          contacts._id = uaf.facility_id
+          OR ifnull(contacts.doc -> 'parent' ->> '_id', contacts.doc ->> 'parent') = uaf.facility_id
+        )
+      WHERE contacts._deleted != true
+        AND contacts.doc ->> 'type' IN '["contact", "person", "clinic", "health_center", "district_hospital"]'
+```
+
+This eliminates the `with` block entirely. The JOIN is evaluated server-side without parameter expansion, so there is no row limit.
+
+**Applies to all streams using `IN accessible_facilities` or `IN report_facilities`:** contacts, reports, sms_messages, targets.

@@ -48,6 +48,8 @@ services:
       - haproxy
     expose:
       - "${API_PORT:-5988}"
+    ports:
+      - "${API_PORT:-5988}:${API_PORT:-5988}"
     environment:
       - COUCH_URL=http://${COUCHDB_USER:-admin}:${COUCHDB_PASSWORD}@haproxy:${HAPROXY_PORT:-5984}/medic
       - BUILDS_URL=${MARKET_URL_READ:-https://staging.dev.medicmobile.org}/${BUILDS_SERVER:-_couch/builds_4}
