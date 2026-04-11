@@ -69,7 +69,10 @@ streams:
       FROM "v1"."couchdb" c
       WHERE c._deleted != true
         AND c.doc ->> 'type' IN '["contact", "person", "clinic", "health_center", "district_hospital"]'
-        AND c._id IN accessible_facilities
+        AND (
+          c._id IN accessible_facilities
+          OR ifnull(c.doc -> 'parent' ->> '_id', c.doc ->> 'parent') IN accessible_facilities
+        )
 
   # ================================================================
   # REPORTS (form-based data_records)

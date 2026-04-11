@@ -23,23 +23,22 @@ api:
     - !env PS_ADMIN_TOKEN
 
 # Sync config inlined to avoid file path issues across container mounts.
-# The canonical source is sync-config.yaml (kept for documentation/editing).
+# No global `with` block — each stream defines its own to avoid
+# PowerSync v1.20.x circular reference errors when mixing global and local `with`.
 sync_config:
   content: |
     config:
       edition: 3
 
-    # Global CTE: UUIDs only (no shortcodes) to avoid empty bucket pollution.
-    with:
-      accessible_facilities: |
-        SELECT facility_id
-        FROM "v1"."user_accessible_facilities"
-        WHERE user_id = auth.user_id()
-
     streams:
       contacts:
         auto_subscribe: true
         priority: 1
+        with:
+          accessible_facilities: |
+            SELECT facility_id
+            FROM "v1"."user_accessible_facilities"
+            WHERE user_id = auth.user_id()
         query: |
           SELECT
             c._id AS id,
@@ -56,7 +55,10 @@ sync_config:
           FROM "v1"."couchdb" c
           WHERE c._deleted != true
             AND c.doc ->> 'type' IN '["contact", "person", "clinic", "health_center", "district_hospital"]'
-            AND c._id IN accessible_facilities
+            AND (
+              c._id IN accessible_facilities
+              OR ifnull(c.doc -> 'parent' ->> '_id', c.doc ->> 'parent') IN accessible_facilities
+            )
 
       reports:
         auto_subscribe: true
@@ -90,10 +92,6 @@ sync_config:
               OR c.doc -> 'fields' ->> 'patient_id' IN report_facilities
               OR c.doc ->> 'place_id' IN report_facilities
               OR c.doc -> 'fields' ->> 'place_id' IN report_facilities
-              OR c.doc ->> 'patient_uuid' IN report_facilities
-              OR c.doc -> 'fields' ->> 'patient_uuid' IN report_facilities
-              OR c.doc ->> 'place_uuid' IN report_facilities
-              OR c.doc -> 'fields' ->> 'place_uuid' IN report_facilities
               OR c.doc -> 'contact' ->> '_id' IN report_facilities
               OR c.doc -> 'contact' ->> '_id' = auth.parameter('contact_id')
               OR (
@@ -101,21 +99,22 @@ sync_config:
                 AND (
                   c.doc -> 'contact' ->> '_id' IN accessible_facilities
                   OR c.doc -> 'contact' -> 'parent' ->> '_id' IN accessible_facilities
-                  OR c.doc -> 'contact' -> 'parent' -> 'parent' ->> '_id' IN accessible_facilities
-                  OR c.doc -> 'contact' -> 'parent' -> 'parent' -> 'parent' ->> '_id' IN accessible_facilities
-                  OR c.doc -> 'contact' -> 'parent' -> 'parent' -> 'parent' -> 'parent' ->> '_id' IN accessible_facilities
                 )
               )
             )
             AND (
               ifnull(c.doc -> 'fields' ->> 'private', 'false') != 'true'
               OR c.doc -> 'contact' ->> '_id' = auth.parameter('contact_id')
-              OR c.doc -> 'contact' ->> '_id' IN accessible_facilities
             )
 
       sms_messages:
         auto_subscribe: true
         priority: 3
+        with:
+          accessible_facilities: |
+            SELECT facility_id
+            FROM "v1"."user_accessible_facilities"
+            WHERE user_id = auth.user_id()
         query: |
           SELECT
             c._id AS id,
@@ -128,30 +127,6 @@ sync_config:
             AND c.doc ->> 'type' = 'data_record'
             AND ifnull(c.doc ->> 'form', '') = ''
             AND c.doc -> 'contact' ->> '_id' IN accessible_facilities
-
-      unassigned_reports:
-        auto_subscribe: true
-        priority: 3
-        query: |
-          SELECT
-            c._id AS id,
-            c.doc ->> 'form' AS form,
-            c.doc -> 'contact' ->> '_id' AS contact_id,
-            c.doc ->> 'reported_date' AS reported_date,
-            CAST(c.doc AS TEXT) AS doc
-          FROM "v1"."couchdb" c
-          WHERE c._deleted != true
-            AND c.doc ->> 'type' = 'data_record'
-            AND ifnull(c.doc ->> 'patient_id', '') = ''
-            AND ifnull(c.doc -> 'fields' ->> 'patient_id', '') = ''
-            AND ifnull(c.doc ->> 'place_id', '') = ''
-            AND ifnull(c.doc -> 'fields' ->> 'place_id', '') = ''
-            AND ifnull(c.doc ->> 'patient_uuid', '') = ''
-            AND ifnull(c.doc -> 'fields' ->> 'patient_uuid', '') = ''
-            AND ifnull(c.doc ->> 'place_uuid', '') = ''
-            AND ifnull(c.doc -> 'fields' ->> 'place_uuid', '') = ''
-            AND ifnull(c.doc -> 'contact' ->> '_id', '') = ''
-            AND auth.parameter('can_view_unallocated') = 'true'
 
       tasks:
         auto_subscribe: true
@@ -176,6 +151,11 @@ sync_config:
       targets:
         auto_subscribe: true
         priority: 3
+        with:
+          accessible_facilities: |
+            SELECT facility_id
+            FROM "v1"."user_accessible_facilities"
+            WHERE user_id = auth.user_id()
         query: |
           SELECT
             c._id AS id,
