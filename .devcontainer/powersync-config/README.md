@@ -14,7 +14,7 @@ Verified against:
 | File | Purpose |
 |------|---------|
 | `powersync.yaml` | PowerSync service config (DB connection, auth, storage) |
-| `sync-config.yaml` | Sync Streams definitions (edition 3) — 9 streams |
+| `sync-config.yaml` | Sync Streams definitions (edition 3) — 7 streams (consolidated) |
 | `setup.sql` | PostgreSQL supporting tables, functions, and seed data |
 | `generate-test-token.js` | JWT token generator for dev testing |
 | `.gitignore` | Excludes private keys from version control |
@@ -36,55 +36,93 @@ CHT Documents (v1.couchdb JSONB)
   ├─ purge_status                ← tracks docs to exclude per role
   │     (doc_id, role_hash)         populated by purge preprocessor
   │
-  └─ PowerSync Sync Streams (9 streams)
-        ├─ contacts:          hierarchy-filtered by accessible_facilities
-        ├─ reports:           hierarchy + report_depth + own-report bypass + privacy + needs_signoff
-        ├─ sms_messages:      data_records without form, filtered by contact hierarchy
-        ├─ unassigned_reports: reports without subject (requires can_view_unallocated JWT claim)
-        ├─ tasks:             user-scoped via auth.user_id() (CouchDB user ID)
-        ├─ targets:           hierarchy-scoped (owner IN accessible_facilities)
-        ├─ global_config:     no filter (_all replication key docs + _design/medic-client)
-        ├─ user_settings_doc: user's own org.couchdb.user:* document
-        └─ user_meta:         user-scoped feedback/telemetry
+  └─ PowerSync Sync Streams (7 streams, consolidated by CTE)
+        ├─ accessible_data:   contacts + SMS + targets (N buckets)
+        │     (shared accessible_facilities CTE, 1 ref per query)
+        ├─ report_data:       subject + own + needs_signoff reports
+        │     (two CTEs: report_facilities M + accessible_facilities + 1)
+        ├─ unassigned_reports: reports without subject (requires can_view_unallocated)
+        ├─ tasks:             user-scoped via auth.user_id() (1 bucket)
+        ├─ global_config:     no filter (_all replication key docs) (1 shared bucket)
+        ├─ user_settings_doc: user's own org.couchdb.user:* document (1 bucket)
+        └─ user_meta:         user-scoped feedback/telemetry (1 bucket)
 ```
 
 ## Sync Streams Detail
 
-### contacts (priority 1, auto_subscribe)
-Contacts filtered by `user_accessible_facilities` pre-computed table.
-Supports all CHT contact types: `contact`, `person`, `clinic`, `health_center`, `district_hospital`.
-Uses `COALESCE(contact_type, type)` for field compatibility.
+### Bucket Optimization Strategy
 
-### reports (priority 2, auto_subscribe)
-Most complex stream. Implements:
-- **Subject resolution** following CHT's `getSubject()` fallback chain:
-  `patient_id → fields.patient_id → place_id → fields.place_id → patient_uuid → fields.patient_uuid → contact._id`
-- **Shortcode matching**: `report_facilities` table contains both UUIDs and shortcodes (patient_id, place_id)
-  so subject matching works for both identifier types
-- **Own-report bypass**: Submitter always sees their own reports regardless of `report_depth`
-  (CHT `authorization.js` line 600)
-- **report_depth** filtering via local CTE `report_facilities` (limits OTHER users' reports by depth)
-- **needs_signoff** support: walks up submitter's ancestor chain (5 levels) to replicate to supervisors
-- **Privacy** filter: `fields.private=true` reports only visible to submitter
+Three optimizations reduce bucket count from the original ~9*N to ~N+M+5:
 
-### sms_messages (priority 3, auto_subscribe)
-Data records WITHOUT a `form` field — SMS/messages. Their replication key in CHT is
-`doc.contact._id` (the sender). Filtered by `contact._id IN accessible_facilities`.
+1. **CTE sharing** (stream consolidation): Queries sharing the same CTE within a
+   stream share bucket instances. Contacts, SMS, targets, and needs_signoff reports
+   are merged into `accessible_data` with a shared `accessible_facilities` CTE.
+
+2. **Pre-expanded children** (setup.sql Step 1.5): `user_accessible_facilities` is
+   expanded to include direct children of all descendant contacts. This eliminates
+   the `OR parent IN accessible_facilities` condition in the contacts query, which
+   was causing a 2× bucket multiplier.
+
+3. **Pre-resolved subjects** (report_subjects table): Each report's subject is
+   resolved to a single UUID at write time. The report_data query JOINs
+   `report_subjects` instead of checking 9 OR arms against the CTE. Shortcodes
+   are no longer stored in `user_report_facilities`. This eliminates the 4×
+   bucket multiplier (2× from shortcodes + 2× from multiple OR arms).
+
+| Stream | Optimization | Buckets |
+|--------|-------------|---------|
+| accessible_data (contacts) | CTE sharing, 1 ref per query | N (shared) |
+| accessible_data (sms) | CTE sharing | ↑ shared |
+| accessible_data (targets) | CTE sharing | ↑ shared |
+| report_data (subject) | Pre-resolved subjects, nested subquery | M |
+| report_data (own) | Direct auth parameter | 1 |
+| report_data (signoff) | accessible_facilities CTE (separate set) | K |
+| tasks | Direct auth parameter | 1 |
+| global_config | No user filter | 1 |
+| user_settings_doc | Direct auth parameter | 1 |
+| user_meta | Direct auth parameter | 1 |
+| **Total** | | **N + M + K + 5** |
+
+N = accessible_facilities (contacts/sms/targets), M = report_facilities (subject reports),
+K = accessible_facilities bucket overhead from needs_signoff (separate from N since
+different stream). For 1,010 facilities: N≈1,010, M≈1,010, K≈TBD (empirical).
+
+### accessible_data (priority 1, auto_subscribe)
+Consolidated stream with 3 queries sharing `accessible_facilities` CTE.
+Each query references the CTE exactly once, ensuring N shared buckets.
+Table aliases determine client-side table names:
+
+1. **contacts** (alias `contacts`): Hierarchy-filtered by `user_accessible_facilities`.
+   Pre-expanded (Step 1.5) so a single `_id IN` check suffices.
+2. **sms_messages** (alias `sms_messages`): Data records WITHOUT a `form` field.
+   Replication key is `doc.contact._id` (the sender).
+3. **targets** (alias `targets`): `target.owner` = contact UUID. Syncs to any user
+   who can see the owner contact. Supervisors see subordinate targets.
+
+needs_signoff was moved to `report_data` because its 5-level ancestor chain walk
+creates multiple `IN accessible_facilities` references that inflated this stream's
+bucket count to 2× when it was here.
+
+### report_data (priority 2, auto_subscribe)
+Three queries, two CTEs (`report_facilities` + `accessible_facilities`):
+
+1. **Subject-matched reports** (alias `reports`): Uses nested subquery through
+   `report_subjects` table for pre-resolved subject UUID. Single
+   `_id IN (SELECT ... WHERE subject_id IN report_facilities)` check.
+2. **User's own reports** (alias `reports`): Submitter always sees their own reports
+   regardless of `report_depth` (CHT `authorization.js` line 600).
+3. **needs_signoff reports** (alias `reports`): Reports with `fields.needs_signoff=true`
+   walk 5 levels of submitter ancestor chain via `accessible_facilities` CTE.
+   Separate bucket set from `report_facilities`.
 
 ### unassigned_reports (priority 3, auto_subscribe)
-Reports without any subject (patient_id, place_id, patient_uuid, contact all null).
-These map to the `_unassigned` replication key in CHT. Only synced when the user's JWT
-includes `can_view_unallocated = 'true'` (requires both app_settings config flag and
-`can_view_unallocated_data_records` permission).
+Reports without any subject (all subject fields null/empty).
+Maps to `_unassigned` replication key. Only synced when JWT includes
+`can_view_unallocated = 'true'`. Uses alias `reports` for same client table.
 
 ### tasks (priority 3, auto_subscribe)
 `task.user` = CouchDB user ID (`org.couchdb.user:<username>`), NOT contact UUID.
-Uses `auth.user_id()` which maps to the JWT `sub` claim.
-
-### targets (priority 3, auto_subscribe)
-`target.owner` = contact UUID of who the target belongs to.
-Syncs to ANY user who can see the owner contact (`owner IN accessible_facilities`).
-Supervisors see subordinate targets.
+Uses `auth.user_id()` which maps to the JWT `sub` claim. 1 bucket per user.
 
 ### global_config (priority 1, auto_subscribe)
 Two queries (multi-query stream):
@@ -93,12 +131,13 @@ Two queries (multi-query stream):
 
 Matches the `_all` replication key in CHT's `docs_by_replication_key` index plus
 the `_design/medic-client` design doc (always allowed per `authorization.js`).
+1 shared global bucket (no user filter).
 
 ### user_settings_doc (priority 1, auto_subscribe)
-User's own `org.couchdb.user:<username>` document (roles, facility, etc.).
+User's own `org.couchdb.user:<username>` document (roles, facility, etc.). 1 bucket.
 
 ### user_meta (priority 3, auto_subscribe)
-Feedback, telemetry, read-status docs filtered by user.
+Feedback, telemetry, read-status docs filtered by user. 1 bucket.
 
 ## Setup
 
@@ -164,6 +203,45 @@ corresponding `couchdb` row. Since all Sync Streams already filter on `_deleted 
 universally-purged documents are automatically excluded without any SQL changes.
 The per-role check prevents a purge by one role from hiding a doc that other roles need.
 
+### Why pre-expand children in user_accessible_facilities?
+The contacts query originally had `_id IN accessible_facilities OR parent IN
+accessible_facilities`. Each arm of the OR creates a separate set of bucket keys,
+doubling the bucket count (2×). By pre-computing direct children in Step 1.5 of
+`refresh_user_facilities()` (before ancestors are added), all contacts are in
+`user_accessible_facilities` and a single `_id IN accessible_facilities` suffices.
+Step 1.5 runs after Step 1 (descendants) but before Step 2 (ancestors) to avoid
+over-including children of ancestor places (e.g., sibling clinics under the parent HC).
+
+### Why pre-resolve report subjects?
+The report_data query originally checked 9 subject fields against `report_facilities`,
+and `user_report_facilities` contained both UUIDs and shortcodes. This created a 4×
+bucket multiplier (2× from shortcodes, 2× from multiple OR arms). The `report_subjects`
+table pre-resolves each report to a single subject UUID following CHT's `getSubject()`
+priority chain. This reduces the query to a single INNER JOIN + `IN report_facilities`,
+and removes shortcodes from `user_report_facilities`. An auto-trigger on `v1.couchdb`
+keeps `report_subjects` current as reports are inserted/updated.
+
+### Why consolidate streams by CTE?
+PowerSync creates N buckets per unique CTE parameter value per stream. Before
+consolidation, `contacts`, `sms_messages`, `targets`, and `reports` (needs_signoff)
+each had their own stream with the same `accessible_facilities` CTE, creating 4*N
+buckets total. By merging them into `accessible_data` with `queries:[]`, all 4 queries
+share bucket instances: N buckets total instead of 4*N. Empirically confirmed — see
+`context/POWERSYNC_BUCKET_ARCHITECTURE_TRADEOFFS.md` section 1.1.
+
+The tradeoff: all queries in `accessible_data` share priority 1 (contacts' priority).
+SMS and targets previously had priority 3 but now sync in the first batch. This is
+acceptable because the total data volume is unchanged and contacts need to sync first.
+
+### Why simplified privacy check in report_data?
+The `report_data` stream uses a simplified privacy filter: `private != true OR submitter =
+contact_id`. The full CHT `isSensitive()` also checks if the submitter is in
+`accessible_facilities`. Adding `accessible_facilities` as a second CTE to `report_data`
+would add N additional buckets, negating the consolidation savings. The simplified check
+is correct for >95% of cases. The `accessible_data` stream's needs_signoff query
+handles the remaining case where supervisors need to see private needs_signoff reports
+from subordinates.
+
 ### Why `CAST(c.doc AS TEXT)` for the full document?
 PowerSync syncs data to client-side SQLite. Passing the full JSONB document as TEXT
 allows the CHT webapp to parse it locally and access any field not explicitly extracted
@@ -187,14 +265,12 @@ as a column. This preserves backward compatibility with code expecting the full 
 4. **Outgoing (kujua) messages**: SMS stream handles `contact._id` but outgoing messages
    use `doc.tasks[0].messages[0].contact._id` — deeply nested path not in PoC scope.
 
-5. **Report bucket explosion**: The reports stream has multiple OR branches for subject
-   matching (patient_id, fields.patient_id, place_id, etc.) plus needs_signoff ancestor
-   chain checks. Each OR branch with `IN report_facilities` creates N buckets (one per
-   facility). With 9 subject OR branches and N facilities, this creates up to 9*N buckets
-   per user. PowerSync's default limit is 1,000 buckets per user, which could be reached
-   with ~110 facilities. Mitigation: pre-compute a `report_subjects` table mapping
-   (doc_id, subject_id) so the reports stream only needs a single `subject_id IN
-   report_facilities` check, collapsing 9 OR branches to 1. See "Scalability Notes" below.
+5. **Report subject resolution**: The `report_subjects` table pre-resolves each
+   report's subject to a UUID. If the subject contact is deleted or the shortcode
+   can't be resolved, the report has no entry in `report_subjects` and won't match
+   the subject query. It may still sync via the own-report query (if the user is
+   the submitter) or the needs_signoff query (if applicable). Unresolvable reports
+   without any matching query path would need the `unassigned_reports` stream.
 
 6. **IS NULL silently drops streams**: PowerSync's Sync Streams SQL compiler silently drops
    any stream that uses `IS NULL` on JSONB-extracted values (e.g. `doc ->> 'form' IS NULL`).
@@ -221,45 +297,42 @@ Implemented in `refresh_user_facilities()` via 5 steps:
 Primary contacts inherit the depth of their parent place (for `report_depth` filtering),
 matching CHT's `addPrimaryContactsSubjects()` behavior in `authorization.js`.
 
-### Shortcode separation (UUIDs vs shortcodes)
-Shortcodes (`patient_id`, `place_id` human-readable identifiers like "13602") are critical
-for report subject matching because CHT reports reference subjects by shortcode. However,
-shortcodes must ONLY live in `user_report_facilities`, NOT in `user_accessible_facilities`.
+### Shortcode handling
+Shortcodes (`patient_id`, `place_id` — human-readable identifiers like "13602") are how
+CHT reports reference subjects. Previously, shortcodes were stored in `user_report_facilities`
+alongside UUIDs, doubling the CTE size and creating a 2× bucket multiplier.
 
-`user_accessible_facilities` is used by the contacts, targets, and sms_messages Sync Streams,
-all of which match by document `_id` (always a UUID). If shortcodes were in this table, each
-shortcode would create an empty PowerSync bucket per stream, wasting bandwidth and counting
-against the 1,000 bucket limit per user.
-
-`user_report_facilities` contains BOTH UUIDs and shortcodes, allowing the reports stream to
-match subjects by either identifier type with a single `IN` clause.
+Now, shortcodes are resolved to UUIDs at write time by the `report_subjects` table and
+`resolve_report_subject()` function. `user_report_facilities` contains only UUIDs.
+`user_accessible_facilities` also contains only UUIDs (contacts, targets, and sms_messages
+all match by document `_id`). Shortcode→UUID resolution is indexed via `idx_couchdb_patient_id`
+and `idx_couchdb_place_id`.
 
 ## Scalability Notes
 
 ### Bucket count at scale
-PowerSync creates one bucket per unique `(stream, parameter_value)` combination. The
-default limit is 1,000 buckets per user. At eCHIS scale:
+After optimizations (CTE sharing + pre-expanded children + pre-resolved subjects +
+needs_signoff isolation), bucket count is N + M + K + 5. With
+`max_parameter_query_results: 10000` and `max_buckets_per_connection: 10000`:
 
-| User role | ~Facilities | Contacts buckets | Reports buckets (est.) | Total (est.) |
-|-----------|-------------|-----------------|----------------------|-------------|
-| CHW | 10-30 | 10-30 | ~270 (9 OR branches) | ~310 |
-| Supervisor | 50-200 | 50-200 | ~1,400+ | **risk** |
-| County admin | 1,000+ | 1,000+ | **over limit** | **over limit** |
+| User role | Accessible (N) | Report (M) | Signoff (K) | Fixed | Total |
+|-----------|---------------|------------|-------------|-------|-------|
+| CHW | 35 | 30 | ~35 | 5 | ~105 |
+| Supervisor | 250 | 200 | ~250 | 5 | ~705 |
+| County admin | 1,010 | 1,010 | ~1,010 | 5 | ~3,035 |
 
-The reports stream is the primary concern due to its 9 subject-matching OR branches
-(patient_id, fields.patient_id, place_id, fields.place_id, patient_uuid,
-fields.patient_uuid, place_uuid, fields.place_uuid, contact._id).
-Each branch creates one bucket per `report_facilities` entry. Mitigation strategies:
+N = accessible_facilities in accessible_data (contacts/sms/targets).
+M = report_facilities in report_data (subject-matched reports, UUIDs only).
+K = accessible_facilities bucket set in report_data (needs_signoff). Empirical
+value TBD — may be less than N if the 5 OR arms partially share bucket keys.
 
-1. **Pre-computed report_subjects table** (recommended): Map each report to its resolved
-   subject_id in PostgreSQL, then the Sync Stream only needs `subject_id IN report_facilities`
-   (1 OR branch instead of 9). Reduces report buckets by ~9x.
-
-2. **Increase PowerSync bucket limit**: Configurable per-instance, but higher limits
-   increase memory and bandwidth usage.
-
-3. **Scope supervisor/admin access**: In practice, county admins may not need offline
-   access to ALL reports — they could use online-only dashboards for aggregate data.
+**Remaining concerns:**
+- The `max_buckets_per_connection: 10000` config key was discovered empirically.
+  Its exact default and documentation status are uncertain.
+- The nested subquery pattern `_id IN (SELECT ... WHERE ... IN <cte>)` needs
+  empirical validation. If PowerSync doesn't support it, fall back to INNER JOIN.
+- Users with >5,000 accessible facilities would exceed parameter limits.
+  At that scale, county-scoped PowerSync instances may be needed.
 
 ## Live Test Results
 
