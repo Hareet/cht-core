@@ -21,14 +21,19 @@
 #   can_view_unallocated:   "true" if user may see reports without a subject
 #
 # BUCKET CONSOLIDATION STRATEGY:
-# Streams are grouped by shared CTE to minimize bucket count. All queries
-# within a stream sharing the same CTE share bucket instances (confirmed
-# empirically — see context/POWERSYNC_BUCKET_ARCHITECTURE_TRADEOFFS.md).
+# All data queries share one accessible_facilities CTE in a single stream
+# (all_data), minimizing bucket count via CTE sharing. Person contacts and
+# SMS match via JOIN to contact_parent_place. Reports match via
+# resolved_subject_place_id. accessible_facilities contains ONLY place IDs
+# (not person IDs), reducing CTE entries from O(persons) to O(places).
 #
-# Before consolidation: 4*N + M + 4 buckets (separate streams per doc type)
-# After consolidation:  N + M + 5 buckets (CTE-grouped streams)
+# Optimization history:
+#   9,071 → 6,040  (CTE sharing across streams)
+#   6,040 → 4,686  (needs_signoff pre-computation)
+#   4,686 → 2,665  (stream merge + resolved_subject_id denormalization)
+#   2,665 → ~60    (person-bucket elimination via place-level matching)
 #
-# For a user with 1,010 facilities: ~2,500 buckets (down from ~5,050).
+# For a CHW with 50 clinics: ~60 buckets (down from ~16,115 at prod scale).
 #
 # Table aliases in FROM clauses determine client-side table names
 # (PowerSync edition 3 row_type). Different queries in one stream
@@ -49,21 +54,27 @@ config:
 
 streams:
   # ================================================================
-  # ACCESSIBLE DATA — contacts, SMS, targets
+  # ALL DATA — contacts, SMS, targets, reports (unified stream)
   # ================================================================
-  # Consolidated stream for queries filtered by accessible_facilities.
-  # Each query references the CTE exactly once, so all 3 share bucket
-  # instances: N buckets total.
+  # All queries share one accessible_facilities CTE → N shared buckets.
+  # accessible_facilities now contains ONLY place IDs (~52 for a typical
+  # CHW), not person IDs (~8,055). Person contacts and SMS match via
+  # INNER JOIN contact_parent_place. Reports match via resolved_subject_place_id
+  # (the place containing the report's subject: parent for persons, self for places).
   #
-  # needs_signoff was moved to report_data because its 5-level ancestor
-  # chain walk has 5 IN accessible_facilities references, creating extra
-  # bucket keys that inflated this stream's count to 2×N.
+  # Trade-off: reports use accessible_facilities (replication_depth) instead
+  # of report_facilities (report_depth). Users with report_depth < depth may
+  # over-sync reports; client-side SQLite can filter. For report_depth=-1
+  # (most common), no change.
   #
   # Table aliases determine client-side table names (edition 3 row_type):
   #   contacts     → client "contacts" table
   #   sms_messages → client "sms_messages" table
   #   targets      → client "targets" table
-  accessible_data:
+  #   reports      → client "reports" table
+  #
+  # Buckets: N (shared CTE) + 1 (own) + 1 (needs_signoff) = N + 2
+  all_data:
     auto_subscribe: true
     priority: 1
     with:
@@ -72,11 +83,10 @@ streams:
         FROM "v1"."user_accessible_facilities"
         WHERE user_id = auth.user_id()
     queries:
-      # -- Contacts --
-      # Hierarchical filtering by facility + replication depth.
-      # user_accessible_facilities is pre-expanded (Step 1.5 in setup.sql)
-      # to include direct children of all descendant contacts, so a single
-      # _id IN check is sufficient — no OR on parent needed.
+      # -- Place contacts (matched by _id in CTE) --
+      # Matches clinics, HCs, districts, and any contacts whose _id is
+      # directly in accessible_facilities (including primary contacts
+      # and the user's own contact from Steps 3-4).
       - |
         SELECT
           contacts._id AS id,
@@ -94,11 +104,35 @@ streams:
         WHERE contacts._deleted != true
           AND contacts.doc ->> 'type' IN '["contact", "person", "clinic", "health_center", "district_hospital"]'
           AND contacts._id IN accessible_facilities
-      # -- SMS Messages --
+      # -- Person contacts (children of accessible places, via lookup) --
+      # Matches persons whose parent place is in accessible_facilities.
+      # Uses contact_parent_place (persons only) so sibling places under
+      # ancestor facilities are NOT over-synced. This replaces the
+      # removed Step 1.5 person expansion in refresh_user_facilities().
+      - |
+        SELECT
+          contacts._id AS id,
+          contacts.doc ->> 'name' AS name,
+          ifnull(contacts.doc ->> 'contact_type', contacts.doc ->> 'type') AS contact_type,
+          ifnull(contacts.doc -> 'parent' ->> '_id', contacts.doc ->> 'parent') AS parent_id,
+          contacts.doc ->> 'patient_id' AS patient_id,
+          contacts.doc ->> 'place_id' AS place_id,
+          contacts.doc ->> 'phone' AS phone,
+          contacts.doc ->> 'date_of_birth' AS date_of_birth,
+          contacts.doc ->> 'sex' AS sex,
+          contacts.doc ->> 'reported_date' AS reported_date,
+          CAST(contacts.doc AS TEXT) AS doc
+        FROM "v1"."couchdb" contacts
+        INNER JOIN "v1"."contact_parent_place" cpp ON cpp.contact_id = contacts._id
+        WHERE contacts._deleted != true
+          AND contacts.doc ->> 'type' IN '["contact", "person", "clinic", "health_center", "district_hospital"]'
+          AND cpp.place_id IN accessible_facilities
+      # -- SMS Messages (via contact's parent place lookup) --
       # data_records without a form field are SMS/messages.
-      # Replication key is doc.contact._id (the sender).
-      # NOTE: Uses ifnull() instead of IS NULL because PowerSync silently
-      # drops streams that use IS NULL on JSONB-extracted values.
+      # The contact._id on an SMS points to a person. Since persons are
+      # no longer in accessible_facilities, we JOIN contact_parent_place
+      # to match via the person's parent place (clinic). The JOIN is
+      # 1-to-1 (each SMS has one contact), so no bucket overhead.
       - |
         SELECT
           sms_messages._id AS id,
@@ -107,10 +141,12 @@ streams:
           sms_messages.doc ->> 'kujua_message' AS is_outgoing,
           CAST(sms_messages.doc AS TEXT) AS doc
         FROM "v1"."couchdb" sms_messages
+        INNER JOIN "v1"."contact_parent_place" cpp
+          ON cpp.contact_id = sms_messages.doc -> 'contact' ->> '_id'
         WHERE sms_messages._deleted != true
           AND sms_messages.doc ->> 'type' = 'data_record'
           AND ifnull(sms_messages.doc ->> 'form', '') = ''
-          AND sms_messages.doc -> 'contact' ->> '_id' IN accessible_facilities
+          AND cpp.place_id IN accessible_facilities
       # -- Targets --
       # target.owner = contact UUID. Syncs to any user who can see
       # the owner contact (supervisors see subordinate targets).
@@ -125,36 +161,12 @@ streams:
         WHERE targets._deleted != true
           AND targets.doc ->> 'type' = 'target'
           AND targets.doc ->> 'owner' IN accessible_facilities
-
-  # ================================================================
-  # REPORT DATA — subject-matched + own + needs_signoff reports
-  # ================================================================
-  # Three query groups, one CTE:
-  #   report_facilities  → subject-matched reports (M buckets)
-  #   auth.parameter     → own reports (1 bucket)
-  #   auth.user_id()     → needs_signoff via pre-computed visibility (1 bucket)
-  #
-  # Subject matching uses the pre-resolved report_subjects table (setup.sql
-  # section 7). Each report maps to a single subject UUID.
-  # report_facilities contains UUIDs only (no shortcodes).
-  #
-  # needs_signoff uses pre-computed report_needs_signoff_visible table
-  # (setup.sql section 8) instead of the 5-level ancestor chain walk.
-  # The JOIN filter is auth.user_id() → 1 bucket (not 5× from OR arms).
-  #
-  # Buckets: M (report_facilities) + 1 (own) + 1 (needs_signoff) = M + 2
-  report_data:
-    auto_subscribe: true
-    priority: 2
-    with:
-      report_facilities: |
-        SELECT facility_id
-        FROM "v1"."user_report_facilities"
-        WHERE user_id = auth.user_id()
-    queries:
-      # Query 1: Reports whose pre-resolved subject matches report_facilities.
-      # INNER JOIN report_subjects maps each report to its resolved subject UUID.
-      # Nested subquery was tested but created MORE bucket keys (3,672 vs 1,651).
+      # -- Subject-matched reports (via subject's containing place) --
+      # Uses resolved_subject_place_id: for person subjects this is the
+      # parent clinic, for place subjects this is the place itself.
+      # Matches against accessible_facilities which now contains only
+      # places (~52 entries), not person IDs (~8,055).
+      # Maintained by BEFORE trigger in setup.sql.
       - |
         SELECT
           reports._id AS id,
@@ -167,18 +179,17 @@ streams:
           CAST(reports.doc -> 'fields' AS TEXT) AS fields,
           CAST(reports.doc AS TEXT) AS doc
         FROM "v1"."couchdb" reports
-        INNER JOIN "v1"."report_subjects" rs
-          ON rs.report_id = reports._id
         WHERE reports._deleted != true
           AND reports.doc ->> 'type' = 'data_record'
           AND reports.doc ->> 'form' IS NOT NULL
-          AND rs.subject_id IN report_facilities
+          AND reports.resolved_subject_place_id IN accessible_facilities
           AND (
             ifnull(reports.doc -> 'fields' ->> 'private', 'false') != 'true'
             OR reports.doc -> 'contact' ->> '_id' = auth.parameter('contact_id')
           )
-      # Query 2: User's own reports (submitter = user's contact_id)
+      # -- User's own reports --
       # Own reports always sync regardless of report_depth or privacy.
+      # Submitter = user's contact_id → 1 bucket.
       - |
         SELECT
           reports._id AS id,
@@ -195,7 +206,7 @@ streams:
           AND reports.doc ->> 'type' = 'data_record'
           AND reports.doc ->> 'form' IS NOT NULL
           AND reports.doc -> 'contact' ->> '_id' = auth.parameter('contact_id')
-      # Query 3: needs_signoff reports via pre-computed visibility.
+      # -- Needs-signoff via pre-computed visibility (1 bucket) --
       # report_needs_signoff_visible maps (report_id, visible_to_user)
       # pre-computed by walking submitter ancestor chains in PostgreSQL.
       # The JOIN filter visible_to_user = auth.user_id() → 1 bucket.
@@ -235,7 +246,7 @@ streams:
   # All REPORT_SUBJECT_PROPERTIES + contact._id must be empty.
   #
   # Alias is "reports" so rows go to the same client table as
-  # report_data and accessible_data report queries.
+  # the all_data stream's report queries.
   unassigned_reports:
     auto_subscribe: true
     priority: 3
