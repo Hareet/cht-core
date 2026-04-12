@@ -27,8 +27,8 @@ api:
   # Each facility_id in user_accessible_facilities becomes a bucket.
   # See context/POWERSYNC_BUCKET_ARCHITECTURE_TRADEOFFS.md for analysis.
   parameters:
-    max_parameter_query_results: 10000
-    max_buckets_per_connection: 10000
+    max_parameter_query_results: 20000
+    max_buckets_per_connection: 20000
 
 # Sync config inlined to avoid file path issues across container mounts.
 # Streams consolidated by CTE to minimize bucket count (CTE sharing).
@@ -48,6 +48,9 @@ sync_config:
       # of report_facilities (report_depth). Users with report_depth < depth
       # may over-sync reports; client-side SQLite can filter. For report_depth=-1
       # (most common), no change.
+      # With Step 1.5 removed, accessible_facilities contains only places
+      # (~52 entries, not ~8,055). Person contacts and SMS match via JOIN
+      # to contact_parent_place. Reports match via resolved_subject_place_id.
       # Buckets: N (shared CTE) + 1 (own) + 1 (needs_signoff) = N + 2
       all_data:
         auto_subscribe: true
@@ -58,7 +61,10 @@ sync_config:
             FROM "v1"."user_accessible_facilities"
             WHERE user_id = auth.user_id()
         queries:
-          # -- Contacts (pre-expanded: no parent OR needed) --
+          # -- Place contacts (matched by _id in CTE) --
+          # Matches clinics, HCs, districts, and any contacts whose _id is
+          # directly in accessible_facilities (including primary contacts
+          # and the user's own contact from Steps 3-4).
           - |
             SELECT
               contacts._id AS id,
@@ -76,19 +82,37 @@ sync_config:
             WHERE contacts._deleted != true
               AND contacts.doc ->> 'type' IN '["contact", "person", "clinic", "health_center", "district_hospital"]'
               AND contacts._id IN accessible_facilities
-          # -- SMS Messages --
+          # -- Person contacts (children of accessible places, direct match) --
+          # Matches persons whose parent_id is in accessible_facilities.
+          # Uses the generated parent_id column directly — NO JOIN, so
+          # bucket count = CTE size (~53), not JOIN cardinality (~8,000).
           - |
             SELECT
-              sms_messages._id AS id,
-              sms_messages.doc -> 'contact' ->> '_id' AS contact_id,
-              sms_messages.doc ->> 'reported_date' AS reported_date,
-              sms_messages.doc ->> 'kujua_message' AS is_outgoing,
-              CAST(sms_messages.doc AS TEXT) AS doc
-            FROM "v1"."couchdb" sms_messages
-            WHERE sms_messages._deleted != true
-              AND sms_messages.doc ->> 'type' = 'data_record'
-              AND ifnull(sms_messages.doc ->> 'form', '') = ''
-              AND sms_messages.doc -> 'contact' ->> '_id' IN accessible_facilities
+              contacts._id AS id,
+              contacts.doc ->> 'name' AS name,
+              ifnull(contacts.doc ->> 'contact_type', contacts.doc ->> 'type') AS contact_type,
+              ifnull(contacts.doc -> 'parent' ->> '_id', contacts.doc ->> 'parent') AS parent_id,
+              contacts.doc ->> 'patient_id' AS patient_id,
+              contacts.doc ->> 'place_id' AS place_id,
+              contacts.doc ->> 'phone' AS phone,
+              contacts.doc ->> 'date_of_birth' AS date_of_birth,
+              contacts.doc ->> 'sex' AS sex,
+              contacts.doc ->> 'reported_date' AS reported_date,
+              CAST(contacts.doc AS TEXT) AS doc
+            FROM "v1"."couchdb" contacts
+            WHERE contacts._deleted != true
+              AND contacts.doc ->> 'type' IN '["contact", "person"]'
+              AND contacts.parent_id IN accessible_facilities
+          # -- SMS Messages --
+          # TODO: SMS contact._id points to a person. Need a stored
+          # contact_parent_id column on couchdb (cross-row lookup at insert
+          # time via trigger). Subqueries not supported in this position.
+          # Disabled for now — zero SMS in test data. Re-enable after
+          # adding the denormalized column.
+          # - |
+          #   SELECT sms_messages._id AS id, ...
+          #   FROM "v1"."couchdb" sms_messages
+          #   WHERE ... AND sms_messages.contact_parent_id IN accessible_facilities
           # -- Targets --
           - |
             SELECT
@@ -101,9 +125,11 @@ sync_config:
             WHERE targets._deleted != true
               AND targets.doc ->> 'type' = 'target'
               AND targets.doc ->> 'owner' IN accessible_facilities
-          # -- Subject-matched reports (denormalized, no JOIN) --
-          # Uses resolved_subject_id on couchdb row directly, eliminating
-          # the INNER JOIN report_subjects that added ~640 extra bucket keys.
+          # -- Subject-matched reports (via subject's containing place) --
+          # Uses resolved_subject_place_id: for person subjects this is the
+          # parent clinic, for place subjects this is the place itself.
+          # Matches against accessible_facilities which now contains only
+          # places (~52 entries), not person IDs (~8,055).
           - |
             SELECT
               reports._id AS id,
@@ -119,7 +145,7 @@ sync_config:
             WHERE reports._deleted != true
               AND reports.doc ->> 'type' = 'data_record'
               AND reports.doc ->> 'form' IS NOT NULL
-              AND reports.resolved_subject_id IN accessible_facilities
+              AND reports.resolved_subject_place_id IN accessible_facilities
               AND (
                 ifnull(reports.doc -> 'fields' ->> 'private', 'false') != 'true'
                 OR reports.doc -> 'contact' ->> '_id' = auth.parameter('contact_id')
