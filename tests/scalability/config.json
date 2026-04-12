@@ -1,5 +1,6 @@
 {
   "url": "http://localhost:5988",
+  "couch_url_note": "Set COUCH_URL env var, e.g. http://admin:pass@couchdb:5984/medic",
   "powersync_url": "http://localhost:8080",
   "powersync_key_path": "../../.devcontainer/powersync-config/dev-private-key.pem",
   "users": [

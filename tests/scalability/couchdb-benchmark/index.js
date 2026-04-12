@@ -6,6 +6,8 @@ const testBulkGet = require('./bulk_get');
 
 const testView = require('./view');
 const testNouveauIndex = require('./nouveau_index');
+const testRoundTrip = require('./round-trip');
+const testRoundTripApi = require('./round-trip-api');
 
 (async () => {
   await cleanFile();
@@ -20,4 +22,7 @@ const testNouveauIndex = require('./nouveau_index');
 
   await printResults('view', await testView());
   await printResults('nouveau_index', await testNouveauIndex());
+
+  await printResults('round_trip_changes', await testRoundTrip());
+  await printResults('round_trip_api', await testRoundTripApi());
 })();
