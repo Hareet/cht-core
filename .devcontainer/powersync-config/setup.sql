@@ -443,6 +443,7 @@ $$;
 
 -- Batch-refresh all report subjects. Call after data loads or
 -- when contacts change (shortcode→UUID mapping may change).
+-- Also syncs resolved_subject_id on the couchdb rows to match.
 CREATE OR REPLACE FUNCTION v1.refresh_report_subjects()
 RETURNS void
 LANGUAGE plpgsql AS $$
@@ -460,6 +461,29 @@ BEGIN
       AND NOT COALESCE(r._deleted, false)
   ) resolved
   WHERE subject_id IS NOT NULL;
+
+  -- Sync resolved_subject_id on couchdb rows to match report_subjects.
+  -- This keeps the denormalized column consistent after batch re-resolves
+  -- (e.g., when a contact's shortcode changes and the UUID mapping shifts).
+  -- Uses a direct UPDATE (not the BEFORE trigger path) since we already
+  -- have the resolved values in report_subjects.
+  UPDATE v1.couchdb c
+  SET resolved_subject_id = rs.subject_id
+  FROM v1.report_subjects rs
+  WHERE rs.report_id = c._id
+    AND c.resolved_subject_id IS DISTINCT FROM rs.subject_id;
+
+  -- Clear resolved_subject_id for reports that no longer resolve
+  -- (removed from report_subjects because subject_id became NULL).
+  UPDATE v1.couchdb c
+  SET resolved_subject_id = NULL
+  WHERE c.doc ->> 'type' = 'data_record'
+    AND c.doc ->> 'form' IS NOT NULL
+    AND NOT COALESCE(c._deleted, false)
+    AND c.resolved_subject_id IS NOT NULL
+    AND NOT EXISTS (
+      SELECT 1 FROM v1.report_subjects rs WHERE rs.report_id = c._id
+    );
 END;
 $$;
 
