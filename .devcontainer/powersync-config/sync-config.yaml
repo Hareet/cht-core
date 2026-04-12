@@ -21,14 +21,15 @@
 #   can_view_unallocated:   "true" if user may see reports without a subject
 #
 # BUCKET CONSOLIDATION STRATEGY:
-# Streams are grouped by shared CTE to minimize bucket count. All queries
-# within a stream sharing the same CTE share bucket instances (confirmed
-# empirically — see context/POWERSYNC_BUCKET_ARCHITECTURE_TRADEOFFS.md).
+# All data queries share one accessible_facilities CTE in a single stream
+# (all_data), minimizing bucket count via CTE sharing. Denormalized
+# resolved_subject_id eliminates JOIN overhead from report_subjects.
+# See context/POWERSYNC_BUCKET_ARCHITECTURE_TRADEOFFS.md for analysis.
 #
-# Before consolidation: 4*N + M + 4 buckets (separate streams per doc type)
-# After consolidation:  N + M + 5 buckets (CTE-grouped streams)
+# Before: 2 streams (accessible_data + report_data) = N + M + 5 buckets
+# After:  1 stream (all_data) + no JOIN = N + 2 + 5 = N + 7 buckets
 #
-# For a user with 1,010 facilities: ~2,500 buckets (down from ~5,050).
+# For a user with 1,010 facilities: ~1,017 buckets (down from ~2,665).
 #
 # Table aliases in FROM clauses determine client-side table names
 # (PowerSync edition 3 row_type). Different queries in one stream
@@ -49,21 +50,28 @@ config:
 
 streams:
   # ================================================================
-  # ACCESSIBLE DATA — contacts, SMS, targets
+  # ALL DATA — contacts, SMS, targets, reports (unified stream)
   # ================================================================
-  # Consolidated stream for queries filtered by accessible_facilities.
-  # Each query references the CTE exactly once, so all 3 share bucket
-  # instances: N buckets total.
+  # All 6 queries share one accessible_facilities CTE → N shared buckets.
+  # Merging the former accessible_data + report_data streams eliminates
+  # duplicate bucket namespaces. Denormalized resolved_subject_id on the
+  # couchdb row eliminates the INNER JOIN report_subjects, removing ~640
+  # extra bucket keys from the JOIN dimension.
   #
-  # needs_signoff was moved to report_data because its 5-level ancestor
-  # chain walk has 5 IN accessible_facilities references, creating extra
-  # bucket keys that inflated this stream's count to 2×N.
+  # Trade-off: reports now use accessible_facilities (replication_depth)
+  # instead of report_facilities (report_depth). Users with report_depth
+  # < replication_depth may see reports from contacts beyond their report
+  # depth — a minor over-sync that client-side SQLite can filter. For
+  # report_depth=-1 (unlimited, the most common case), no behavioral change.
   #
   # Table aliases determine client-side table names (edition 3 row_type):
   #   contacts     → client "contacts" table
   #   sms_messages → client "sms_messages" table
   #   targets      → client "targets" table
-  accessible_data:
+  #   reports      → client "reports" table
+  #
+  # Buckets: N (shared CTE) + 1 (own) + 1 (needs_signoff) = N + 2
+  all_data:
     auto_subscribe: true
     priority: 1
     with:
@@ -125,36 +133,11 @@ streams:
         WHERE targets._deleted != true
           AND targets.doc ->> 'type' = 'target'
           AND targets.doc ->> 'owner' IN accessible_facilities
-
-  # ================================================================
-  # REPORT DATA — subject-matched + own + needs_signoff reports
-  # ================================================================
-  # Three query groups, one CTE:
-  #   report_facilities  → subject-matched reports (M buckets)
-  #   auth.parameter     → own reports (1 bucket)
-  #   auth.user_id()     → needs_signoff via pre-computed visibility (1 bucket)
-  #
-  # Subject matching uses the pre-resolved report_subjects table (setup.sql
-  # section 7). Each report maps to a single subject UUID.
-  # report_facilities contains UUIDs only (no shortcodes).
-  #
-  # needs_signoff uses pre-computed report_needs_signoff_visible table
-  # (setup.sql section 8) instead of the 5-level ancestor chain walk.
-  # The JOIN filter is auth.user_id() → 1 bucket (not 5× from OR arms).
-  #
-  # Buckets: M (report_facilities) + 1 (own) + 1 (needs_signoff) = M + 2
-  report_data:
-    auto_subscribe: true
-    priority: 2
-    with:
-      report_facilities: |
-        SELECT facility_id
-        FROM "v1"."user_report_facilities"
-        WHERE user_id = auth.user_id()
-    queries:
-      # Query 1: Reports whose pre-resolved subject matches report_facilities.
-      # INNER JOIN report_subjects maps each report to its resolved subject UUID.
-      # Nested subquery was tested but created MORE bucket keys (3,672 vs 1,651).
+      # -- Subject-matched reports (denormalized, no JOIN) --
+      # Uses resolved_subject_id column on couchdb row directly,
+      # eliminating the INNER JOIN report_subjects that added ~640
+      # extra bucket keys from the JOIN dimension.
+      # Subject resolution is maintained by BEFORE trigger in setup.sql.
       - |
         SELECT
           reports._id AS id,
@@ -167,18 +150,17 @@ streams:
           CAST(reports.doc -> 'fields' AS TEXT) AS fields,
           CAST(reports.doc AS TEXT) AS doc
         FROM "v1"."couchdb" reports
-        INNER JOIN "v1"."report_subjects" rs
-          ON rs.report_id = reports._id
         WHERE reports._deleted != true
           AND reports.doc ->> 'type' = 'data_record'
           AND reports.doc ->> 'form' IS NOT NULL
-          AND rs.subject_id IN report_facilities
+          AND reports.resolved_subject_id IN accessible_facilities
           AND (
             ifnull(reports.doc -> 'fields' ->> 'private', 'false') != 'true'
             OR reports.doc -> 'contact' ->> '_id' = auth.parameter('contact_id')
           )
-      # Query 2: User's own reports (submitter = user's contact_id)
+      # -- User's own reports --
       # Own reports always sync regardless of report_depth or privacy.
+      # Submitter = user's contact_id → 1 bucket.
       - |
         SELECT
           reports._id AS id,
@@ -195,7 +177,7 @@ streams:
           AND reports.doc ->> 'type' = 'data_record'
           AND reports.doc ->> 'form' IS NOT NULL
           AND reports.doc -> 'contact' ->> '_id' = auth.parameter('contact_id')
-      # Query 3: needs_signoff reports via pre-computed visibility.
+      # -- Needs-signoff via pre-computed visibility (1 bucket) --
       # report_needs_signoff_visible maps (report_id, visible_to_user)
       # pre-computed by walking submitter ancestor chains in PostgreSQL.
       # The JOIN filter visible_to_user = auth.user_id() → 1 bucket.
@@ -235,7 +217,7 @@ streams:
   # All REPORT_SUBJECT_PROPERTIES + contact._id must be empty.
   #
   # Alias is "reports" so rows go to the same client table as
-  # report_data and accessible_data report queries.
+  # the all_data stream's report queries.
   unassigned_reports:
     auto_subscribe: true
     priority: 3

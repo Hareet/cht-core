@@ -8,10 +8,11 @@ replication:
       uri: !env PS_DATABASE_URI
       sslmode: disable  # Local Docker network only
 
-# Bucket storage: use the same PostgreSQL instance (separate schema)
+# Bucket storage: separate database on same PostgreSQL server
+# Isolates bucket I/O from source WAL replication
 storage:
   type: postgresql
-  uri: !env PS_DATABASE_URI
+  uri: !env PS_STORAGE_URI
   sslmode: disable
 
 # API port
@@ -39,9 +40,16 @@ sync_config:
       edition: 3
 
     streams:
-      # Consolidated: contacts + SMS + targets
-      # All share accessible_facilities CTE, each with 1 CTE ref → N buckets
-      accessible_data:
+      # Unified stream: contacts + SMS + targets + reports
+      # All 6 queries share one accessible_facilities CTE → N shared buckets.
+      # Merging accessible_data + report_data eliminates duplicate bucket
+      # namespaces. Denormalized resolved_subject_id eliminates JOIN overhead.
+      # Trade-off: reports use accessible_facilities (replication_depth) instead
+      # of report_facilities (report_depth). Users with report_depth < depth
+      # may over-sync reports; client-side SQLite can filter. For report_depth=-1
+      # (most common), no change.
+      # Buckets: N (shared CTE) + 1 (own) + 1 (needs_signoff) = N + 2
+      all_data:
         auto_subscribe: true
         priority: 1
         with:
@@ -93,20 +101,9 @@ sync_config:
             WHERE targets._deleted != true
               AND targets.doc ->> 'type' = 'target'
               AND targets.doc ->> 'owner' IN accessible_facilities
-
-      # Subject-matched + own + needs_signoff reports
-      # One CTE (report_facilities) + auth filters for own/signoff
-      # Buckets: M (subject) + 1 (own) + 1 (needs_signoff) = M + 2
-      report_data:
-        auto_subscribe: true
-        priority: 2
-        with:
-          report_facilities: |
-            SELECT facility_id
-            FROM "v1"."user_report_facilities"
-            WHERE user_id = auth.user_id()
-        queries:
-          # Query 1: Reports by pre-resolved subject (INNER JOIN)
+          # -- Subject-matched reports (denormalized, no JOIN) --
+          # Uses resolved_subject_id on couchdb row directly, eliminating
+          # the INNER JOIN report_subjects that added ~640 extra bucket keys.
           - |
             SELECT
               reports._id AS id,
@@ -119,17 +116,15 @@ sync_config:
               CAST(reports.doc -> 'fields' AS TEXT) AS fields,
               CAST(reports.doc AS TEXT) AS doc
             FROM "v1"."couchdb" reports
-            INNER JOIN "v1"."report_subjects" rs
-              ON rs.report_id = reports._id
             WHERE reports._deleted != true
               AND reports.doc ->> 'type' = 'data_record'
               AND reports.doc ->> 'form' IS NOT NULL
-              AND rs.subject_id IN report_facilities
+              AND reports.resolved_subject_id IN accessible_facilities
               AND (
                 ifnull(reports.doc -> 'fields' ->> 'private', 'false') != 'true'
                 OR reports.doc -> 'contact' ->> '_id' = auth.parameter('contact_id')
               )
-          # Query 2: User's own reports
+          # -- User's own reports --
           - |
             SELECT
               reports._id AS id,
@@ -146,7 +141,7 @@ sync_config:
               AND reports.doc ->> 'type' = 'data_record'
               AND reports.doc ->> 'form' IS NOT NULL
               AND reports.doc -> 'contact' ->> '_id' = auth.parameter('contact_id')
-          # Query 3: needs_signoff via pre-computed visibility (1 bucket)
+          # -- Needs-signoff via pre-computed visibility (1 bucket) --
           - |
             SELECT
               reports._id AS id,

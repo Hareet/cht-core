@@ -65,9 +65,9 @@ CREATE INDEX IF NOT EXISTS idx_urf_facility
 -- 2c. Report Subjects (pre-resolved)
 -- Maps each report to its single resolved subject UUID.
 -- Eliminates the need for 9 OR arms and shortcodes in the
--- Sync Stream query, reducing report_data from 4× to 1× buckets.
+-- Sync Stream query. Also populates resolved_subject_id on couchdb.
 -- Populated by refresh_report_subjects() and auto-maintained
--- by a trigger on v1.couchdb.
+-- by a BEFORE trigger on v1.couchdb.
 -- ============================================================
 CREATE TABLE IF NOT EXISTS v1.report_subjects (
   report_id  TEXT PRIMARY KEY,
@@ -76,6 +76,19 @@ CREATE TABLE IF NOT EXISTS v1.report_subjects (
 
 CREATE INDEX IF NOT EXISTS idx_report_subjects_subject
   ON v1.report_subjects(subject_id);
+
+-- ============================================================
+-- 2c-bis. Resolved Subject ID (denormalized on couchdb)
+-- Stores the resolved subject UUID directly on the couchdb row.
+-- Eliminates the INNER JOIN report_subjects in Sync Streams,
+-- removing ~640 extra bucket keys from the JOIN dimension.
+-- Maintained by the BEFORE trigger (auto_resolve_report_subject).
+-- ============================================================
+ALTER TABLE v1.couchdb ADD COLUMN IF NOT EXISTS resolved_subject_id TEXT;
+
+CREATE INDEX IF NOT EXISTS idx_couchdb_resolved_subject
+  ON v1.couchdb(resolved_subject_id)
+  WHERE resolved_subject_id IS NOT NULL;
 
 -- Indexes for shortcode → UUID resolution during subject resolution.
 -- Reports reference subjects by shortcode (e.g., patient_id="13602").
@@ -352,10 +365,10 @@ BEGIN
     );
 
   -- Step 5b: REMOVED — shortcodes no longer needed in user_report_facilities.
-  -- Subject resolution is now handled by the report_subjects table, which
-  -- pre-resolves shortcodes to UUIDs. The report_data Sync Stream query
-  -- JOINs against report_subjects and matches subject_id IN report_facilities
-  -- (UUIDs only). This eliminates the 2× bucket multiplier from shortcodes.
+  -- Subject resolution is now handled by resolved_subject_id on the couchdb
+  -- row (denormalized from report_subjects). The all_data Sync Stream query
+  -- uses reports.resolved_subject_id IN accessible_facilities (no JOIN).
+  -- user_report_facilities is retained but no longer referenced in Sync Streams.
 END;
 $$;
 
@@ -460,6 +473,8 @@ DECLARE
 BEGIN
   IF NEW.doc ->> 'form' IS NOT NULL AND NOT COALESCE(NEW._deleted, false) THEN
     v_subject_id := v1.resolve_report_subject(NEW.doc);
+    -- Denormalize onto the couchdb row (BEFORE trigger can modify NEW directly)
+    NEW.resolved_subject_id := v_subject_id;
     IF v_subject_id IS NOT NULL THEN
       INSERT INTO v1.report_subjects (report_id, subject_id)
       VALUES (NEW._id, v_subject_id)
@@ -468,15 +483,18 @@ BEGIN
       DELETE FROM v1.report_subjects WHERE report_id = NEW._id;
     END IF;
   ELSIF COALESCE(NEW._deleted, false) THEN
+    NEW.resolved_subject_id := NULL;
     DELETE FROM v1.report_subjects WHERE report_id = NEW._id;
   END IF;
   RETURN NEW;
 END;
 $$;
 
+-- BEFORE trigger: sets resolved_subject_id in-place (no recursive UPDATE needed).
+-- Also maintains report_subjects table for backward compatibility.
 DROP TRIGGER IF EXISTS trg_auto_resolve_report_subject ON v1.couchdb;
 CREATE TRIGGER trg_auto_resolve_report_subject
-  AFTER INSERT OR UPDATE ON v1.couchdb
+  BEFORE INSERT OR UPDATE ON v1.couchdb
   FOR EACH ROW
   WHEN (NEW.doc ->> 'type' = 'data_record')
   EXECUTE FUNCTION v1.auto_resolve_report_subject();
@@ -634,6 +652,13 @@ SELECT v1.refresh_all_user_facilities();
 
 -- Pre-resolve report subjects (shortcode → UUID mapping)
 SELECT v1.refresh_report_subjects();
+
+-- Batch-populate resolved_subject_id on couchdb rows from report_subjects
+UPDATE v1.couchdb c
+SET resolved_subject_id = rs.subject_id
+FROM v1.report_subjects rs
+WHERE rs.report_id = c._id
+  AND c.resolved_subject_id IS DISTINCT FROM rs.subject_id;
 
 -- Pre-compute needs_signoff visibility (ancestor chain → user mapping)
 SELECT v1.refresh_needs_signoff_visibility();
