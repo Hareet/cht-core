@@ -520,7 +520,13 @@ app.putJson('/api/v1/report/:uuid', report.v1.update);
 
 app.postJson('/api/v1/bulk-delete', bulkDocs.bulkDelete);
 
-app.postJson('/api/v1/powersync/upload', powersyncUpload.upload);
+app.post(
+  '/api/v1/powersync/upload',
+  jsonParser,
+  authorization.handleAuthErrors,
+  authorization.onlineUserPassThrough,
+  powersyncUpload.upload,
+);
 
 // offline users are not allowed to hydrate documents via the hydrate API
 app.get(

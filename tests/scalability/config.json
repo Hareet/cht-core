@@ -5,12 +5,13 @@
   "powersync_key_path": "../../.devcontainer/powersync-config/dev-private-key.pem",
   "users": [
     { "name": "ac1", "pass": "Secret_1" },
-    { "name": "ac2", "pass": "Secret_1" }
+    { "name": "ac2", "pass": "Secret_1" },
+    { "name": "chw_user", "pass": "Secret_1" }
   ],
   "powersync_users": [
     { "name": "ac1" },
-    { "name": "ac2" },
     { "name": "chw_user" },
+    { "name": "ac2" },
     { "name": "supervisor_user" },
     { "name": "county_admin" }
   ]

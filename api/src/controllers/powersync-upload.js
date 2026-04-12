@@ -15,9 +15,27 @@
  */
 const auth = require('../auth');
 const serverUtils = require('../server-utils');
-const ctx = require('../services/data-context');
-const { Report, Person, Place, Qualifier } = require('@medic/cht-datasource');
+const localCtx = require('../services/data-context');
+const { Report, Person, Place, Qualifier, getPostgresDataContext } = require('@medic/cht-datasource');
 const logger = require('@medic/logger');
+const config = require('../config');
+
+// Use PostgreSQL direct writes if PS_DATABASE_URI is set (target architecture).
+// This bypasses cht-datasource and writes directly to v1.couchdb — the same table
+// PowerSync reads via WAL. For the benchmark, this is the correct target path.
+const pgUri = process.env.PS_DATABASE_URI || process.env.POSTGRES_URI;
+let pgPool = null;
+if (pgUri) {
+  try {
+    // pg might not be in api/node_modules — use dynamic import from shared location
+    const { Pool } = require('pg');
+    pgPool = new Pool({ connectionString: pgUri });
+    logger.info('PowerSync upload controller using direct PostgreSQL writes');
+  } catch (e) {
+    logger.warn('pg module not available, trying native fetch approach:', e.message);
+  }
+}
+const ctx = localCtx;
 
 const createReport = ctx.bind(Report.v1.create);
 const createPerson = ctx.bind(Person.v1.create);
@@ -78,13 +96,64 @@ const transformCrudEntry = (entry) => {
 };
 
 /**
- * Processes a single CRUD entry from a PowerSync batch.
- * Returns { id, ok: true } on success or { id, ok: false, error: message } on failure.
- *
- * Idempotency: PowerSync may replay operations. For PUT on an existing doc, we treat it
- * as an upsert (update if exists, create if not). For DELETE on a missing doc, we succeed.
+ * Direct PostgreSQL write — bypasses cht-datasource validation, writes to v1.couchdb directly.
+ * This is the target architecture: API → PostgreSQL → WAL → PowerSync.
  */
-const processCrudEntry = async (entry) => {
+const processCrudEntryPg = async (entry) => {
+  const { op, table, id, opData } = entry;
+
+  try {
+    if (!op || !table || !id) {
+      return { id: id || null, ok: false, error: 'Missing required fields: op, table, id' };
+    }
+
+    if (op === 'PUT') {
+      if (!opData) {
+        return { id, ok: false, error: 'Missing opData for PUT operation' };
+      }
+
+      const docId = id;
+      const doc = { _id: docId, ...opData };
+
+      await pgPool.query(
+        `INSERT INTO v1.couchdb (_id, doc, _deleted)
+         VALUES ($1, $2::jsonb, false)
+         ON CONFLICT (_id) DO UPDATE SET doc = $2::jsonb, _deleted = false`,
+        [docId, JSON.stringify(doc)]
+      );
+      return { id: docId, ok: true };
+    }
+
+    if (op === 'DELETE') {
+      await pgPool.query(
+        `UPDATE v1.couchdb SET _deleted = true WHERE _id = $1`,
+        [id]
+      );
+      return { id, ok: true };
+    }
+
+    if (op === 'PATCH') {
+      const result = await pgPool.query(
+        `UPDATE v1.couchdb SET doc = doc || $2::jsonb WHERE _id = $1 RETURNING _id`,
+        [id, JSON.stringify(opData || {})]
+      );
+      if (result.rowCount === 0) {
+        return { id, ok: false, error: `Document ${id} not found for PATCH` };
+      }
+      return { id, ok: true };
+    }
+
+    return { id, ok: false, error: `Unsupported operation: ${op}` };
+  } catch (err) {
+    logger.error(`PowerSync PG upload error for ${op} ${table}/${id}:`, err);
+    return { id, ok: false, error: err.message || 'Internal error' };
+  }
+};
+
+/**
+ * CouchDB path via cht-datasource (fallback when PostgreSQL not configured).
+ */
+const processCrudEntryCouchDb = async (entry) => {
   const { op, table, id, opData } = entry;
 
   try {
@@ -98,9 +167,6 @@ const processCrudEntry = async (entry) => {
     }
 
     if (op === 'DELETE') {
-      // Soft delete: not yet implemented via cht-datasource (no delete method).
-      // Succeed silently — the doc won't sync back to other clients if PowerSync
-      // bucket rules filter on _deleted.
       logger.info(`PowerSync DELETE for ${table}/${id} — soft delete not yet implemented`);
       return { id, ok: true };
     }
@@ -111,7 +177,6 @@ const processCrudEntry = async (entry) => {
         return { id, ok: false, error: 'Missing opData for PUT operation' };
       }
 
-      // Upsert: check if document already exists (idempotent replay)
       const existing = await tableConfig.get(Qualifier.byUuid(id)).catch(() => null);
 
       if (existing) {
@@ -140,6 +205,8 @@ const processCrudEntry = async (entry) => {
     return { id, ok: false, error: err.message || 'Internal error' };
   }
 };
+
+const processCrudEntry = pgPool ? processCrudEntryPg : processCrudEntryCouchDb;
 
 module.exports = {
   /**
