@@ -57,6 +57,7 @@ const authorization = require('./middleware/authorization');
 const deprecation = require('./middleware/deprecation');
 const hydration = require('./controllers/hydration');
 const contactsByPhone = require('./controllers/contacts-by-phone');
+const powersyncUpload = require('./controllers/powersync-upload');
 const createUserDb = require('./controllers/create-user-db');
 const privacyPolicyController = require('./controllers/privacy-policy');
 const couchConfigController = require('./controllers/couch-config');
@@ -518,6 +519,8 @@ app.postJson('/api/v1/report', report.v1.create);
 app.putJson('/api/v1/report/:uuid', report.v1.update);
 
 app.postJson('/api/v1/bulk-delete', bulkDocs.bulkDelete);
+
+app.postJson('/api/v1/powersync/upload', powersyncUpload.upload);
 
 // offline users are not allowed to hydrate documents via the hydrate API
 app.get(
