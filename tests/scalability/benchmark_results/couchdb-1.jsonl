@@ -1,0 +1,10 @@
+{"thread":0,"iteration":1,"duration":1050,"found":true,"engine":"couchdb","user":"ac1"}
+{"thread":0,"iteration":2,"duration":872,"found":true,"engine":"couchdb","user":"ac1"}
+{"thread":0,"iteration":3,"duration":815,"found":true,"engine":"couchdb","user":"ac1"}
+{"thread":0,"iteration":4,"duration":863,"found":true,"engine":"couchdb","user":"ac1"}
+{"thread":0,"iteration":5,"duration":856,"found":true,"engine":"couchdb","user":"ac1"}
+{"thread":0,"iteration":6,"duration":865,"found":true,"engine":"couchdb","user":"ac1"}
+{"thread":0,"iteration":7,"duration":845,"found":true,"engine":"couchdb","user":"ac1"}
+{"thread":0,"iteration":8,"duration":834,"found":true,"engine":"couchdb","user":"ac1"}
+{"thread":0,"iteration":9,"duration":818,"found":true,"engine":"couchdb","user":"ac1"}
+{"thread":0,"iteration":10,"duration":843,"found":true,"engine":"couchdb","user":"ac1"}
