@@ -1,35 +1,78 @@
-# Agent 1: cht-datasource PostgreSQL Adapter
+# Agent 1: cht-datasource PostgreSQL Adapter + Feature Flag
 
-## Objective
-Extend the `@medic/cht-datasource` shared library to support PostgreSQL as a backend alongside CouchDB. This is the **foundation** — all other agents depend on this abstraction layer.
+## Iteration 2 — Hardening + Production Feature Flag
+
+### Objective
+Harden the cht-datasource PostgreSQL adapter (from Iteration 1) and implement a **server-side feature flag system** that controls per-facility PowerSync rollout. This flag gates whether the API returns PowerSync JWT tokens or falls back to CouchDB replication.
+
+**Why this matters**: Production rollout must be controllable per-facility. If Go edition devices in one facility have problems, operators need to disable PowerSync for that facility without affecting others.
 
 ## Scope
 - **Primary directory**: `shared-libs/cht-datasource/`
-- **May modify**: `api/` (to wire new adapter), `shared-libs/cht-datasource/test/`
+- **May modify**: `api/` (feature flag endpoint, JWT issuing), `api/src/services/` (new feature-flags service)
 - **Do NOT modify**: `sentinel/`, `webapp/`, `tests/integration/`
 
 ## Phase Dependency
-Phase 2 (PostgreSQL running) required for integration testing. Unit tests with mocks can start at Phase 0.
+Phase 2 (PostgreSQL running). Feature flag code can start at Phase 0.
+
+## Iteration 1 Work — Review Before Continuing
+Read existing PG adapter code in `shared-libs/cht-datasource/src/`. Check git log for recent fixes (SQL injection fix, report hydration from Iteration 1 logs).
 
 ## Tasks
-1. Read current cht-datasource architecture: `shared-libs/cht-datasource/src/`
-2. Identify all CouchDB-specific calls (view queries, allDocs, bulkGet, changes feed)
-3. Design PostgreSQL adapter interface matching existing CouchDB adapter
-4. Implement PostgreSQL adapter using `pg` npm package
-5. Add connection pooling configuration
-6. Write unit tests for all adapter methods (mock pg)
-7. Write integration tests against live PostgreSQL (Phase 2)
-8. Ensure backward compatibility — CouchDB adapter still works, adapter selected by config
+
+### Continuing: PG Adapter Hardening
+1. **Review and fix** any remaining issues from Iteration 1 (SQL injection, query performance)
+2. **Connection pool tuning**: Ensure pool settings work for national-scale (100K users):
+   - `max: 20` (default), configurable via `CHT_PG_POOL_MAX`
+   - Idle timeout, connection timeout, statement timeout
+3. **Query performance**: Add EXPLAIN ANALYZE for common queries at scale. Ensure indexes exist.
+4. **Backward compatibility**: Verify `CHT_DB_BACKEND=couchdb` still works unchanged
+
+### NEW: Feature Flag System
+5. **Design feature flag in `app_settings`**:
+   ```json
+   {
+     "powersync": {
+       "enabled": false,
+       "facilities": [],
+       "rollout_percentage": 0
+     }
+   }
+   ```
+   - `enabled: true` + empty `facilities` = enabled for ALL
+   - `enabled: true` + `facilities: ["facility-uuid-1"]` = enabled only for listed facilities
+   - `rollout_percentage` = gradual rollout (0-100, consistent hash of user_id)
+
+6. **Create feature flag service**: NEW `api/src/services/feature-flags.js`
+   - `isFeatureEnabled(feature, userCtx)` → boolean
+   - Reads from `app_settings` (already cached in API)
+   - For PowerSync: checks `powersync.enabled`, `powersync.facilities` against user's `facility_id`
+
+7. **Gate PowerSync JWT issuance**: MODIFY `api/src/controllers/powersync-upload.js` or auth endpoint
+   - Before issuing PowerSync JWT: `if (!isFeatureEnabled('powersync', userCtx)) return 403`
+   - Client (Agent 5) checks for 403 and falls back to PouchDB
+
+8. **Admin API for feature flag management**: NEW endpoint `PUT /api/v1/admin/feature-flags/powersync`
+   - Body: `{ enabled, facilities, rollout_percentage }`
+   - Requires admin role
+   - Updates `app_settings` in database
+   - Returns current state
+
+### Testing
+9. **Unit tests**: Feature flag service with various configs (all enabled, facility-scoped, percentage rollout)
+10. **Integration test**: JWT issuance gated by feature flag
+11. Run `npm run unit-api` and `npm run unit-shared-lib` after each change
 
 ## Key Context
-- Read `context/IMPLEMENTATION_GUIDE.md` — PostgreSQL schema design (Layer 1 JSONB, Layer 2 normalized)
-- Read `context/DECISIONS_AND_CONSTRAINTS.md` — dual-write pattern from CommCare
-- The existing `cht-datasource` is the API abstraction being expanded per Medic's official roadmap
-- cht-sync puts CouchDB docs into `couchdb` table with JSONB `doc` column
-- Generated columns (`doc_type`, `facility_id`, `reported_date`) enable efficient queries
+- `app_settings` is stored in CouchDB as a doc, cached in API memory, synced to clients
+- Existing feature flags in CHT: check `api/src/services/` for patterns to follow
+- Agent 5 consumes this flag client-side: if PowerSync JWT returns 403, instantiate PouchDB instead
+- The flag must support per-facility granularity (47 counties in Kenya, rollout by county)
 
 ## Success Criteria
-- `npm run unit-shared-lib` passes with new adapter tests
-- PostgreSQL adapter can perform: get by ID, query by type, query by facility, changes since seq
-- CouchDB adapter still passes all existing tests unchanged
-- Adapter selection via environment variable (`CHT_DB_BACKEND=postgres|couchdb`)
+- PG adapter: all existing unit tests pass, no SQL injection, connection pooling configured
+- Feature flag: `isFeatureEnabled('powersync', userCtx)` correctly evaluates against app_settings
+- JWT gating: PowerSync JWT only issued when feature enabled for user's facility
+- Admin endpoint: feature flag can be toggled per-facility via API
+- `CHT_DB_BACKEND=couchdb` still works unchanged (backward compat)
+- `npm run unit-api` and `npm run unit-shared-lib` pass
