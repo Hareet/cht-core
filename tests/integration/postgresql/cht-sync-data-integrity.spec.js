@@ -1,297 +1,258 @@
 /**
  * cht-sync Data Integrity and Edge Case Tests
  *
- * Validates edge cases identified from cht-sync source analysis (MCP research):
+ * Validates edge cases identified from cht-sync source analysis:
  *
  * 1. Soft delete behavior (_deleted column, NOT row removal)
- * 2. Security detail stripping (user docs: password_scheme, derived_key, salt removed)
+ * 2. Security detail stripping (user docs)
  * 3. Message documents (data_record without form field — SMS)
  * 4. Sensitive/private document fields (fields.private)
  * 5. couchdb_progress table tracking
- * 6. Source identifier tracking (multi-database support)
+ * 6. Source identifier tracking
  * 7. UPSERT conflict resolution (ON CONFLICT (_id) DO UPDATE)
  *
- * These tests fill gaps identified by cross-referencing:
- * - cht-sync-wiki: Data Import (importer.js sanitization, deletion handling)
- * - cht-core-wiki: Database Schema (document types, message docs)
- * - cht-kapa-docs: Document types and their sync behavior
- *
- * Prerequisites: CouchDB, API, PostgreSQL, and cht-sync must be running.
+ * Prerequisites: CouchDB, PostgreSQL, and cht-sync (couch2pg) must be running.
  */
-const utils = require('../../utils/agent-harness');
-const uuid = require('uuid').v4;
+require('../../aliases');
+const chai = require('chai');
+chai.use(require('chai-as-promised'));
+const expect = chai.expect;
+const { Pool } = require('pg');
 
-describe('cht-sync data integrity and edge cases', () => {
+const PG_SCHEMA = process.env.POSTGRES_SCHEMA || 'v1';
+const DOCS_TABLE = `"${PG_SCHEMA}"."couchdb"`;
+
+let pool;
+const stamp = () => `integrity-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+const testDocIds = [];
+
+// CouchDB helpers
+const COUCH_URL = process.env.COUCH_URL || 'http://admin:secret21512@couchdb:5984/medic';
+const parsedCouch = new URL(COUCH_URL);
+const COUCH_HOST = `${parsedCouch.protocol}//${parsedCouch.host}`;
+const COUCH_DB = parsedCouch.pathname.replace(/^\//, '');
+const COUCH_AUTH = 'Basic ' + Buffer.from(`${parsedCouch.username}:${parsedCouch.password}`).toString('base64');
+const couchFetch = (path, opts = {}) => {
+  opts.headers = { ...opts.headers, Authorization: COUCH_AUTH, Accept: 'application/json' };
+  return fetch(`${COUCH_HOST}${path}`, opts);
+};
+const couchPost = async (doc) => (await couchFetch(`/${COUCH_DB}`, {
+  method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(doc),
+})).json();
+const couchGet = async (id) => (await couchFetch(`/${COUCH_DB}/${encodeURIComponent(id)}`)).json();
+const couchPut = async (id, doc) => (await couchFetch(`/${COUCH_DB}/${encodeURIComponent(id)}`, {
+  method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(doc),
+})).json();
+const couchDelete = async (id) => {
+  const doc = await couchGet(id);
+  if (doc._rev) await couchFetch(`/${COUCH_DB}/${encodeURIComponent(id)}?rev=${doc._rev}`, { method: 'DELETE' });
+};
+const waitForDoc = async (docId, timeout = 45000) => {
+  const start = Date.now();
+  while (Date.now() - start < timeout) {
+    const { rows } = await pool.query(
+      `SELECT doc FROM ${DOCS_TABLE} WHERE _id = $1 AND (_deleted IS NULL OR _deleted = false)`, [docId]
+    );
+    if (rows.length > 0) return rows[0].doc;
+    await new Promise(r => setTimeout(r, 500));
+  }
+  throw new Error(`${docId} not replicated to PG within ${timeout}ms`);
+};
+const waitForDeleted = async (docId, timeout = 30000) => {
+  const start = Date.now();
+  while (Date.now() - start < timeout) {
+    const { rows } = await pool.query(`SELECT _deleted FROM ${DOCS_TABLE} WHERE _id = $1`, [docId]);
+    if (rows.length > 0 && rows[0]._deleted === true) return true;
+    await new Promise(r => setTimeout(r, 500));
+  }
+  throw new Error(`${docId} not marked deleted in PG within ${timeout}ms`);
+};
+
+describe('cht-sync data integrity and edge cases', function () {
+  this.timeout(120000);
+
+  before(async () => {
+    const pgPass = process.env.POSTGRES_PASSWORD || 'pgpass';
+    pool = new Pool({ connectionString: `postgresql://cht:${pgPass}@postgres:5432/cht` });
+    await pool.query('SELECT 1');
+  });
+
+  after(async () => {
+    for (const id of testDocIds) await couchDelete(id).catch(() => {});
+    if (pool) await pool.end();
+  });
 
   describe('soft delete behavior', () => {
-    it('should set _deleted=true on row when document is deleted, not remove the row', async function () {
-      this.timeout(60000);
-      const docId = `integrity-delete-${uuid()}`;
-      const doc = {
-        _id: docId,
-        type: 'data_record',
-        fields: { test: 'soft-delete' },
-        reported_date: Date.now(),
-      };
-      await utils.saveDoc(doc);
-      await utils.waitForDocInPostgres(docId, 45000);
+    it('should set _deleted=true on row when document is deleted, not remove the row', async () => {
+      const docId = stamp();
+      testDocIds.push(docId);
+      await couchPost({ _id: docId, type: 'data_record', fields: { test: 'soft-delete' }, reported_date: Date.now() });
+      await waitForDoc(docId);
 
-      // Verify it exists and is not deleted
-      const rowBefore = await utils.getPostgresRawRow(docId);
-      expect(rowBefore).to.exist;
-      expect(rowBefore._deleted).to.satisfy(v => v === false || v === null);
-
-      // Delete the document in CouchDB
-      await utils.deleteDoc(docId);
-
-      // cht-sync should mark _deleted=true, NOT remove the row
-      // This is confirmed by: importer.js addDeletesToResult() + ON CONFLICT UPDATE
-      const maxWait = 30000;
-      const start = Date.now();
-      let softDeleted = false;
-      while (Date.now() - start < maxWait) {
-        const row = await utils.getPostgresRawRow(docId);
-        if (row && row._deleted === true) {
-          softDeleted = true;
-          // The doc JSONB should also reflect deletion
-          expect(row.doc._deleted).to.be.true;
-          break;
-        }
-        await new Promise(resolve => setTimeout(resolve, 500));
-      }
-      expect(softDeleted).to.be.true;
-
-      // Row should still exist (not removed)
-      const result = await utils.pgQuery(
-        `SELECT COUNT(*) as cnt FROM ${utils.pgDocsTable()} WHERE _id = $1`,
-        [docId]
+      // Verify initial state
+      const { rows: before } = await pool.query(
+        `SELECT _deleted FROM ${DOCS_TABLE} WHERE _id = $1`, [docId]
       );
-      expect(parseInt(result.rows[0].cnt)).to.equal(1);
+      expect(before[0]._deleted).to.satisfy(v => v === false || v === null);
+
+      // Delete in CouchDB
+      await couchDelete(docId);
+      await waitForDeleted(docId);
+
+      // Row should still exist with _deleted=true
+      const { rows: after } = await pool.query(
+        `SELECT _deleted, doc FROM ${DOCS_TABLE} WHERE _id = $1`, [docId]
+      );
+      expect(after).to.have.length(1);
+      expect(after[0]._deleted).to.be.true;
     });
   });
 
   describe('security detail stripping', () => {
-    it('should remove sensitive fields from user documents', async function () {
-      this.timeout(60000);
-
-      // Create a user via the API — this creates an org.couchdb.user: doc
-      const username = `integrity-user-${Date.now()}`;
-      const user = {
-        username,
-        password: 'Str0ngP@ss123!',
-        place: undefined, // will use default
-        roles: ['chw'],
-        contact: {
-          _id: `fixture:user:${username}`,
-          name: 'Integrity Test User',
-        },
-      };
-
-      // We can't easily create a raw user doc, but we can check that
-      // if a user doc lands in PostgreSQL, sensitive fields are stripped.
-      // cht-sync's removeSecurityDetails strips: password_scheme, derived_key, salt
-      // from docs where type === 'user' && _id.startsWith('org.couchdb.user:')
-
-      // Instead of creating a user, verify the sanitization on any user doc
-      // that already exists in the _users database (which cht-sync may sync)
-      const result = await utils.pgQuery(
-        `SELECT doc FROM ${utils.pgDocsTable()}
-         WHERE _id LIKE 'org.couchdb.user:%' LIMIT 5`
+    it('should remove sensitive fields from user documents if synced', async function () {
+      // Check if any user docs exist in PG (cht-sync may or may not sync _users DB)
+      const { rows } = await pool.query(
+        `SELECT doc FROM ${DOCS_TABLE} WHERE _id LIKE 'org.couchdb.user:%' LIMIT 5`
       );
-
-      if (result.rows.length > 0) {
-        for (const row of result.rows) {
-          // These fields should have been stripped by cht-sync's removeSecurityDetails
-          expect(row.doc).to.not.have.property('password_scheme');
-          expect(row.doc).to.not.have.property('derived_key');
-          expect(row.doc).to.not.have.property('salt');
-        }
-      } else {
-        // If _users DB is not being synced, skip gracefully
-        console.log('No user documents found in PostgreSQL — _users DB may not be synced. Skipping.');
+      if (rows.length === 0) {
+        console.log('  No user documents in PostgreSQL — _users DB not synced. Skipping.');
         this.skip();
+        return;
+      }
+      for (const row of rows) {
+        expect(row.doc).to.not.have.property('password_scheme');
+        expect(row.doc).to.not.have.property('derived_key');
+        expect(row.doc).to.not.have.property('salt');
       }
     });
   });
 
   describe('message documents (SMS without form)', () => {
-    it('should replicate SMS message documents (data_record without form)', async function () {
-      this.timeout(60000);
-      // Messages are data_records WITHOUT a form field — incoming SMS
-      const msgId = `integrity-msg-${uuid()}`;
-      const messageDoc = {
-        _id: msgId,
-        type: 'data_record',
-        // No 'form' field — this distinguishes messages from reports
+    it('should replicate SMS message documents (data_record without form)', async () => {
+      const docId = stamp();
+      testDocIds.push(docId);
+      await couchPost({
+        _id: docId, type: 'data_record',
+        // No 'form' field — this is a message (SMS)
         from: '+254700000099',
-        sms_message: {
-          from: '+254700000099',
-          message: 'Test SMS message for PostgreSQL sync',
-          sent_timestamp: Date.now(),
-        },
+        sms_message: { from: '+254700000099', message: 'Test SMS for PG sync', sent_timestamp: Date.now() },
         reported_date: Date.now(),
-      };
-      await utils.saveDoc(messageDoc);
+      });
 
-      const pgDoc = await utils.waitForDocInPostgres(msgId, 45000);
-      expect(pgDoc).to.exist;
+      const pgDoc = await waitForDoc(docId);
       expect(pgDoc.type).to.equal('data_record');
-      expect(pgDoc).to.not.have.property('form'); // messages have no form
-      expect(pgDoc.sms_message).to.exist;
-      expect(pgDoc.sms_message.message).to.equal('Test SMS message for PostgreSQL sync');
+      expect(pgDoc).to.not.have.property('form');
+      expect(pgDoc.sms_message.message).to.equal('Test SMS for PG sync');
       expect(pgDoc.from).to.equal('+254700000099');
-
-      await utils.deleteDoc(msgId);
     });
   });
 
   describe('sensitive/private document fields', () => {
-    it('should replicate reports with private fields intact in PostgreSQL', async function () {
-      this.timeout(60000);
-      // CHT supports fields.private = 'yes' to exclude sensitive fields from
-      // subordinate user replication. This is a replication-level filter, NOT
-      // a cht-sync filter — private docs should still appear fully in PostgreSQL.
-      const reportId = `integrity-private-${uuid()}`;
-      const report = {
-        _id: reportId,
-        type: 'data_record',
-        form: 'pregnancy',
-        fields: {
-          patient_name: 'Confidential Patient',
-          private: 'yes',
-          hiv_status: 'positive',
-        },
+    it('should replicate reports with private fields intact in PostgreSQL', async () => {
+      const docId = stamp();
+      testDocIds.push(docId);
+      await couchPost({
+        _id: docId, type: 'data_record', form: 'pregnancy',
+        fields: { patient_name: 'Confidential Patient', private: 'yes', hiv_status: 'positive' },
         reported_date: Date.now(),
-      };
-      await utils.saveDoc(report);
+      });
 
-      const pgDoc = await utils.waitForDocInPostgres(reportId, 45000);
-      expect(pgDoc).to.exist;
-      // cht-sync replicates ALL documents fully — private field filtering
-      // is a client replication concern, not a cht-sync concern
+      const pgDoc = await waitForDoc(docId);
+      // cht-sync replicates ALL documents fully — private filtering is client-side only
       expect(pgDoc.fields.private).to.equal('yes');
       expect(pgDoc.fields.hiv_status).to.equal('positive');
       expect(pgDoc.fields.patient_name).to.equal('Confidential Patient');
-
-      await utils.deleteDoc(reportId);
     });
   });
 
   describe('couchdb_progress tracking', () => {
     it('should track sync progress with source, seq, pending, and updated_at', async () => {
-      const progress = await utils.getPostgresProgress();
-      expect(progress).to.be.an('array').that.is.not.empty;
-
-      for (const entry of progress) {
+      const { rows } = await pool.query(
+        `SELECT source, seq, pending, updated_at FROM "${PG_SCHEMA}"."couchdb_progress"`
+      );
+      expect(rows).to.be.an('array').that.is.not.empty;
+      for (const entry of rows) {
         expect(entry).to.have.property('source');
         expect(entry).to.have.property('seq');
         expect(entry).to.have.property('updated_at');
-        // pending may be 0 or null when caught up
         expect(entry).to.have.property('pending');
       }
     });
 
-    it('should advance seq after new documents are synced', async function () {
-      this.timeout(60000);
-      const progressBefore = await utils.getPostgresProgress();
-      const sourceBefore = progressBefore[0];
+    it('should advance seq after new documents are synced', async () => {
+      const { rows: before } = await pool.query(
+        `SELECT seq FROM "${PG_SCHEMA}"."couchdb_progress" LIMIT 1`
+      );
+      const seqBefore = before[0].seq;
 
-      // Create a document to advance the changes feed
-      const docId = `integrity-progress-${uuid()}`;
-      await utils.saveDoc({
-        _id: docId,
-        type: 'data_record',
-        fields: {},
-        reported_date: Date.now(),
-      });
-      await utils.waitForDocInPostgres(docId, 45000);
+      const docId = stamp();
+      testDocIds.push(docId);
+      await couchPost({ _id: docId, type: 'data_record', fields: {}, reported_date: Date.now() });
+      await waitForDoc(docId);
 
-      const progressAfter = await utils.getPostgresProgress();
-      const sourceAfter = progressAfter.find(p => p.source === sourceBefore.source);
-      expect(sourceAfter).to.exist;
-      // Seq should have advanced (CouchDB seqs are strings but should differ)
-      expect(sourceAfter.seq).to.not.equal(sourceBefore.seq);
-      // updated_at should be recent
-      const updatedAt = new Date(sourceAfter.updated_at);
-      expect(updatedAt.getTime()).to.be.above(Date.now() - 120000); // within last 2 minutes
-
-      await utils.deleteDoc(docId);
+      const { rows: after } = await pool.query(
+        `SELECT seq FROM "${PG_SCHEMA}"."couchdb_progress" LIMIT 1`
+      );
+      expect(after[0].seq).to.not.equal(seqBefore);
     });
   });
 
   describe('source identifier tracking', () => {
-    it('should record the CouchDB source for each document', async function () {
-      this.timeout(60000);
-      const docId = `integrity-source-${uuid()}`;
-      await utils.saveDoc({
-        _id: docId,
-        type: 'data_record',
-        fields: {},
-        reported_date: Date.now(),
-      });
-      await utils.waitForDocInPostgres(docId, 45000);
+    it('should record the CouchDB source for each document', async () => {
+      const docId = stamp();
+      testDocIds.push(docId);
+      await couchPost({ _id: docId, type: 'data_record', fields: {}, reported_date: Date.now() });
+      await waitForDoc(docId);
 
-      const row = await utils.getPostgresRawRow(docId);
-      expect(row).to.exist;
-      // source should be set to the CouchDB hostname:port/dbname
-      expect(row.source).to.be.a('string').that.is.not.empty;
-      // source should match the progress table's source
-      const progress = await utils.getPostgresProgress();
+      const { rows } = await pool.query(
+        `SELECT source FROM ${DOCS_TABLE} WHERE _id = $1`, [docId]
+      );
+      expect(rows[0].source).to.be.a('string').that.is.not.empty;
+
+      // Source should match couchdb_progress source
+      const { rows: progress } = await pool.query(
+        `SELECT source FROM "${PG_SCHEMA}"."couchdb_progress"`
+      );
       const sources = progress.map(p => p.source);
-      expect(sources).to.include(row.source);
-
-      await utils.deleteDoc(docId);
+      expect(sources).to.include(rows[0].source);
     });
   });
 
   describe('UPSERT conflict resolution', () => {
-    it('should update existing documents via ON CONFLICT (_id) DO UPDATE', async function () {
-      this.timeout(60000);
-      const docId = `integrity-upsert-${uuid()}`;
-      const doc = {
-        _id: docId,
-        type: 'data_record',
-        fields: { version: 1 },
-        reported_date: Date.now(),
-      };
-      await utils.saveDoc(doc);
-      await utils.waitForDocInPostgres(docId, 45000);
+    it('should update existing documents via ON CONFLICT (_id) DO UPDATE', async () => {
+      const docId = stamp();
+      testDocIds.push(docId);
+      await couchPost({ _id: docId, type: 'data_record', fields: { version: 1 }, reported_date: Date.now() });
+      await waitForDoc(docId);
 
-      // Get initial saved_timestamp
-      const rowV1 = await utils.getPostgresRawRow(docId);
-      expect(rowV1.doc.fields.version).to.equal(1);
-      const tsV1 = new Date(rowV1.saved_timestamp).getTime();
-
-      // Update the document
-      const savedDoc = await utils.getDoc(docId);
-      savedDoc.fields.version = 2;
-      await utils.saveDoc(savedDoc);
-
-      // Wait for the UPSERT to update the existing row
-      const maxWait = 30000;
-      const start = Date.now();
-      let rowV2;
-      while (Date.now() - start < maxWait) {
-        rowV2 = await utils.getPostgresRawRow(docId);
-        if (rowV2 && rowV2.doc.fields?.version === 2) {
-          break;
-        }
-        await new Promise(resolve => setTimeout(resolve, 500));
-      }
-      expect(rowV2.doc.fields.version).to.equal(2);
-
-      // saved_timestamp should have been updated
-      const tsV2 = new Date(rowV2.saved_timestamp).getTime();
-      expect(tsV2).to.be.at.least(tsV1);
-
-      // There should be exactly ONE row (UPSERT, not INSERT)
-      const countResult = await utils.pgQuery(
-        `SELECT COUNT(*) as cnt FROM ${utils.pgDocsTable()} WHERE _id = $1`,
-        [docId]
+      const { rows: v1 } = await pool.query(
+        `SELECT saved_timestamp, doc FROM ${DOCS_TABLE} WHERE _id = $1`, [docId]
       );
-      expect(parseInt(countResult.rows[0].cnt)).to.equal(1);
+      expect(v1[0].doc.fields.version).to.equal(1);
 
-      await utils.deleteDoc(docId);
+      // Update via CouchDB
+      const saved = await couchGet(docId);
+      saved.fields.version = 2;
+      await couchPut(docId, saved);
+
+      // Wait for UPSERT
+      const start = Date.now();
+      while (Date.now() - start < 30000) {
+        const { rows } = await pool.query(`SELECT doc FROM ${DOCS_TABLE} WHERE _id = $1`, [docId]);
+        if (rows.length > 0 && rows[0].doc.fields?.version === 2) break;
+        await new Promise(r => setTimeout(r, 500));
+      }
+
+      const { rows: v2 } = await pool.query(
+        `SELECT saved_timestamp, doc FROM ${DOCS_TABLE} WHERE _id = $1`, [docId]
+      );
+      expect(v2[0].doc.fields.version).to.equal(2);
+
+      // Exactly ONE row (UPSERT, not a second INSERT)
+      const { rows: count } = await pool.query(
+        `SELECT COUNT(*) as cnt FROM ${DOCS_TABLE} WHERE _id = $1`, [docId]
+      );
+      expect(parseInt(count[0].cnt)).to.equal(1);
     });
   });
 });

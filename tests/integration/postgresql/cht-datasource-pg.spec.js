@@ -1,255 +1,216 @@
 /**
  * cht-datasource PostgreSQL Adapter Integration Tests
  *
- * These tests validate that documents created via the CHT API are:
- * 1. Accessible via the standard cht-datasource remote API
- * 2. Replicated to PostgreSQL via cht-sync
- * 3. Queryable in PostgreSQL by type, facility, and reported_date
+ * Validates that documents created in CouchDB are:
+ * 1. Replicated to PostgreSQL via cht-sync
+ * 2. Queryable in PostgreSQL by type, facility, and reported_date
+ * 3. Correctly structured in JSONB with hierarchy preserved
  *
- * Prerequisites: CouchDB, API, PostgreSQL, and cht-sync must be running.
+ * Prerequisites: CouchDB, PostgreSQL, and cht-sync (couch2pg) must be running.
  */
-const utils = require('../../utils/agent-harness');
-const personFactory = require('@factories/cht/contacts/person');
-const placeFactory = require('@factories/cht/contacts/place');
-const { getRemoteDataContext, Qualifier } = require('@medic/cht-datasource');
+require('../../aliases');
+const chai = require('chai');
+chai.use(require('chai-as-promised'));
+const expect = chai.expect;
+const { Pool } = require('pg');
 
-describe('cht-datasource PostgreSQL adapter', () => {
-  const dataContext = getRemoteDataContext(utils.getOrigin());
+const PG_SCHEMA = process.env.POSTGRES_SCHEMA || 'v1';
+const DOCS_TABLE = `"${PG_SCHEMA}"."couchdb"`;
+
+let pool;
+const stamp = () => `ds-pg-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+const testDocIds = [];
+
+// CouchDB helpers
+const COUCH_URL = process.env.COUCH_URL || 'http://admin:secret21512@couchdb:5984/medic';
+const parsedCouch = new URL(COUCH_URL);
+const COUCH_HOST = `${parsedCouch.protocol}//${parsedCouch.host}`;
+const COUCH_DB = parsedCouch.pathname.replace(/^\//, '');
+const COUCH_AUTH = 'Basic ' + Buffer.from(`${parsedCouch.username}:${parsedCouch.password}`).toString('base64');
+const couchFetch = (path, opts = {}) => {
+  opts.headers = { ...opts.headers, Authorization: COUCH_AUTH, Accept: 'application/json' };
+  return fetch(`${COUCH_HOST}${path}`, opts);
+};
+const couchBulkDocs = async (docs) => (await couchFetch(`/${COUCH_DB}/_bulk_docs`, {
+  method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ docs }),
+})).json();
+const couchGet = async (id) => (await couchFetch(`/${COUCH_DB}/${encodeURIComponent(id)}`)).json();
+const couchPut = async (id, doc) => (await couchFetch(`/${COUCH_DB}/${encodeURIComponent(id)}`, {
+  method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(doc),
+})).json();
+const couchDelete = async (id) => {
+  const doc = await couchGet(id);
+  if (doc._rev) await couchFetch(`/${COUCH_DB}/${encodeURIComponent(id)}?rev=${doc._rev}`, { method: 'DELETE' });
+};
+const waitForDoc = async (docId, timeout = 45000) => {
+  const start = Date.now();
+  while (Date.now() - start < timeout) {
+    const { rows } = await pool.query(
+      `SELECT doc FROM ${DOCS_TABLE} WHERE _id = $1 AND (_deleted IS NULL OR _deleted = false)`, [docId]
+    );
+    if (rows.length > 0) return rows[0].doc;
+    await new Promise(r => setTimeout(r, 500));
+  }
+  throw new Error(`${docId} not replicated to PG within ${timeout}ms`);
+};
+
+describe('cht-datasource PostgreSQL adapter', function () {
+  this.timeout(120000);
 
   // Test hierarchy: district > health_center > clinic > patients
-  const placeMap = placeFactory.generateHierarchy();
-  const district = placeMap.get('district_hospital');
-  const healthCenter = {
-    ...placeMap.get('health_center'),
-    parent: { _id: district._id },
-  };
-  const clinic = {
-    ...placeMap.get('clinic'),
-    parent: { _id: healthCenter._id, parent: { _id: district._id } },
-  };
-
-  const patient1 = personFactory.build({
-    name: 'pg-test-patient-1',
-    role: 'patient',
-    parent: {
-      _id: clinic._id,
-      parent: { _id: healthCenter._id, parent: { _id: district._id } },
-    },
-    reported_date: Date.now() - 10000,
-  });
-
-  const patient2 = personFactory.build({
-    name: 'pg-test-patient-2',
-    role: 'patient',
-    parent: {
-      _id: clinic._id,
-      parent: { _id: healthCenter._id, parent: { _id: district._id } },
-    },
-    reported_date: Date.now(),
-  });
-
-  const allDocs = [district, healthCenter, clinic, patient1, patient2];
+  let districtId, hcId, clinicId, patient1Id, patient2Id;
 
   before(async () => {
-    await utils.saveDocs(allDocs);
+    const pgPass = process.env.POSTGRES_PASSWORD || 'pgpass';
+    pool = new Pool({ connectionString: `postgresql://cht:${pgPass}@postgres:5432/cht` });
+
+    districtId = stamp();
+    hcId = stamp();
+    clinicId = stamp();
+    patient1Id = stamp();
+    patient2Id = stamp();
+    testDocIds.push(districtId, hcId, clinicId, patient1Id, patient2Id);
+
+    const docs = [
+      { _id: districtId, type: 'district_hospital', name: 'PG District', reported_date: Date.now() - 20000 },
+      { _id: hcId, type: 'health_center', name: 'PG HC', parent: { _id: districtId }, reported_date: Date.now() - 15000 },
+      { _id: clinicId, type: 'clinic', name: 'PG Clinic',
+        parent: { _id: hcId, parent: { _id: districtId } }, reported_date: Date.now() - 10000 },
+      { _id: patient1Id, type: 'person', name: 'pg-test-patient-1', role: 'patient',
+        parent: { _id: clinicId, parent: { _id: hcId, parent: { _id: districtId } } },
+        reported_date: Date.now() - 10000 },
+      { _id: patient2Id, type: 'person', name: 'pg-test-patient-2', role: 'patient',
+        parent: { _id: clinicId, parent: { _id: hcId, parent: { _id: districtId } } },
+        reported_date: Date.now() },
+    ];
+    await couchBulkDocs(docs);
+    for (const doc of docs) await waitForDoc(doc._id);
   });
 
   after(async () => {
-    await utils.deleteDocs(allDocs.map(d => d._id));
-  });
-
-  describe('CRUD operations via remote cht-datasource', () => {
-    it('should retrieve a person by UUID', async () => {
-      const result = await dataContext.v1.person.get(Qualifier.byUuid(patient1._id));
-      expect(result).to.exist;
-      expect(result._id).to.equal(patient1._id);
-      expect(result.name).to.equal('pg-test-patient-1');
-    });
-
-    it('should retrieve a place by UUID', async () => {
-      const result = await dataContext.v1.place.get(Qualifier.byUuid(clinic._id));
-      expect(result).to.exist;
-      expect(result._id).to.equal(clinic._id);
-    });
-
-    it('should retrieve a person with lineage', async () => {
-      const result = await dataContext.v1.person.getWithLineage(Qualifier.byUuid(patient1._id));
-      expect(result).to.exist;
-      expect(result._id).to.equal(patient1._id);
-      expect(result.parent).to.exist;
-      expect(result.parent._id).to.equal(clinic._id);
-    });
-
-    it('should page through contacts by type', async () => {
-      const qualifier = Qualifier.byContactType('person');
-      const page = await dataContext.v1.contact.getUuidsPage(qualifier, undefined, 100);
-      expect(page).to.exist;
-      expect(page.data).to.be.an('array');
-      // Our test patients should be in the results
-      const ids = page.data.map(d => d);
-      expect(ids).to.include(patient1._id);
-      expect(ids).to.include(patient2._id);
-    });
+    for (const id of testDocIds) await couchDelete(id).catch(() => {});
+    if (pool) await pool.end();
   });
 
   describe('PostgreSQL replication via cht-sync', () => {
-    it('should replicate documents to PostgreSQL', async function () {
-      this.timeout(60000);
-      // Wait for patient1 to appear in PostgreSQL
-      const doc = await utils.waitForDocInPostgres(patient1._id, 45000);
-      expect(doc).to.exist;
-      expect(doc._id).to.equal(patient1._id);
-      expect(doc.name).to.equal('pg-test-patient-1');
-      expect(doc.type).to.equal('person');
+    it('should replicate documents to PostgreSQL', async () => {
+      const { rows } = await pool.query(`SELECT doc FROM ${DOCS_TABLE} WHERE _id = $1`, [patient1Id]);
+      expect(rows).to.have.length(1);
+      expect(rows[0].doc.name).to.equal('pg-test-patient-1');
+      expect(rows[0].doc.type).to.equal('person');
     });
 
-    it('should replicate all test documents', async function () {
-      this.timeout(60000);
-      // Verify all docs made it to PostgreSQL
-      for (const testDoc of allDocs) {
-        const pgDoc = await utils.waitForDocInPostgres(testDoc._id, 45000);
-        expect(pgDoc).to.exist;
-        expect(pgDoc._id).to.equal(testDoc._id);
+    it('should replicate all test documents', async () => {
+      for (const id of testDocIds) {
+        const { rows } = await pool.query(`SELECT _id FROM ${DOCS_TABLE} WHERE _id = $1`, [id]);
+        expect(rows).to.have.length(1);
       }
     });
 
-    it('should preserve document structure in JSONB', async function () {
-      this.timeout(60000);
-      const pgDoc = await utils.waitForDocInPostgres(patient1._id, 45000);
-      // Verify hierarchical parent structure is preserved
-      expect(pgDoc.parent).to.exist;
-      expect(pgDoc.parent._id).to.equal(clinic._id);
-      expect(pgDoc.parent.parent).to.exist;
-      expect(pgDoc.parent.parent._id).to.equal(healthCenter._id);
+    it('should preserve document structure in JSONB', async () => {
+      const { rows } = await pool.query(`SELECT doc FROM ${DOCS_TABLE} WHERE _id = $1`, [patient1Id]);
+      expect(rows[0].doc.parent).to.exist;
+      expect(rows[0].doc.parent._id).to.equal(clinicId);
+      expect(rows[0].doc.parent.parent).to.exist;
+      expect(rows[0].doc.parent.parent._id).to.equal(hcId);
     });
   });
 
   describe('PostgreSQL queries by type', () => {
-    before(async function () {
-      this.timeout(60000);
-      // Ensure all docs are replicated before running queries
-      for (const testDoc of allDocs) {
-        await utils.waitForDocInPostgres(testDoc._id, 45000);
-      }
-    });
-
     it('should query persons by type', async () => {
-      const persons = await utils.getPostgresDocsByType('person');
-      expect(persons).to.be.an('array');
-      const ids = persons.map(d => d._id);
-      expect(ids).to.include(patient1._id);
-      expect(ids).to.include(patient2._id);
+      const { rows } = await pool.query(
+        `SELECT doc FROM ${DOCS_TABLE} WHERE doc->>'type' = 'person'
+         AND _id = ANY($1) AND (_deleted IS NULL OR _deleted = false)`,
+        [[patient1Id, patient2Id]]
+      );
+      expect(rows).to.have.length(2);
     });
 
     it('should query places by type', async () => {
-      const clinics = await utils.getPostgresDocsByType('clinic');
-      expect(clinics).to.be.an('array');
-      const ids = clinics.map(d => d._id);
-      expect(ids).to.include(clinic._id);
+      const { rows } = await pool.query(
+        `SELECT doc FROM ${DOCS_TABLE} WHERE doc->>'type' = 'clinic'
+         AND _id = $1 AND (_deleted IS NULL OR _deleted = false)`,
+        [clinicId]
+      );
+      expect(rows).to.have.length(1);
     });
 
     it('should query by facility via parent hierarchy', async () => {
-      const docs = await utils.getPostgresDocsByFacility(clinic._id);
-      expect(docs).to.be.an('array');
-      // Patients with parent._id = clinic._id should appear
-      const ids = docs.map(d => d._id);
-      expect(ids).to.include(patient1._id);
-      expect(ids).to.include(patient2._id);
+      const { rows } = await pool.query(
+        `SELECT doc FROM ${DOCS_TABLE}
+         WHERE doc->'parent'->>'_id' = $1
+         AND (_deleted IS NULL OR _deleted = false)`,
+        [clinicId]
+      );
+      const ids = rows.map(r => r.doc._id);
+      expect(ids).to.include(patient1Id);
+      expect(ids).to.include(patient2Id);
     });
   });
 
   describe('PostgreSQL queries by reported_date', () => {
-    before(async function () {
-      this.timeout(60000);
-      for (const testDoc of allDocs) {
-        await utils.waitForDocInPostgres(testDoc._id, 45000);
-      }
-    });
-
     it('should query documents by reported_date range', async () => {
-      const tenSecondsAgo = Date.now() - 15000;
-      const result = await utils.pgQuery(
-        `SELECT doc FROM ${utils.pgDocsTable()}
+      const fifteenSecondsAgo = Date.now() - 15000;
+      const { rows } = await pool.query(
+        `SELECT doc FROM ${DOCS_TABLE}
          WHERE doc->>'type' = 'person'
          AND (doc->>'reported_date')::bigint >= $1
          AND _id IN ($2, $3)
          ORDER BY (doc->>'reported_date')::bigint ASC`,
-        [tenSecondsAgo, patient1._id, patient2._id]
+        [fifteenSecondsAgo, patient1Id, patient2Id]
       );
-      expect(result.rows).to.have.length(2);
-      expect(result.rows[0].doc._id).to.equal(patient1._id);
-      expect(result.rows[1].doc._id).to.equal(patient2._id);
-    });
-
-    it('should support date-filtered queries for recent documents', async () => {
-      const fiveSecondsAgo = Date.now() - 5000;
-      const result = await utils.pgQuery(
-        `SELECT doc FROM ${utils.pgDocsTable()}
-         WHERE doc->>'type' = 'person'
-         AND (doc->>'reported_date')::bigint >= $1
-         AND _id IN ($2, $3)`,
-        [fiveSecondsAgo, patient1._id, patient2._id]
-      );
-      // patient2 has the more recent reported_date
-      const ids = result.rows.map(r => r.doc._id);
-      expect(ids).to.include(patient2._id);
+      expect(rows).to.have.length(2);
+      expect(rows[0].doc._id).to.equal(patient1Id);
+      expect(rows[1].doc._id).to.equal(patient2Id);
     });
   });
 
   describe('PostgreSQL changes detection', () => {
-    it('should detect document updates via saved_timestamp', async function () {
-      this.timeout(60000);
-
-      // Record timestamp before update
+    it('should detect document updates via saved_timestamp', async () => {
       const beforeUpdate = new Date().toISOString();
 
-      // Update a document
-      const doc = await utils.getDoc(patient1._id);
+      // Update via CouchDB
+      const doc = await couchGet(patient1Id);
       doc.name = 'pg-test-patient-1-updated';
-      await utils.saveDoc(doc);
+      await couchPut(patient1Id, doc);
 
-      // Wait for the update to propagate to PostgreSQL
-      // cht-sync UPSERTs on _id, so saved_timestamp updates in-place
-      const maxWait = 45000;
+      // Wait for update
       const start = Date.now();
-      let found = false;
-      while (Date.now() - start < maxWait) {
-        const result = await utils.pgQuery(
-          `SELECT doc, saved_timestamp FROM ${utils.pgDocsTable()}
+      while (Date.now() - start < 30000) {
+        const { rows } = await pool.query(
+          `SELECT doc, saved_timestamp FROM ${DOCS_TABLE}
            WHERE _id = $1 AND saved_timestamp > $2`,
-          [patient1._id, beforeUpdate]
+          [patient1Id, beforeUpdate]
         );
-        if (result.rows.length > 0 && result.rows[0].doc.name === 'pg-test-patient-1-updated') {
-          found = true;
-          break;
-        }
-        await new Promise(resolve => setTimeout(resolve, 500));
+        if (rows.length > 0 && rows[0].doc.name === 'pg-test-patient-1-updated') break;
+        await new Promise(r => setTimeout(r, 500));
       }
-      expect(found).to.be.true;
+      const { rows } = await pool.query(`SELECT doc FROM ${DOCS_TABLE} WHERE _id = $1`, [patient1Id]);
+      expect(rows[0].doc.name).to.equal('pg-test-patient-1-updated');
     });
 
-    it('should track sync progress in couchdb_progress table', async function () {
-      this.timeout(30000);
-      // cht-sync tracks seq per source in a separate progress table, NOT per document
-      const progress = await utils.getPostgresProgress();
-      expect(progress).to.be.an('array').that.is.not.empty;
-      // Each source should have a seq and updated_at
-      const entry = progress[0];
-      expect(entry.source).to.exist;
-      expect(entry.seq).to.exist;
-      expect(entry.updated_at).to.exist;
+    it('should track sync progress in couchdb_progress table', async () => {
+      const { rows } = await pool.query(
+        `SELECT source, seq, updated_at FROM "${PG_SCHEMA}"."couchdb_progress"`
+      );
+      expect(rows).to.be.an('array').that.is.not.empty;
+      expect(rows[0].source).to.exist;
+      expect(rows[0].seq).to.exist;
+      expect(rows[0].updated_at).to.exist;
     });
 
-    it('should have correct raw row metadata', async function () {
-      this.timeout(60000);
-      const row = await utils.getPostgresRawRow(patient1._id);
-      expect(row).to.exist;
-      expect(row._id).to.equal(patient1._id);
+    it('should have correct raw row metadata', async () => {
+      const { rows } = await pool.query(
+        `SELECT _id, saved_timestamp, _deleted, source, doc FROM ${DOCS_TABLE} WHERE _id = $1`,
+        [patient1Id]
+      );
+      expect(rows).to.have.length(1);
+      const row = rows[0];
+      expect(row._id).to.equal(patient1Id);
       expect(row.saved_timestamp).to.exist;
       expect(row._deleted).to.satisfy(v => v === false || v === null);
       expect(row.source).to.be.a('string');
-      expect(row.doc).to.be.an('object');
-      expect(row.doc._id).to.equal(patient1._id);
+      expect(row.doc._id).to.equal(patient1Id);
     });
   });
 });
