@@ -178,6 +178,34 @@ export class PowerSyncService implements OnDestroy {
 
     // Start storage monitoring for resource-constrained devices
     this.storageHealthService.startMonitoring();
+
+    // Record device tier and VFS selection to telemetry (fire-and-forget)
+    this.recordInitTelemetry(deviceTier, vfs);
+  }
+
+  /**
+   * Record PowerSync initialization telemetry to the local-only telemetry table.
+   * Logs device tier, VFS selection, and storage metrics on every app start.
+   * Fire-and-forget — failure is non-fatal.
+   */
+  private recordInitTelemetry(deviceTier: DeviceTier, vfs: string): void {
+    if (!this.db) {
+      return;
+    }
+    const metrics = {
+      powersync_vfs: vfs,
+      powersync_device_tier: deviceTier.tier,
+      powersync_opfs_available: deviceTier.opfsAvailable,
+      powersync_storage_free_gb: Math.round(deviceTier.storageFreeGB * 10) / 10,
+      powersync_storage_total_gb: Math.round(deviceTier.storageTotalGB * 10) / 10,
+      powersync_webview_major: deviceTier.webviewMajor,
+    };
+    this.db.execute(
+      `INSERT INTO telemetry (id, type, metrics, reported_date) VALUES (uuid(), ?, ?, ?)`,
+      ['powersync_init', JSON.stringify(metrics), new Date().toISOString()]
+    ).catch(() => {
+      // Non-fatal: telemetry recording failure should never break init
+    });
   }
 
   /**

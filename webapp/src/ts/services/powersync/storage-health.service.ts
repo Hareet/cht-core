@@ -109,12 +109,16 @@ export class StorageHealthService implements OnDestroy {
     const freeBytes = Math.max(0, totalBytes - usedBytes);
     const usagePercent = totalBytes > 0 ? (usedBytes / totalBytes) * 100 : 0;
 
-    const level = this.classifyLevel(freeBytes, usagePercent);
+    const level = this.classifyLevel(freeBytes, usagePercent, totalBytes);
 
     return { level, usedBytes, totalBytes, freeBytes, usagePercent };
   }
 
-  private classifyLevel(freeBytes: number, usagePercent: number): StorageHealthLevel {
+  private classifyLevel(freeBytes: number, usagePercent: number, totalBytes: number): StorageHealthLevel {
+    // If we can't determine storage state (API unavailable), assume healthy
+    if (totalBytes === 0) {
+      return 'healthy';
+    }
     if (freeBytes < CRITICAL_FREE_THRESHOLD || usagePercent > CRITICAL_USAGE_PERCENT) {
       return 'critical';
     }
