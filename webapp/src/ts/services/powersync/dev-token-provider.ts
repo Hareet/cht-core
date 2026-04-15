@@ -93,6 +93,8 @@ export interface DevTokenOptions {
   roles?: string[];
   /** Max depth for report syncing (-1 = unlimited) */
   reportDepth?: number;
+  /** Whether user can view unassigned/unallocated reports */
+  canViewUnallocated?: boolean;
   /** Token validity in seconds (default: 24 hours) */
   expiresInSeconds?: number;
 }
@@ -124,6 +126,7 @@ export async function generateDevToken(options: DevTokenOptions): Promise<{ toke
     role_hash: roleHash,
     contact_id: options.contactId || null,
     report_depth: options.reportDepth ?? 1,
+    can_view_unallocated: options.canViewUnallocated ? 'true' : 'false',
   };
 
   const headerB64 = strToBase64url(JSON.stringify(header));
@@ -146,14 +149,83 @@ export async function generateDevToken(options: DevTokenOptions): Promise<{ toke
 
 /**
  * MD5 hash for role_hash JWT claim. Must match Node's crypto.createHash('md5').
- * Minimal pure-JS MD5 implementation for browser use (dev only).
+ * Pure-JS RFC 1321 MD5 implementation for browser use (dev only).
  */
-function md5Hash(input: string): string {
-  // Pre-computed role hashes for dev users (avoids needing full MD5 in browser)
-  const KNOWN_HASHES: Record<string, string> = {
-    'chw': 'f5b84b40469cbcfaa4cd7183856ecfaf',
-    'chw_supervisor': '7c92f994ff1e92eab97eb65a23ab1f59',
-    'national_admin': '20a4b4b81bde00e5fc6f974cf0801e8d',
-  };
-  return KNOWN_HASHES[input] || 'unknown_role_hash';
+export function md5Hash(input: string): string {
+  const bytes = new TextEncoder().encode(input);
+
+  // Pre-processing: pad to 64-byte blocks
+  const bitLen = bytes.length * 8;
+  // Need: original + 1 byte (0x80) + padding + 8 bytes (length)
+  const padded = new Uint8Array(Math.ceil((bytes.length + 9) / 64) * 64);
+  padded.set(bytes);
+  padded[bytes.length] = 0x80;
+  // Append original length in bits as 64-bit little-endian
+  const view = new DataView(padded.buffer);
+  view.setUint32(padded.length - 8, bitLen >>> 0, true);
+  view.setUint32(padded.length - 4, Math.floor(bitLen / 0x100000000), true);
+
+  // Per-round shift amounts
+  const s = [
+    7,12,17,22, 7,12,17,22, 7,12,17,22, 7,12,17,22,
+    5, 9,14,20, 5, 9,14,20, 5, 9,14,20, 5, 9,14,20,
+    4,11,16,23, 4,11,16,23, 4,11,16,23, 4,11,16,23,
+    6,10,15,21, 6,10,15,21, 6,10,15,21, 6,10,15,21,
+  ];
+
+  // Pre-computed T[i] = floor(2^32 * abs(sin(i + 1)))
+  const K = new Uint32Array(64);
+  for (let i = 0; i < 64; i++) {
+    K[i] = Math.floor(Math.abs(Math.sin(i + 1)) * 0x100000000) >>> 0;
+  }
+
+  let a0 = 0x67452301;
+  let b0 = 0xEFCDAB89;
+  let c0 = 0x98BADCFE;
+  let d0 = 0x10325476;
+
+  for (let offset = 0; offset < padded.length; offset += 64) {
+    const M = new Uint32Array(16);
+    for (let j = 0; j < 16; j++) {
+      M[j] = view.getUint32(offset + j * 4, true);
+    }
+
+    let A = a0, B = b0, C = c0, D = d0;
+
+    for (let i = 0; i < 64; i++) {
+      let F: number, g: number;
+      if (i < 16) {
+        F = (B & C) | (~B & D);
+        g = i;
+      } else if (i < 32) {
+        F = (D & B) | (~D & C);
+        g = (5 * i + 1) % 16;
+      } else if (i < 48) {
+        F = B ^ C ^ D;
+        g = (3 * i + 5) % 16;
+      } else {
+        F = C ^ (B | ~D);
+        g = (7 * i) % 16;
+      }
+      F = (F + A + K[i] + M[g]) >>> 0;
+      A = D;
+      D = C;
+      C = B;
+      B = (B + ((F << s[i]) | (F >>> (32 - s[i])))) >>> 0;
+    }
+
+    a0 = (a0 + A) >>> 0;
+    b0 = (b0 + B) >>> 0;
+    c0 = (c0 + C) >>> 0;
+    d0 = (d0 + D) >>> 0;
+  }
+
+  // Format as hex string (little-endian bytes)
+  const result = new Uint8Array(16);
+  const rv = new DataView(result.buffer);
+  rv.setUint32(0, a0, true);
+  rv.setUint32(4, b0, true);
+  rv.setUint32(8, c0, true);
+  rv.setUint32(12, d0, true);
+  return Array.from(result).map(b => b.toString(16).padStart(2, '0')).join('');
 }
