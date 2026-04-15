@@ -155,48 +155,67 @@ CREATE INDEX IF NOT EXISTS idx_rnsv_user
 -- 3. Purge Status
 -- Tracks which documents should be excluded from sync per role.
 -- Populated by the purge preprocessing service (Agent 4).
+-- Schema matches public.purge_status (Agent 4's canonical definition).
+--
+-- SYNC STREAMS INTEGRATION:
+-- PowerSync Sync Streams cannot do NOT EXISTS, NOT IN, or LEFT JOIN.
+-- auth.parameter() can ONLY be used with = operator on row data.
+-- Therefore, per-role purge exclusion uses INNER JOIN:
+--   INNER JOIN purge_status ps ON ps.doc_id = t._id
+--     AND ps.role_hash = auth.parameter('role_hash')
+--     AND ps.purged = false
+-- This requires EVERY purgeable doc to have a purge_status row
+-- (purged=false for non-purged docs). The auto_create_purge_status
+-- trigger below ensures new docs get rows immediately on INSERT.
 -- ============================================================
 CREATE TABLE IF NOT EXISTS v1.purge_status (
-  doc_id    TEXT NOT NULL,
-  role_hash TEXT NOT NULL,
-  purged_at TIMESTAMP DEFAULT NOW(),
-  reason    TEXT,
+  doc_id       TEXT        NOT NULL,
+  role_hash    TEXT        NOT NULL,
+  purged       BOOLEAN     NOT NULL DEFAULT false,
+  evaluated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  seq          TEXT,
+  aggressive   BOOLEAN     NOT NULL DEFAULT false,
+  requested_by TEXT,
+  reason       TEXT,
   PRIMARY KEY (doc_id, role_hash)
 );
 
+-- For Sync Streams JOIN: lookup by (doc_id, role_hash) is covered by PK.
+-- Partial index for purge preprocessor: "all purged docs for this role"
+CREATE INDEX IF NOT EXISTS idx_purge_status_role_purged
+  ON v1.purge_status (role_hash) WHERE purged = true;
+
+-- For incremental evaluation: "which docs were evaluated before a given time?"
+CREATE INDEX IF NOT EXISTS idx_purge_status_evaluated_at
+  ON v1.purge_status (evaluated_at);
+
+-- Legacy index (kept for backward compatibility with any existing queries)
 CREATE INDEX IF NOT EXISTS idx_purge_status_role
   ON v1.purge_status(role_hash);
 
 -- ============================================================
--- 4. Sync-eligible documents view (materialized)
--- Contacts that are NOT purged for a given role.
--- Since Sync Streams don't support NOT IN (subquery),
--- we use INNER JOIN against this table instead.
--- Refreshed by purge preprocessor after each run.
+-- 4. Purge exclusion strategy (INNER JOIN approach)
 -- ============================================================
-CREATE MATERIALIZED VIEW IF NOT EXISTS v1.unpurged_contacts AS
-  SELECT c._id AS doc_id, 'all' AS role_hash
-  FROM v1.couchdb c
-  WHERE c.doc ->> 'type' IN ('contact', 'person', 'clinic', 'health_center', 'district_hospital')
-    AND NOT COALESCE(c._deleted, false)
-  EXCEPT
-  SELECT ps.doc_id, ps.role_hash
-  FROM v1.purge_status ps;
-
--- Purge exclusion strategy:
--- PowerSync Sync Streams cannot do NOT IN (subquery) or LEFT JOIN.
--- Instead, when the purge preprocessor (Agent 4) inserts into purge_status,
--- a trigger checks whether ALL active roles have purged the doc. Only when
--- every role has purged it does the trigger soft-delete the couchdb row.
--- The Sync Streams already filter on _deleted != true, so universally-purged
--- docs are automatically excluded from all users.
+-- PowerSync Sync Streams cannot do NOT EXISTS, NOT IN, or LEFT JOIN.
+-- auth.parameter() can ONLY appear with = operator against row data.
 --
--- Per-role purge (where some roles purge but others don't) is a known
--- limitation of this approach. In CHT, this mainly affects tasks/targets
--- (which are user-scoped, so role doesn't matter) and reports (where
--- per-role purge differences are rare). For the rare cross-role case,
--- the purge preprocessor should filter at the user_accessible_facilities
--- level instead of relying on soft-delete.
+-- TWO-LAYER PURGE EXCLUSION:
+--
+-- Layer 1: Per-role purge (INNER JOIN in Sync Streams)
+--   Purgeable doc types (data_record, task, target) get an INNER JOIN
+--   against purge_status in each Sync Stream query:
+--     INNER JOIN purge_status ps ON ps.doc_id = t._id
+--       AND ps.role_hash = auth.parameter('role_hash')
+--       AND ps.purged = false
+--   This requires EVERY purgeable doc to have a row in purge_status.
+--   New docs get rows via the auto_create_purge_status trigger below.
+--   Contact queries do NOT need this JOIN (contacts are never purged).
+--
+-- Layer 2: Universal purge (soft-delete trigger, safety net)
+--   When ALL active roles have purged a doc, the purge_soft_delete
+--   trigger sets _deleted=true on the couchdb row. This catches edge
+--   cases and provides a hard floor: universally-purged docs are
+--   excluded from ALL streams (contacts included) via _deleted != true.
 
 CREATE OR REPLACE FUNCTION v1.purge_soft_delete()
 RETURNS trigger
@@ -205,14 +224,20 @@ DECLARE
   v_active_roles INT;
   v_purged_roles INT;
 BEGIN
+  -- Only act when a doc is marked as purged
+  IF NOT NEW.purged THEN
+    RETURN NEW;
+  END IF;
+
   -- Count distinct active role hashes in the system
   SELECT COUNT(DISTINCT role_hash) INTO v_active_roles
   FROM v1.user_settings;
 
-  -- Count how many distinct roles have purged this doc
+  -- Count how many distinct roles have purged this doc (purged=true only)
   SELECT COUNT(DISTINCT role_hash) INTO v_purged_roles
   FROM v1.purge_status
-  WHERE doc_id = NEW.doc_id;
+  WHERE doc_id = NEW.doc_id
+    AND purged = true;
 
   -- Only soft-delete when ALL active roles have purged this doc
   IF v_purged_roles >= v_active_roles THEN
@@ -228,8 +253,37 @@ $$;
 
 DROP TRIGGER IF EXISTS trg_purge_soft_delete ON v1.purge_status;
 CREATE TRIGGER trg_purge_soft_delete
-  AFTER INSERT ON v1.purge_status
+  AFTER INSERT OR UPDATE ON v1.purge_status
   FOR EACH ROW EXECUTE FUNCTION v1.purge_soft_delete();
+
+-- ============================================================
+-- 4b. Auto-create purge_status rows for new purgeable documents
+-- Ensures new data_records, tasks, and targets get purge_status
+-- rows (purged=false) for all active roles immediately on INSERT.
+-- Without this, the INNER JOIN in Sync Streams would exclude new
+-- docs until the purge preprocessor evaluates them.
+-- Contacts are never purged and don't need rows.
+-- ============================================================
+CREATE OR REPLACE FUNCTION v1.auto_create_purge_status()
+RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+  IF NOT COALESCE(NEW._deleted, false) THEN
+    INSERT INTO v1.purge_status (doc_id, role_hash, purged, evaluated_at, reason)
+    SELECT NEW._id, us.role_hash, false, NOW(), 'auto_init'
+    FROM (SELECT DISTINCT role_hash FROM v1.user_settings WHERE role_hash IS NOT NULL) us
+    ON CONFLICT (doc_id, role_hash) DO NOTHING;
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS trg_auto_create_purge_status ON v1.couchdb;
+CREATE TRIGGER trg_auto_create_purge_status
+  AFTER INSERT ON v1.couchdb
+  FOR EACH ROW
+  WHEN (NEW.doc ->> 'type' IN ('data_record', 'task', 'target'))
+  EXECUTE FUNCTION v1.auto_create_purge_status();
 
 -- ============================================================
 -- 5. Function: Refresh accessible facilities for one user
@@ -833,5 +887,18 @@ SELECT v1.refresh_report_subjects();
 
 -- Pre-compute needs_signoff visibility (ancestor chain → user mapping)
 SELECT v1.refresh_needs_signoff_visibility();
+
+-- Bulk-populate purge_status for all existing purgeable documents.
+-- Creates (doc_id, role_hash, purged=false) for every data_record, task,
+-- and target doc × every active role_hash. This ensures the Sync Streams
+-- INNER JOIN includes existing docs that haven't been evaluated by the
+-- purge preprocessor yet.
+INSERT INTO v1.purge_status (doc_id, role_hash, purged, evaluated_at, reason)
+SELECT c._id, us.role_hash, false, NOW(), 'bulk_init'
+FROM v1.couchdb c
+CROSS JOIN (SELECT DISTINCT role_hash FROM v1.user_settings WHERE role_hash IS NOT NULL) us
+WHERE NOT COALESCE(c._deleted, false)
+  AND c.doc ->> 'type' IN ('data_record', 'task', 'target')
+ON CONFLICT (doc_id, role_hash) DO NOTHING;
 
 COMMIT;

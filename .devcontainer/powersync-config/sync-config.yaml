@@ -7,11 +7,24 @@
 #   ->, ->>, CAST, ifnull, iif, substring, length, instr,
 #   datetime, unixepoch (time-value arg required, no current-time)
 # NOT supported: COALESCE, LIKE, LIMIT, GROUP BY, ORDER BY, jsonb_typeof,
-#   NOT IN (subquery), LEFT/RIGHT JOIN, aggregation, NOW()
+#   NOT IN (subquery), NOT EXISTS, LEFT/RIGHT JOIN, aggregation, NOW()
+#
+# NOTE: auth.parameter() can ONLY be used with = operator against row data.
+#   It CANNOT appear inside ifnull(), instr(), ->>, CASE, or with != operator.
+#   Validated against PowerSync 2026-04-15 via /api/admin/v1/validate.
 #
 # NOTE: IS NULL on JSONB-extracted values (e.g. doc ->> 'field' IS NULL)
 #   causes PowerSync to silently drop the stream. Use the ifnull() pattern
 #   instead: ifnull(doc ->> 'field', '') = '' (for null-or-missing checks).
+#
+# PURGE EXCLUSION STRATEGY:
+# Per-role purge exclusion uses INNER JOIN against purge_status:
+#   INNER JOIN "v1"."purge_status" ps ON ps.doc_id = t._id
+#     AND ps.role_hash = auth.parameter('role_hash') AND ps.purged = false
+# Applied to: purgeable doc queries (reports, targets, tasks).
+# NOT applied to: contacts (never purged), global_config, user_settings_doc, user_meta.
+# Requires: every purgeable doc has a purge_status row (purged=false default).
+# See setup.sql auto_create_purge_status trigger for new doc handling.
 #
 # JWT claims expected in auth token:
 #   sub:                    user_id (e.g., "org.couchdb.user:chw_user")
@@ -150,6 +163,7 @@ streams:
       # -- Targets --
       # target.owner = contact UUID. Syncs to any user who can see
       # the owner contact (supervisors see subordinate targets).
+      # PURGE: INNER JOIN purge_status excludes purged targets per role.
       - |
         SELECT
           targets._id AS id,
@@ -158,6 +172,10 @@ streams:
           CAST(targets.doc -> 'targets' AS TEXT) AS targets_data,
           CAST(targets.doc AS TEXT) AS doc
         FROM "v1"."couchdb" targets
+        INNER JOIN "v1"."purge_status" ps_t
+          ON ps_t.doc_id = targets._id
+          AND ps_t.role_hash = auth.parameter('role_hash')
+          AND ps_t.purged = false
         WHERE targets._deleted != true
           AND targets.doc ->> 'type' = 'target'
           AND targets.doc ->> 'owner' IN accessible_facilities
@@ -167,6 +185,7 @@ streams:
       # Matches against accessible_facilities which now contains only
       # places (~52 entries), not person IDs (~8,055).
       # Maintained by BEFORE trigger in setup.sql.
+      # PURGE: INNER JOIN purge_status excludes purged reports per role.
       - |
         SELECT
           reports._id AS id,
@@ -179,6 +198,10 @@ streams:
           CAST(reports.doc -> 'fields' AS TEXT) AS fields,
           CAST(reports.doc AS TEXT) AS doc
         FROM "v1"."couchdb" reports
+        INNER JOIN "v1"."purge_status" ps_r
+          ON ps_r.doc_id = reports._id
+          AND ps_r.role_hash = auth.parameter('role_hash')
+          AND ps_r.purged = false
         WHERE reports._deleted != true
           AND reports.doc ->> 'type' = 'data_record'
           AND reports.doc ->> 'form' IS NOT NULL
@@ -190,6 +213,7 @@ streams:
       # -- User's own reports --
       # Own reports always sync regardless of report_depth or privacy.
       # Submitter = user's contact_id → 1 bucket.
+      # PURGE: INNER JOIN purge_status excludes purged reports per role.
       - |
         SELECT
           reports._id AS id,
@@ -202,6 +226,10 @@ streams:
           CAST(reports.doc -> 'fields' AS TEXT) AS fields,
           CAST(reports.doc AS TEXT) AS doc
         FROM "v1"."couchdb" reports
+        INNER JOIN "v1"."purge_status" ps_r
+          ON ps_r.doc_id = reports._id
+          AND ps_r.role_hash = auth.parameter('role_hash')
+          AND ps_r.purged = false
         WHERE reports._deleted != true
           AND reports.doc ->> 'type' = 'data_record'
           AND reports.doc ->> 'form' IS NOT NULL
@@ -210,6 +238,7 @@ streams:
       # report_needs_signoff_visible maps (report_id, visible_to_user)
       # pre-computed by walking submitter ancestor chains in PostgreSQL.
       # The JOIN filter visible_to_user = auth.user_id() → 1 bucket.
+      # PURGE: INNER JOIN purge_status excludes purged reports per role.
       - |
         SELECT
           reports._id AS id,
@@ -225,6 +254,10 @@ streams:
         INNER JOIN "v1"."report_needs_signoff_visible" rnsv
           ON rnsv.report_id = reports._id
           AND rnsv.visible_to_user = auth.user_id()
+        INNER JOIN "v1"."purge_status" ps_r
+          ON ps_r.doc_id = reports._id
+          AND ps_r.role_hash = auth.parameter('role_hash')
+          AND ps_r.purged = false
         WHERE reports._deleted != true
           AND reports.doc ->> 'type' = 'data_record'
           AND reports.doc ->> 'form' IS NOT NULL
@@ -247,6 +280,7 @@ streams:
   #
   # Alias is "reports" so rows go to the same client table as
   # the all_data stream's report queries.
+  # PURGE: INNER JOIN purge_status excludes purged reports per role.
   unassigned_reports:
     auto_subscribe: true
     priority: 3
@@ -262,6 +296,10 @@ streams:
         CAST(reports.doc -> 'fields' AS TEXT) AS fields,
         CAST(reports.doc AS TEXT) AS doc
       FROM "v1"."couchdb" reports
+      INNER JOIN "v1"."purge_status" ps_r
+        ON ps_r.doc_id = reports._id
+        AND ps_r.role_hash = auth.parameter('role_hash')
+        AND ps_r.purged = false
       WHERE reports._deleted != true
         AND reports.doc ->> 'type' = 'data_record'
         AND reports.doc ->> 'form' IS NOT NULL
@@ -281,6 +319,7 @@ streams:
   # ================================================================
   # task.user = CouchDB user ID ("org.couchdb.user:xxx"), NOT contact UUID.
   # Direct auth.user_id() filter = 1 bucket per user.
+  # PURGE: INNER JOIN purge_status excludes purged tasks per role.
   tasks:
     auto_subscribe: true
     priority: 3
@@ -297,6 +336,10 @@ streams:
         tasks.doc ->> 'endDate' AS end_date,
         CAST(tasks.doc AS TEXT) AS doc
       FROM "v1"."couchdb" tasks
+      INNER JOIN "v1"."purge_status" ps_t
+        ON ps_t.doc_id = tasks._id
+        AND ps_t.role_hash = auth.parameter('role_hash')
+        AND ps_t.purged = false
       WHERE tasks._deleted != true
         AND tasks.doc ->> 'type' = 'task'
         AND tasks.doc ->> 'user' = auth.user_id()
