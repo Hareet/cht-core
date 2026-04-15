@@ -11,5 +11,5 @@ export { StorageHealthService } from './storage-health.service';
 export type { StorageHealthStatus, StorageHealthLevel } from './storage-health.service';
 export { initializePowerSync } from './powersync-init';
 export type { PowerSyncInitResult, PowerSyncInitOptions } from './powersync-init';
-export { generateDevToken } from './dev-token-provider';
+export { generateDevToken, md5Hash } from './dev-token-provider';
 export type { DevTokenOptions } from './dev-token-provider';

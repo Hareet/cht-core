@@ -40,6 +40,7 @@ export interface ChtConnectorConfig {
     contactId?: string;
     roles?: string[];
     reportDepth?: number;
+    canViewUnallocated?: boolean;
   };
   /** Timeout for HTTP requests in milliseconds (default: 30000) */
   fetchTimeoutMs?: number;
@@ -94,6 +95,7 @@ export class ChtPowerSyncConnector implements PowerSyncBackendConnector {
         contactId: this.config.devUser.contactId,
         roles: this.config.devUser.roles,
         reportDepth: this.config.devUser.reportDepth,
+        canViewUnallocated: this.config.devUser.canViewUnallocated,
       });
       return {
         endpoint: this.config.powerSyncUrl,

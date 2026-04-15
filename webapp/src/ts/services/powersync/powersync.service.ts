@@ -51,6 +51,7 @@ export interface PowerSyncConfig {
     contactId?: string;
     roles?: string[];
     reportDepth?: number;
+    canViewUnallocated?: boolean;
   };
 }
 

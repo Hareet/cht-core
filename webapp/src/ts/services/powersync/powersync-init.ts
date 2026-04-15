@@ -46,6 +46,12 @@ export interface PowerSyncInitOptions {
    * If not provided, PowerSync is assumed enabled.
    */
   getSettings?: () => Promise<Record<string, any>>;
+  /**
+   * Whether the user can view unassigned/unallocated reports.
+   * In production this is derived from app_settings permissions.
+   * In dev mode, pass explicitly for roles that need it.
+   */
+  canViewUnallocated?: boolean;
 }
 
 export interface PowerSyncInitResult {
@@ -105,6 +111,7 @@ export function initializePowerSync(
       userId: `org.couchdb.user:${userCtx.name}`,
       roles: userCtx.roles || [],
       reportDepth: 1,
+      canViewUnallocated: options.canViewUnallocated ?? false,
     };
     console.info(`PowerSync: Dev mode initialization for user '${userCtx.name}'`);
   }
