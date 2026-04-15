@@ -13,7 +13,6 @@ const chai = require('chai');
 const chaiExclude = require('chai-exclude');
 const moment = require('moment');
 const sinon = require('sinon');
-const rewire = require('rewire');
 
 const { engineSettings } = require('./mocks');
 const rulesEmitter = require('../src/rules-emitter');
@@ -102,12 +101,12 @@ const createMockPowerSyncDb = () => {
     // IS NULL
     const isNull = trimmed.match(/^(\w+)\s+IS\s+NULL$/i);
     if (isNull) {
-      return row[isNull[1]] == null;
+      return row[isNull[1]] === null || row[isNull[1]] === undefined;
     }
     // IS NOT NULL
     const isNotNull = trimmed.match(/^(\w+)\s+IS\s+NOT\s+NULL$/i);
     if (isNotNull) {
-      return row[isNotNull[1]] != null;
+      return row[isNotNull[1]] !== null && row[isNotNull[1]] !== undefined;
     }
     // NOT IN with literals
     const notIn = trimmed.match(/^(\w+)\s+NOT\s+IN\s+\(([^)]+)\)/i);
@@ -144,7 +143,7 @@ const createMockPowerSyncDb = () => {
     const neqLit = trimmed.match(/^(\w+)\s*!=\s*'([^']*)'/);
     if (neqLit) {
       const val = row[neqLit[1]];
-      if (val == null) {
+      if (val === null || val === undefined) {
         return false;
       }
       return val !== neqLit[2];
@@ -185,17 +184,17 @@ const createMockPowerSyncDb = () => {
   const db = {
     _tables: tables,
 
-    getAll: async (sql, params = []) => {
+    getAll: (sql, params = []) => {
       const table = findTable(sql);
       const rows = tables[table] || [];
-      return rows
+      return Promise.resolve(rows
         .filter(r => matchRow(r, sql, params))
         .map(r => {
           if (table === 'rules_state_store') {
             return { ...r };
           }
           return { ...r, doc: r._rawDoc ? JSON.stringify(r._rawDoc) : r.doc };
-        });
+        }));
     },
 
     getOptional: async (sql, params = []) => {
@@ -203,7 +202,7 @@ const createMockPowerSyncDb = () => {
       return results[0] || null;
     },
 
-    execute: async (sql, params = []) => {
+    execute: (sql, params = []) => {
       const table = findTable(sql);
       if (!tables[table]) {
         tables[table] = [];
@@ -242,6 +241,7 @@ const createMockPowerSyncDb = () => {
           row.updated_date = params[2];
         }
       }
+      return Promise.resolve();
     },
 
     writeTransaction: async (callback) => {
@@ -810,7 +810,7 @@ describe('PowerSync backend connector', () => {
   it('should create a connector with fetchCredentials and uploadData', () => {
     const connector = createChtBackendConnector({
       apiUrl: 'https://cht.example.com',
-      getAuthToken: async () => 'test-token',
+      getAuthToken: () => Promise.resolve('test-token'),
     });
 
     expect(connector).to.have.property('fetchCredentials').that.is.a('function');
@@ -820,7 +820,7 @@ describe('PowerSync backend connector', () => {
   it('fetchCredentials should return endpoint and token', async () => {
     const connector = createChtBackendConnector({
       apiUrl: 'https://cht.example.com',
-      getAuthToken: async () => 'jwt-token-123',
+      getAuthToken: () => Promise.resolve('jwt-token-123'),
       powersyncUrl: 'http://powersync:8080',
     });
 
@@ -833,11 +833,11 @@ describe('PowerSync backend connector', () => {
   it('uploadData should handle empty transaction queue', async () => {
     const connector = createChtBackendConnector({
       apiUrl: 'https://cht.example.com',
-      getAuthToken: async () => 'token',
+      getAuthToken: () => Promise.resolve('token'),
     });
 
     const mockDatabase = {
-      getNextCrudTransaction: async () => null,
+      getNextCrudTransaction: () => Promise.resolve(null),
     };
 
     // Should complete without error
@@ -847,7 +847,7 @@ describe('PowerSync backend connector', () => {
   it('uploadData should process task writes and call complete', async () => {
     const connector = createChtBackendConnector({
       apiUrl: 'https://cht.example.com',
-      getAuthToken: async () => 'token',
+      getAuthToken: () => Promise.resolve('token'),
     });
 
     const completeSpy = sinon.spy();
@@ -862,7 +862,7 @@ describe('PowerSync backend connector', () => {
     };
 
     const mockDatabase = {
-      getNextCrudTransaction: async () => mockTransaction,
+      getNextCrudTransaction: () => Promise.resolve(mockTransaction),
     };
 
     // Stub global fetch
@@ -879,7 +879,7 @@ describe('PowerSync backend connector', () => {
   it('uploadData should skip read-only tables', async () => {
     const connector = createChtBackendConnector({
       apiUrl: 'https://cht.example.com',
-      getAuthToken: async () => 'token',
+      getAuthToken: () => Promise.resolve('token'),
     });
 
     const completeSpy = sinon.spy();
@@ -894,7 +894,7 @@ describe('PowerSync backend connector', () => {
     };
 
     const mockDatabase = {
-      getNextCrudTransaction: async () => mockTransaction,
+      getNextCrudTransaction: () => Promise.resolve(mockTransaction),
     };
 
     await connector.uploadData(mockDatabase);
@@ -905,7 +905,7 @@ describe('PowerSync backend connector', () => {
   it('uploadData should handle PATCH operations (task updates)', async () => {
     const connector = createChtBackendConnector({
       apiUrl: 'https://cht.example.com',
-      getAuthToken: async () => 'token',
+      getAuthToken: () => Promise.resolve('token'),
     });
 
     const completeSpy = sinon.spy();
@@ -920,7 +920,7 @@ describe('PowerSync backend connector', () => {
     };
 
     const mockDatabase = {
-      getNextCrudTransaction: async () => mockTransaction,
+      getNextCrudTransaction: () => Promise.resolve(mockTransaction),
     };
 
     const fetchStub = sinon.stub(globalThis, 'fetch').resolves({ ok: true, status: 200 });
@@ -938,7 +938,7 @@ describe('PowerSync backend connector', () => {
   it('uploadData should handle DELETE operations', async () => {
     const connector = createChtBackendConnector({
       apiUrl: 'https://cht.example.com',
-      getAuthToken: async () => 'token',
+      getAuthToken: () => Promise.resolve('token'),
     });
 
     const completeSpy = sinon.spy();
@@ -953,7 +953,7 @@ describe('PowerSync backend connector', () => {
     };
 
     const mockDatabase = {
-      getNextCrudTransaction: async () => mockTransaction,
+      getNextCrudTransaction: () => Promise.resolve(mockTransaction),
     };
 
     const fetchStub = sinon.stub(globalThis, 'fetch').resolves({ ok: true, status: 200 });
@@ -969,7 +969,7 @@ describe('PowerSync backend connector', () => {
   it('uploadData should throw on 5xx server errors for retry', async () => {
     const connector = createChtBackendConnector({
       apiUrl: 'https://cht.example.com',
-      getAuthToken: async () => 'token',
+      getAuthToken: () => Promise.resolve('token'),
     });
 
     const completeSpy = sinon.spy();
@@ -984,7 +984,7 @@ describe('PowerSync backend connector', () => {
     };
 
     const mockDatabase = {
-      getNextCrudTransaction: async () => mockTransaction,
+      getNextCrudTransaction: () => Promise.resolve(mockTransaction),
     };
 
     const fetchStub = sinon.stub(globalThis, 'fetch').resolves({ ok: false, status: 503 });
@@ -999,7 +999,7 @@ describe('PowerSync backend connector', () => {
   it('uploadData should log but not throw on 4xx client errors', async () => {
     const connector = createChtBackendConnector({
       apiUrl: 'https://cht.example.com',
-      getAuthToken: async () => 'token',
+      getAuthToken: () => Promise.resolve('token'),
     });
 
     const completeSpy = sinon.spy();
@@ -1014,7 +1014,7 @@ describe('PowerSync backend connector', () => {
     };
 
     const mockDatabase = {
-      getNextCrudTransaction: async () => mockTransaction,
+      getNextCrudTransaction: () => Promise.resolve(mockTransaction),
     };
 
     const fetchStub = sinon.stub(globalThis, 'fetch').resolves({ ok: false, status: 409 });
@@ -1033,7 +1033,7 @@ describe('PowerSync backend connector', () => {
   it('uploadData should handle PATCH 4xx errors without throwing', async () => {
     const connector = createChtBackendConnector({
       apiUrl: 'https://cht.example.com',
-      getAuthToken: async () => 'token',
+      getAuthToken: () => Promise.resolve('token'),
     });
 
     const completeSpy = sinon.spy();
@@ -1048,7 +1048,7 @@ describe('PowerSync backend connector', () => {
     };
 
     const mockDatabase = {
-      getNextCrudTransaction: async () => mockTransaction,
+      getNextCrudTransaction: () => Promise.resolve(mockTransaction),
     };
 
     const fetchStub = sinon.stub(globalThis, 'fetch').resolves({ ok: false, status: 409 });
@@ -1066,7 +1066,7 @@ describe('PowerSync backend connector', () => {
   it('uploadData should handle DELETE 5xx errors with retry', async () => {
     const connector = createChtBackendConnector({
       apiUrl: 'https://cht.example.com',
-      getAuthToken: async () => 'token',
+      getAuthToken: () => Promise.resolve('token'),
     });
 
     const completeSpy = sinon.spy();
@@ -1081,7 +1081,7 @@ describe('PowerSync backend connector', () => {
     };
 
     const mockDatabase = {
-      getNextCrudTransaction: async () => mockTransaction,
+      getNextCrudTransaction: () => Promise.resolve(mockTransaction),
     };
 
     const fetchStub = sinon.stub(globalThis, 'fetch').resolves({ ok: false, status: 500 });
