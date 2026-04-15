@@ -34,10 +34,36 @@ describe('Purge Status', () => {
       const [sql, params] = queryStub.args[0];
       expect(sql).to.include('INSERT INTO purge_status');
       expect(sql).to.include('ON CONFLICT');
-      // 3 rows x 3 params each = 9 params
-      expect(params).to.have.length(9);
+      // 3 rows x 6 params each = 18 params
+      expect(params).to.have.length(18);
       expect(params).to.include('doc1');
       expect(params).to.include('hash_a');
+      // Default options: aggressive=false, requestedBy=null, reason=null
+      expect(params[3]).to.equal(false);
+      expect(params[4]).to.be.null;
+      expect(params[5]).to.be.null;
+    });
+
+    it('should upsert with aggressive purge metadata', async () => {
+      const queryStub = sinon.stub(db, 'query').resolves();
+
+      await purgeStatus.writePurgeResults(
+        { hash_a: { doc1: true } },
+        { aggressive: true, requestedBy: 'user-chw1', reason: 'storage_budget' }
+      );
+
+      expect(queryStub.callCount).to.equal(1);
+      const [sql, params] = queryStub.args[0];
+      expect(sql).to.include('aggressive');
+      expect(sql).to.include('requested_by');
+      expect(sql).to.include('reason');
+      expect(params).to.have.length(6);
+      expect(params[0]).to.equal('doc1');
+      expect(params[1]).to.equal('hash_a');
+      expect(params[2]).to.equal(true);
+      expect(params[3]).to.equal(true);       // aggressive
+      expect(params[4]).to.equal('user-chw1'); // requested_by
+      expect(params[5]).to.equal('storage_budget'); // reason
     });
   });
 

@@ -4,6 +4,7 @@
  * Uses agent-harness instead of Docker-based service management.
  * Services (CouchDB, API, PostgreSQL, optionally PowerSync) must be pre-running.
  */
+require('../../aliases');
 const utils = require('../../utils/agent-harness');
 
 exports.mochaHooks = {

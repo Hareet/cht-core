@@ -231,6 +231,157 @@ const purgeExpiredTargets = async (rolesByHash, stats) => {
   console.log(`Auto-purged ${result.rows.length} expired targets`);
 };
 
+// --- Aggressive purge logic for storage budget enforcement ---
+// Called when a device reports storage pressure. Applies tighter retention
+// thresholds than standard purge to free space quickly.
+
+// Aggressive: purge ALL tasks in terminal state immediately (no 60-day wait).
+const aggressivePurgeTasks = async (roleHash, stats) => {
+  const db = require('./db');
+  const tbl = `${db.getSchema()}.couchdb`;
+
+  const result = await db.query(`
+    SELECT _id
+    FROM ${tbl}
+    WHERE doc->>'type' = 'task'
+      AND (_deleted IS NOT TRUE)
+      AND doc->>'state' IN ('Cancelled', 'Completed', 'Failed')
+  `);
+
+  if (!result.rows.length) {
+    return {};
+  }
+
+  const toPurge = { [roleHash]: {} };
+  for (const row of result.rows) {
+    toPurge[roleHash][row._id] = true;
+  }
+
+  stats.tasksPurged = result.rows.length;
+  return toPurge;
+};
+
+// Aggressive: purge targets older than 1 reporting period (not 6 months).
+const aggressivePurgeTargets = async (roleHash, stats) => {
+  const db = require('./db');
+  const tbl = `${db.getSchema()}.couchdb`;
+
+  // 1 period = current month minus 1
+  const cutoff = new Date();
+  cutoff.setMonth(cutoff.getMonth() - 1);
+  const cutoffTag = `${cutoff.getFullYear()}-${String(cutoff.getMonth() + 1).padStart(2, '0')}`;
+
+  const result = await db.query(`
+    SELECT _id
+    FROM ${tbl}
+    WHERE _id LIKE 'target~%'
+      AND (_deleted IS NOT TRUE)
+      AND _id < $1
+  `, [`target~${cutoffTag}~`]);
+
+  if (!result.rows.length) {
+    return {};
+  }
+
+  const toPurge = { [roleHash]: {} };
+  for (const row of result.rows) {
+    toPurge[roleHash][row._id] = true;
+  }
+
+  stats.targetsPurged = result.rows.length;
+  return toPurge;
+};
+
+// Aggressive: purge reports older than 90 days that have no active follow-up task.
+// A report has an "active follow-up" if there's a non-terminal task referencing it.
+const AGGRESSIVE_REPORT_AGE_DAYS = 90;
+
+const aggressivePurgeReports = async (roleHash, facilityId, stats) => {
+  const db = require('./db');
+  const tbl = `${db.getSchema()}.couchdb`;
+  const cutoffMs = Date.now() - AGGRESSIVE_REPORT_AGE_DAYS * 24 * 60 * 60 * 1000;
+
+  // Find reports older than 90 days that belong to this facility's hierarchy
+  // and have no active (non-terminal) task referencing them.
+  // Task documents reference reports via emission.forId.
+  const result = await db.query(`
+    SELECT r._id
+    FROM ${tbl} r
+    WHERE r.doc->>'type' = 'data_record'
+      AND r.doc->>'form' IS NOT NULL
+      AND (r._deleted IS NOT TRUE)
+      AND (r.doc->>'reported_date')::bigint < $1
+      AND (
+        r.doc->'contact'->'parent'->>'_id' = $2
+        OR r.doc->'contact'->'parent'->'parent'->>'_id' = $2
+        OR r.doc->'contact'->'parent'->'parent'->'parent'->>'_id' = $2
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM ${tbl} t
+        WHERE t.doc->>'type' = 'task'
+          AND (t._deleted IS NOT TRUE)
+          AND t.doc->>'state' NOT IN ('Cancelled', 'Completed', 'Failed')
+          AND t.doc->'emission'->>'forId' = r._id
+      )
+  `, [cutoffMs, facilityId]);
+
+  if (!result.rows.length) {
+    return {};
+  }
+
+  const toPurge = { [roleHash]: {} };
+  for (const row of result.rows) {
+    toPurge[roleHash][row._id] = true;
+  }
+
+  stats.reportsPurged = result.rows.length;
+  return toPurge;
+};
+
+// Average document size estimate for reduction calculation.
+// CHT reports average ~2-5KB in JSONB; tasks/targets ~1KB.
+const AVG_DOC_SIZE_KB = 3;
+
+// Run aggressive purge for a specific user under storage pressure.
+// Returns { purged_count, estimated_reduction_mb, breakdown }.
+const runAggressivePurge = async (userId, facilityId, roleHash) => {
+  const purgeOptions = {
+    aggressive: true,
+    requestedBy: userId,
+    reason: 'storage_budget',
+  };
+
+  const stats = { tasksPurged: 0, targetsPurged: 0, reportsPurged: 0 };
+
+  const taskResults = await aggressivePurgeTasks(roleHash, stats);
+  const targetResults = await aggressivePurgeTargets(roleHash, stats);
+  const reportResults = await aggressivePurgeReports(roleHash, facilityId, stats);
+
+  // Write all results
+  if (Object.keys(taskResults).length) {
+    await purgeStatus.writePurgeResults(taskResults, purgeOptions);
+  }
+  if (Object.keys(targetResults).length) {
+    await purgeStatus.writePurgeResults(targetResults, purgeOptions);
+  }
+  if (Object.keys(reportResults).length) {
+    await purgeStatus.writePurgeResults(reportResults, purgeOptions);
+  }
+
+  const purgedCount = stats.tasksPurged + stats.targetsPurged + stats.reportsPurged;
+  const estimatedReductionMb = (purgedCount * AVG_DOC_SIZE_KB) / 1024;
+
+  return {
+    purged_count: purgedCount,
+    estimated_reduction_mb: Math.round(estimatedReductionMb * 100) / 100,
+    breakdown: {
+      tasks: stats.tasksPurged,
+      targets: stats.targetsPurged,
+      reports: stats.reportsPurged,
+    },
+  };
+};
+
 // Full purge evaluation run.
 const run = async (options = {}) => {
   const db = require('./db');
@@ -425,6 +576,7 @@ const processContact = async (contactRow, purgeFn, rolesByHash, stats) => {
 
 module.exports = {
   run,
+  runAggressivePurge,
   // Exported for testing
   _getPurgeFn: getPurgeFn,
   _buildGroupForContact: buildGroupForContact,
@@ -433,4 +585,7 @@ module.exports = {
   _purgeExpiredTasks: purgeExpiredTasks,
   _purgeExpiredTargets: purgeExpiredTargets,
   _hashPurgeFn: hashPurgeFn,
+  _aggressivePurgeTasks: aggressivePurgeTasks,
+  _aggressivePurgeTargets: aggressivePurgeTargets,
+  _aggressivePurgeReports: aggressivePurgeReports,
 };

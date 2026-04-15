@@ -13,158 +13,183 @@
  * 5. All CHT document types are correctly replicated
  * 6. Latency is within acceptable bounds
  *
- * Prerequisites: CouchDB, API, PostgreSQL, and cht-sync must be running.
+ * Prerequisites: CouchDB, PostgreSQL, and cht-sync (couch2pg) must be running.
  */
-const utils = require('../../utils/agent-harness');
-const uuid = require('uuid').v4;
-const personFactory = require('@factories/cht/contacts/person');
-const placeFactory = require('@factories/cht/contacts/place');
+require('../../aliases');
+const chai = require('chai');
+chai.use(require('chai-as-promised'));
+const expect = chai.expect;
+const { Pool } = require('pg');
 
-describe('cht-sync bridge: CouchDB → PostgreSQL', () => {
+const PG_SCHEMA = process.env.POSTGRES_SCHEMA || 'v1';
+const DOCS_TABLE = `"${PG_SCHEMA}"."couchdb"`;
+
+let pool;
+const stamp = () => `sync-bridge-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+const testDocIds = [];
+
+// CouchDB helpers
+const COUCH_URL = process.env.COUCH_URL || 'http://admin:secret21512@couchdb:5984/medic';
+const parsedCouch = new URL(COUCH_URL);
+const COUCH_HOST = `${parsedCouch.protocol}//${parsedCouch.host}`;
+const COUCH_DB = parsedCouch.pathname.replace(/^\//, '');
+const COUCH_AUTH = 'Basic ' + Buffer.from(`${parsedCouch.username}:${parsedCouch.password}`).toString('base64');
+const couchFetch = (path, opts = {}) => {
+  opts.headers = { ...opts.headers, Authorization: COUCH_AUTH, Accept: 'application/json' };
+  return fetch(`${COUCH_HOST}${path}`, opts);
+};
+const couchPost = async (doc) => {
+  const resp = await couchFetch(`/${COUCH_DB}`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(doc),
+  });
+  return resp.json();
+};
+const couchBulkDocs = async (docs) => {
+  const resp = await couchFetch(`/${COUCH_DB}/_bulk_docs`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ docs }),
+  });
+  return resp.json();
+};
+const couchGet = async (id) => {
+  const resp = await couchFetch(`/${COUCH_DB}/${encodeURIComponent(id)}`);
+  return resp.json();
+};
+const couchDelete = async (id) => {
+  const doc = await couchGet(id);
+  if (doc._rev) {
+    await couchFetch(`/${COUCH_DB}/${encodeURIComponent(id)}?rev=${doc._rev}`, { method: 'DELETE' });
+  }
+};
+const waitForDoc = async (docId, timeout = 45000) => {
+  const start = Date.now();
+  while (Date.now() - start < timeout) {
+    const { rows } = await pool.query(
+      `SELECT doc FROM ${DOCS_TABLE} WHERE _id = $1 AND (_deleted IS NULL OR _deleted = false)`, [docId]
+    );
+    if (rows.length > 0) return rows[0].doc;
+    await new Promise(r => setTimeout(r, 500));
+  }
+  throw new Error(`${docId} not replicated to PG within ${timeout}ms`);
+};
+const waitForDeleted = async (docId, timeout = 30000) => {
+  const start = Date.now();
+  while (Date.now() - start < timeout) {
+    const { rows } = await pool.query(`SELECT _deleted FROM ${DOCS_TABLE} WHERE _id = $1`, [docId]);
+    if (rows.length > 0 && rows[0]._deleted === true) return true;
+    await new Promise(r => setTimeout(r, 500));
+  }
+  throw new Error(`${docId} not marked deleted in PG within ${timeout}ms`);
+};
+
+describe('cht-sync bridge: CouchDB → PostgreSQL', function () {
+  this.timeout(120000);
+
+  before(async () => {
+    const pgPass = process.env.POSTGRES_PASSWORD || 'pgpass';
+    pool = new Pool({ connectionString: `postgresql://cht:${pgPass}@postgres:5432/cht` });
+    await pool.query('SELECT 1');
+
+    // Verify couch2pg is running (progress table is being updated)
+    const { rows } = await pool.query(
+      `SELECT updated_at FROM "${PG_SCHEMA}"."couchdb_progress" LIMIT 1`
+    );
+    if (rows.length === 0) {
+      throw new Error('cht-sync not running: no entries in couchdb_progress');
+    }
+    const age = Date.now() - new Date(rows[0].updated_at).getTime();
+    if (age > 300000) { // 5 minutes
+      console.log(`  WARNING: couchdb_progress last updated ${Math.round(age / 1000)}s ago — couch2pg may be stalled`);
+    }
+  });
+
+  after(async () => {
+    for (const id of testDocIds) await couchDelete(id).catch(() => {});
+    if (pool) await pool.end();
+  });
+
+  // ── Basic replication ──────────────────────────────────────────────
 
   describe('basic replication', () => {
-    const testDocs = [];
+    it('should replicate a single document', async () => {
+      const docId = stamp();
+      testDocIds.push(docId);
+      await couchPost({ _id: docId, type: 'data_record', form: 'test_form',
+        fields: { patient_name: 'Test Patient' }, reported_date: Date.now() });
 
-    afterEach(async () => {
-      if (testDocs.length) {
-        await utils.deleteDocs(testDocs.map(d => d._id)).catch(() => {});
-        testDocs.length = 0;
-      }
-    });
-
-    it('should replicate a single document', async function () {
-      this.timeout(60000);
-      const doc = {
-        _id: `sync-test-${uuid()}`,
-        type: 'data_record',
-        form: 'test_form',
-        fields: { patient_name: 'Test Patient' },
-        reported_date: Date.now(),
-      };
-      testDocs.push(doc);
-      await utils.saveDoc(doc);
-
-      const pgDoc = await utils.waitForDocInPostgres(doc._id, 45000);
-      expect(pgDoc).to.exist;
-      expect(pgDoc._id).to.equal(doc._id);
+      const pgDoc = await waitForDoc(docId);
+      expect(pgDoc._id).to.equal(docId);
       expect(pgDoc.type).to.equal('data_record');
       expect(pgDoc.fields.patient_name).to.equal('Test Patient');
     });
 
-    it('should replicate a batch of documents', async function () {
-      this.timeout(60000);
-      const docs = Array.from({ length: 10 }, (_, i) => ({
-        _id: `sync-batch-${uuid()}`,
-        type: 'data_record',
-        form: 'batch_test',
-        fields: { index: i },
-        reported_date: Date.now(),
+    it('should replicate a batch of documents', async () => {
+      const docs = Array.from({ length: 5 }, (_, i) => ({
+        _id: stamp(), type: 'data_record', form: 'batch_test',
+        fields: { index: i }, reported_date: Date.now(),
       }));
-      testDocs.push(...docs);
-      await utils.saveDocs(docs);
+      testDocIds.push(...docs.map(d => d._id));
+      await couchBulkDocs(docs);
 
-      // All docs should appear in PostgreSQL
       for (const doc of docs) {
-        const pgDoc = await utils.waitForDocInPostgres(doc._id, 45000);
-        expect(pgDoc).to.exist;
+        const pgDoc = await waitForDoc(doc._id);
         expect(pgDoc.fields.index).to.equal(doc.fields.index);
       }
     });
 
-    it('should replicate document updates', async function () {
-      this.timeout(60000);
-      const doc = {
-        _id: `sync-update-${uuid()}`,
-        type: 'data_record',
-        fields: { status: 'draft' },
-        reported_date: Date.now(),
-      };
-      testDocs.push(doc);
-      await utils.saveDoc(doc);
+    it('should replicate document updates', async () => {
+      const docId = stamp();
+      testDocIds.push(docId);
+      await couchPost({ _id: docId, type: 'data_record', fields: { status: 'draft' }, reported_date: Date.now() });
+      await waitForDoc(docId);
 
-      // Wait for initial replication
-      await utils.waitForDocInPostgres(doc._id, 45000);
+      // Update via CouchDB
+      const saved = await couchGet(docId);
+      saved.fields.status = 'submitted';
+      await couchFetch(`/${COUCH_DB}/${encodeURIComponent(docId)}`, {
+        method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(saved),
+      });
 
-      // Update the document
-      const savedDoc = await utils.getDoc(doc._id);
-      savedDoc.fields.status = 'submitted';
-      await utils.saveDoc(savedDoc);
-
-      // Wait for the update to propagate
-      const maxWait = 30000;
+      // Wait for update to propagate
       const start = Date.now();
-      let found = false;
-      while (Date.now() - start < maxWait) {
-        const result = await utils.pgQuery(
-          `SELECT doc FROM ${utils.pgDocsTable()} WHERE _id = $1`,
-          [doc._id]
-        );
-        if (result.rows.length > 0 && result.rows[0].doc.fields?.status === 'submitted') {
-          found = true;
-          break;
-        }
-        await new Promise(resolve => setTimeout(resolve, 500));
+      while (Date.now() - start < 30000) {
+        const { rows } = await pool.query(`SELECT doc FROM ${DOCS_TABLE} WHERE _id = $1`, [docId]);
+        if (rows.length > 0 && rows[0].doc.fields?.status === 'submitted') break;
+        await new Promise(r => setTimeout(r, 500));
       }
-      expect(found).to.be.true;
+      const { rows } = await pool.query(`SELECT doc FROM ${DOCS_TABLE} WHERE _id = $1`, [docId]);
+      expect(rows[0].doc.fields.status).to.equal('submitted');
     });
 
-    it('should handle document deletion', async function () {
-      this.timeout(60000);
-      const doc = {
-        _id: `sync-delete-${uuid()}`,
-        type: 'data_record',
-        fields: { temp: true },
-        reported_date: Date.now(),
-      };
-      await utils.saveDoc(doc);
+    it('should handle document deletion', async () => {
+      const docId = stamp();
+      testDocIds.push(docId);
+      await couchPost({ _id: docId, type: 'data_record', fields: { temp: true }, reported_date: Date.now() });
+      await waitForDoc(docId);
 
-      // Wait for initial replication
-      await utils.waitForDocInPostgres(doc._id, 45000);
+      await couchDelete(docId);
+      await waitForDeleted(docId);
 
-      // Delete the document
-      await utils.deleteDoc(doc._id);
-
-      // cht-sync marks deleted docs with _deleted=true in the row AND
-      // stores a minimal {_id, _rev, _deleted: true} in the doc JSONB column.
-      // The row is NOT removed — it stays for downstream consumers.
-      const maxWait = 30000;
-      const start = Date.now();
-      let handled = false;
-      while (Date.now() - start < maxWait) {
-        const result = await utils.pgQuery(
-          `SELECT _deleted, doc FROM ${utils.pgDocsTable()} WHERE _id = $1`,
-          [doc._id]
-        );
-        if (result.rows.length > 0 && result.rows[0]._deleted === true) {
-          handled = true;
-          break;
-        }
-        await new Promise(resolve => setTimeout(resolve, 500));
-      }
-      expect(handled).to.be.true;
+      // Verify: row stays with _deleted=true (not physically removed)
+      const { rows } = await pool.query(`SELECT _deleted FROM ${DOCS_TABLE} WHERE _id = $1`, [docId]);
+      expect(rows).to.have.length(1);
+      expect(rows[0]._deleted).to.be.true;
     });
   });
 
+  // ── Schema correctness ──────────────────────────────────────────────
+
   describe('schema correctness', () => {
     it('should have correct cht-sync couchdb table schema', async () => {
-      // cht-sync creates: v1.couchdb(_id VARCHAR PK, saved_timestamp, _deleted BOOLEAN, source VARCHAR, doc JSONB)
-      const pgSchema = process.env.POSTGRES_SCHEMA || 'v1';
-      const pgTable = process.env.POSTGRES_TABLE || 'couchdb';
-      const result = await utils.pgQuery(`
+      const result = await pool.query(`
         SELECT column_name, data_type
         FROM information_schema.columns
-        WHERE table_schema = $1 AND table_name = $2
+        WHERE table_schema = $1 AND table_name = 'couchdb'
         ORDER BY ordinal_position
-      `, [pgSchema, pgTable]);
+      `, [PG_SCHEMA]);
 
-      const columns = result.rows.reduce((acc, row) => {
-        acc[row.column_name] = row.data_type;
-        return acc;
-      }, {});
-
-      // Exact cht-sync schema columns
+      const columns = result.rows.reduce((acc, row) => { acc[row.column_name] = row.data_type; return acc; }, {});
       expect(columns).to.have.property('_id');
-      expect(columns._id).to.include('character'); // VARCHAR
+      expect(columns._id).to.include('character');
       expect(columns).to.have.property('saved_timestamp');
       expect(columns).to.have.property('_deleted');
       expect(columns).to.have.property('source');
@@ -173,222 +198,169 @@ describe('cht-sync bridge: CouchDB → PostgreSQL', () => {
     });
 
     it('should have couchdb_progress table for sync tracking', async () => {
-      const pgSchema = process.env.POSTGRES_SCHEMA || 'v1';
-      const result = await utils.pgQuery(`
+      const result = await pool.query(`
         SELECT column_name, data_type
         FROM information_schema.columns
         WHERE table_schema = $1 AND table_name = 'couchdb_progress'
         ORDER BY ordinal_position
-      `, [pgSchema]);
+      `, [PG_SCHEMA]);
 
-      const columns = result.rows.reduce((acc, row) => {
-        acc[row.column_name] = row.data_type;
-        return acc;
-      }, {});
-
+      const columns = result.rows.reduce((acc, row) => { acc[row.column_name] = row.data_type; return acc; }, {});
       expect(columns).to.have.property('seq');
       expect(columns).to.have.property('pending');
       expect(columns).to.have.property('updated_at');
       expect(columns).to.have.property('source');
     });
 
-    it('should store the full CouchDB document in JSONB', async function () {
-      this.timeout(60000);
-      const doc = {
-        _id: `sync-schema-${uuid()}`,
-        type: 'data_record',
-        form: 'schema_test',
+    it('should store the full CouchDB document in JSONB', async () => {
+      const docId = stamp();
+      testDocIds.push(docId);
+      await couchPost({
+        _id: docId, type: 'data_record', form: 'schema_test',
         fields: {
-          nested: {
-            deeply: {
-              value: 'preserved'
-            }
-          },
+          nested: { deeply: { value: 'preserved' } },
           array_field: [1, 2, 3],
           boolean_field: true,
           number_field: 42,
         },
         reported_date: Date.now(),
-      };
-      await utils.saveDoc(doc);
+      });
 
-      const pgDoc = await utils.waitForDocInPostgres(doc._id, 45000);
-
-      // Verify deep structure is preserved
+      const pgDoc = await waitForDoc(docId);
       expect(pgDoc.fields.nested.deeply.value).to.equal('preserved');
       expect(pgDoc.fields.array_field).to.deep.equal([1, 2, 3]);
       expect(pgDoc.fields.boolean_field).to.be.true;
       expect(pgDoc.fields.number_field).to.equal(42);
-
-      // Clean up
-      await utils.deleteDoc(doc._id);
     });
 
-    it('should include metadata columns', async function () {
-      this.timeout(60000);
-      const doc = {
-        _id: `sync-meta-${uuid()}`,
-        type: 'data_record',
-        fields: {},
-        reported_date: Date.now(),
-      };
-      await utils.saveDoc(doc);
+    it('should include metadata columns', async () => {
+      const docId = stamp();
+      testDocIds.push(docId);
+      await couchPost({ _id: docId, type: 'data_record', fields: {}, reported_date: Date.now() });
+      await waitForDoc(docId);
 
-      await utils.waitForDocInPostgres(doc._id, 45000);
-
-      // cht-sync schema: _id, saved_timestamp, _deleted, source, doc
-      const row = await utils.getPostgresRawRow(doc._id);
-      expect(row).to.exist;
-      expect(row._id).to.equal(doc._id);
+      const { rows } = await pool.query(
+        `SELECT _id, saved_timestamp, _deleted, source, doc FROM ${DOCS_TABLE} WHERE _id = $1`, [docId]
+      );
+      expect(rows).to.have.length(1);
+      const row = rows[0];
+      expect(row._id).to.equal(docId);
       expect(row.saved_timestamp).to.exist;
       expect(row._deleted).to.satisfy(v => v === false || v === null);
       expect(row.source).to.be.a('string').that.is.not.empty;
-      // doc column should contain the full JSONB document
       expect(row.doc).to.be.an('object');
-      expect(row.doc._id).to.equal(doc._id);
-
-      // Clean up
-      await utils.deleteDoc(doc._id);
+      expect(row.doc._id).to.equal(docId);
     });
   });
 
+  // ── CHT document type replication ──────────────────────────────────
+
   describe('CHT document type replication', () => {
-    const hierarchy = [];
-    const docs = [];
+    let districtId, hcId, clinicId, personId, reportId, taskId, targetId;
 
-    before(async function () {
-      this.timeout(60000);
+    before(async () => {
+      districtId = stamp();
+      hcId = stamp();
+      clinicId = stamp();
+      personId = stamp();
+      reportId = stamp();
+      taskId = stamp();
+      targetId = stamp();
+      testDocIds.push(districtId, hcId, clinicId, personId, reportId, taskId, targetId);
 
-      // Create a minimal hierarchy
-      const district = {
-        _id: `sync-district-${uuid()}`,
-        type: 'district_hospital',
-        name: 'Sync Test District',
-        reported_date: Date.now(),
-      };
-      const healthCenter = {
-        _id: `sync-hc-${uuid()}`,
-        type: 'health_center',
-        name: 'Sync Test HC',
-        parent: { _id: district._id },
-        reported_date: Date.now(),
-      };
-      const clinic = {
-        _id: `sync-clinic-${uuid()}`,
-        type: 'clinic',
-        name: 'Sync Test Clinic',
-        parent: { _id: healthCenter._id, parent: { _id: district._id } },
-        reported_date: Date.now(),
-      };
-      const person = personFactory.build({
-        _id: `sync-person-${uuid()}`,
-        name: 'Sync Test Person',
-        parent: {
-          _id: clinic._id,
-          parent: { _id: healthCenter._id, parent: { _id: district._id } },
-        },
-      });
-
-      hierarchy.push(district, healthCenter, clinic, person);
-      await utils.saveDocs(hierarchy);
-
-      // Create various document types
-      const report = {
-        _id: `sync-report-${uuid()}`,
-        type: 'data_record',
-        form: 'pregnancy',
-        fields: { patient_id: person._id },
-        contact: { _id: person._id },
-        reported_date: Date.now(),
-      };
-
-      const task = {
-        _id: `sync-task-${uuid()}`,
-        type: 'task',
-        owner: person._id,
-        state: 'Ready',
-        emission: { _id: `sync-task-emission-${uuid()}` },
-        reported_date: Date.now(),
-      };
-
-      const target = {
-        _id: `sync-target-${uuid()}`,
-        type: 'target',
-        owner: person._id,
-        reporting_period: '2026-04',
-        targets: [{ id: 'pregnancies', value: { pass: 1, total: 1 } }],
-        reported_date: Date.now(),
-      };
-
-      docs.push(report, task, target);
-      await utils.saveDocs(docs);
+      const docs = [
+        { _id: districtId, type: 'district_hospital', name: 'Sync District', reported_date: Date.now() },
+        { _id: hcId, type: 'health_center', name: 'Sync HC', parent: { _id: districtId }, reported_date: Date.now() },
+        { _id: clinicId, type: 'clinic', name: 'Sync Clinic', parent: { _id: hcId }, reported_date: Date.now() },
+        { _id: personId, type: 'person', name: 'Sync Person', parent: { _id: clinicId }, reported_date: Date.now() },
+        { _id: reportId, type: 'data_record', form: 'pregnancy', fields: { patient_id: personId },
+          contact: { _id: personId }, reported_date: Date.now() },
+        { _id: taskId, type: 'task', owner: personId, state: 'Ready',
+          emission: { _id: `emission-${taskId}` }, reported_date: Date.now() },
+        { _id: targetId, type: 'target', owner: personId, reporting_period: '2026-04',
+          targets: [{ id: 'pregnancies', value: { pass: 1, total: 1 } }], reported_date: Date.now() },
+      ];
+      await couchBulkDocs(docs);
+      for (const doc of docs) await waitForDoc(doc._id);
     });
 
-    after(async () => {
-      const allIds = [...hierarchy, ...docs].map(d => d._id);
-      await utils.deleteDocs(allIds).catch(() => {});
-    });
-
-    it('should replicate contact documents (person, clinic, health_center, district)', async function () {
-      this.timeout(60000);
-      for (const contact of hierarchy) {
-        const pgDoc = await utils.waitForDocInPostgres(contact._id, 45000);
-        expect(pgDoc).to.exist;
-        expect(pgDoc.name).to.equal(contact.name);
+    it('should replicate contact documents (person, clinic, health_center, district)', async () => {
+      for (const [id, name] of [[districtId, 'Sync District'], [hcId, 'Sync HC'], [clinicId, 'Sync Clinic'], [personId, 'Sync Person']]) {
+        const { rows } = await pool.query(`SELECT doc FROM ${DOCS_TABLE} WHERE _id = $1`, [id]);
+        expect(rows).to.have.length(1);
+        expect(rows[0].doc.name).to.equal(name);
       }
     });
 
-    it('should replicate report documents (data_record)', async function () {
-      this.timeout(60000);
-      const report = docs.find(d => d.type === 'data_record');
-      const pgDoc = await utils.waitForDocInPostgres(report._id, 45000);
-      expect(pgDoc).to.exist;
-      expect(pgDoc.type).to.equal('data_record');
-      expect(pgDoc.form).to.equal('pregnancy');
+    it('should replicate report documents (data_record)', async () => {
+      const { rows } = await pool.query(`SELECT doc FROM ${DOCS_TABLE} WHERE _id = $1`, [reportId]);
+      expect(rows).to.have.length(1);
+      expect(rows[0].doc.type).to.equal('data_record');
+      expect(rows[0].doc.form).to.equal('pregnancy');
     });
 
-    it('should replicate task documents', async function () {
-      this.timeout(60000);
-      const task = docs.find(d => d.type === 'task');
-      const pgDoc = await utils.waitForDocInPostgres(task._id, 45000);
-      expect(pgDoc).to.exist;
-      expect(pgDoc.type).to.equal('task');
-      expect(pgDoc.state).to.equal('Ready');
+    it('should replicate task documents', async () => {
+      const { rows } = await pool.query(`SELECT doc FROM ${DOCS_TABLE} WHERE _id = $1`, [taskId]);
+      expect(rows).to.have.length(1);
+      expect(rows[0].doc.type).to.equal('task');
+      expect(rows[0].doc.state).to.equal('Ready');
     });
 
-    it('should replicate target documents', async function () {
-      this.timeout(60000);
-      const target = docs.find(d => d.type === 'target');
-      const pgDoc = await utils.waitForDocInPostgres(target._id, 45000);
-      expect(pgDoc).to.exist;
-      expect(pgDoc.type).to.equal('target');
-      expect(pgDoc.reporting_period).to.equal('2026-04');
+    it('should replicate target documents', async () => {
+      const { rows } = await pool.query(`SELECT doc FROM ${DOCS_TABLE} WHERE _id = $1`, [targetId]);
+      expect(rows).to.have.length(1);
+      expect(rows[0].doc.type).to.equal('target');
+      expect(rows[0].doc.reporting_period).to.equal('2026-04');
     });
   });
 
+  // ── Replication latency ────────────────────────────────────────────
+
   describe('replication latency', () => {
-    it('should replicate within acceptable latency (<30s with default config)', async function () {
-      this.timeout(60000);
-      const doc = {
-        _id: `sync-latency-${uuid()}`,
-        type: 'data_record',
-        fields: { latency_test: true },
-        reported_date: Date.now(),
-      };
+    it('should replicate within acceptable latency (<30s)', async () => {
+      const docId = stamp();
+      testDocIds.push(docId);
 
       const startTime = Date.now();
-      await utils.saveDoc(doc);
-      await utils.waitForDocInPostgres(doc._id, 45000);
+      await couchPost({ _id: docId, type: 'data_record', fields: { latency_test: true }, reported_date: Date.now() });
+      await waitForDoc(docId);
       const latencyMs = Date.now() - startTime;
 
-      console.log(`cht-sync replication latency: ${latencyMs}ms`);
+      console.log(`  cht-sync replication latency: ${latencyMs}ms`);
+      expect(latencyMs).to.be.below(30000);
+    });
+  });
 
-      // With DATAEMON_INTERVAL tuned down (60-300s), latency should be well under 30s
-      // In CI with default config, it may be higher
-      expect(latencyMs).to.be.below(45000);
+  // ── Sync progress tracking ─────────────────────────────────────────
 
-      // Clean up
-      await utils.deleteDoc(doc._id);
+  describe('sync progress tracking', () => {
+    it('should have active sync progress', async () => {
+      const { rows } = await pool.query(
+        `SELECT source, pending, updated_at FROM "${PG_SCHEMA}"."couchdb_progress"`
+      );
+      expect(rows).to.have.length.at.least(1);
+      expect(rows[0].source).to.be.a('string').that.is.not.empty;
+      console.log(`  Source: ${rows[0].source}, pending: ${rows[0].pending}`);
+    });
+
+    it('should advance seq after new documents', async () => {
+      // Get current seq
+      const { rows: before } = await pool.query(
+        `SELECT seq FROM "${PG_SCHEMA}"."couchdb_progress" LIMIT 1`
+      );
+      const seqBefore = before[0].seq;
+
+      // Write a document to CouchDB
+      const docId = stamp();
+      testDocIds.push(docId);
+      await couchPost({ _id: docId, type: 'data_record', fields: {}, reported_date: Date.now() });
+      await waitForDoc(docId);
+
+      // Seq should have advanced
+      const { rows: after } = await pool.query(
+        `SELECT seq FROM "${PG_SCHEMA}"."couchdb_progress" LIMIT 1`
+      );
+      expect(after[0].seq).to.not.equal(seqBefore);
     });
   });
 });

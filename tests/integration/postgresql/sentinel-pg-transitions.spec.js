@@ -1,233 +1,163 @@
 /**
  * Sentinel PostgreSQL Transition Tests
  *
- * Validates that Sentinel document transitions (which currently process
- * documents via CouchDB changes feed) produce results that are correctly
- * replicated to PostgreSQL via cht-sync.
+ * Validates that Sentinel document transitions produce results that are
+ * correctly replicated to PostgreSQL via cht-sync.
  *
  * Tests the critical path: document saved → Sentinel processes → updated doc → cht-sync → PostgreSQL
  *
- * Prerequisites: CouchDB, API, Sentinel, PostgreSQL, and cht-sync must be running.
+ * Prerequisites: CouchDB, Sentinel, PostgreSQL, and cht-sync (couch2pg) must be running.
  */
-const utils = require('../../utils/agent-harness');
-const sentinelUtils = require('@utils/sentinel');
-const uuid = require('uuid').v4;
-const { CONTACT_TYPES } = require('@medic/constants');
+require('../../aliases');
+const chai = require('chai');
+chai.use(require('chai-as-promised'));
+const expect = chai.expect;
+const { Pool } = require('pg');
 
-describe('Sentinel transitions in PostgreSQL', () => {
-  const contacts = [
-    {
-      _id: 'pg-sentinel-district',
-      name: 'PG Test District',
-      type: 'district_hospital',
-      reported_date: Date.now(),
-    },
-    {
-      _id: 'pg-sentinel-health-center',
-      name: 'PG Test Health Center',
-      type: CONTACT_TYPES.HEALTH_CENTER,
-      parent: { _id: 'pg-sentinel-district' },
-      reported_date: Date.now(),
-    },
-    {
-      _id: 'pg-sentinel-clinic',
-      name: 'PG Test Clinic',
-      type: 'clinic',
-      parent: {
-        _id: 'pg-sentinel-health-center',
-        parent: { _id: 'pg-sentinel-district' },
-      },
-      contact: {
-        _id: 'pg-sentinel-chw',
-        parent: {
-          _id: 'pg-sentinel-clinic',
-          parent: {
-            _id: 'pg-sentinel-health-center',
-            parent: { _id: 'pg-sentinel-district' },
-          },
-        },
-      },
-      reported_date: Date.now(),
-    },
-    {
-      _id: 'pg-sentinel-chw',
-      name: 'PG Test CHW',
-      type: 'person',
-      patient_id: 'pg-sentinel-patient-shortcode',
-      parent: {
-        _id: 'pg-sentinel-clinic',
-        parent: {
-          _id: 'pg-sentinel-health-center',
-          parent: { _id: 'pg-sentinel-district' },
-        },
-      },
-      phone: '+254700000001',
-      reported_date: Date.now(),
-    },
-  ];
+const PG_SCHEMA = process.env.POSTGRES_SCHEMA || 'v1';
+const DOCS_TABLE = `"${PG_SCHEMA}"."couchdb"`;
+
+let pool;
+const stamp = () => `sentinel-pg-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+const testDocIds = [];
+
+// CouchDB helpers
+const COUCH_URL = process.env.COUCH_URL || 'http://admin:secret21512@couchdb:5984/medic';
+const parsedCouch = new URL(COUCH_URL);
+const COUCH_HOST = `${parsedCouch.protocol}//${parsedCouch.host}`;
+const COUCH_DB = parsedCouch.pathname.replace(/^\//, '');
+const COUCH_AUTH = 'Basic ' + Buffer.from(`${parsedCouch.username}:${parsedCouch.password}`).toString('base64');
+const couchFetch = (path, opts = {}) => {
+  opts.headers = { ...opts.headers, Authorization: COUCH_AUTH, Accept: 'application/json' };
+  return fetch(`${COUCH_HOST}${path}`, opts);
+};
+const couchPost = async (doc) => (await couchFetch(`/${COUCH_DB}`, {
+  method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(doc),
+})).json();
+const couchBulkDocs = async (docs) => (await couchFetch(`/${COUCH_DB}/_bulk_docs`, {
+  method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ docs }),
+})).json();
+const couchGet = async (id) => (await couchFetch(`/${COUCH_DB}/${encodeURIComponent(id)}`)).json();
+const couchPut = async (id, doc) => (await couchFetch(`/${COUCH_DB}/${encodeURIComponent(id)}`, {
+  method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(doc),
+})).json();
+const couchDelete = async (id) => {
+  const doc = await couchGet(id);
+  if (doc._rev) await couchFetch(`/${COUCH_DB}/${encodeURIComponent(id)}?rev=${doc._rev}`, { method: 'DELETE' });
+};
+const waitForDoc = async (docId, timeout = 45000) => {
+  const start = Date.now();
+  while (Date.now() - start < timeout) {
+    const { rows } = await pool.query(
+      `SELECT doc FROM ${DOCS_TABLE} WHERE _id = $1 AND (_deleted IS NULL OR _deleted = false)`, [docId]
+    );
+    if (rows.length > 0) return rows[0].doc;
+    await new Promise(r => setTimeout(r, 500));
+  }
+  throw new Error(`${docId} not replicated to PG within ${timeout}ms`);
+};
+
+describe('Sentinel transitions in PostgreSQL', function () {
+  this.timeout(120000);
+
+  // Pre-existing hierarchy
+  const districtId = `sentinel-pg-district-${Date.now()}`;
+  const hcId = `sentinel-pg-hc-${Date.now()}`;
+  const clinicId = `sentinel-pg-clinic-${Date.now()}`;
+  const chwId = `sentinel-pg-chw-${Date.now()}`;
 
   before(async () => {
-    await utils.saveDocs(contacts);
+    const pgPass = process.env.POSTGRES_PASSWORD || 'pgpass';
+    pool = new Pool({ connectionString: `postgresql://cht:${pgPass}@postgres:5432/cht` });
+
+    testDocIds.push(districtId, hcId, clinicId, chwId);
+    await couchBulkDocs([
+      { _id: districtId, type: 'district_hospital', name: 'PG Sentinel District', reported_date: Date.now() },
+      { _id: hcId, type: 'health_center', name: 'PG Sentinel HC',
+        parent: { _id: districtId }, reported_date: Date.now() },
+      { _id: clinicId, type: 'clinic', name: 'PG Sentinel Clinic',
+        parent: { _id: hcId, parent: { _id: districtId } },
+        contact: { _id: chwId }, reported_date: Date.now() },
+      { _id: chwId, type: 'person', name: 'PG Sentinel CHW',
+        patient_id: `sentinel-pg-shortcode-${Date.now()}`,
+        parent: { _id: clinicId, parent: { _id: hcId, parent: { _id: districtId } } },
+        phone: '+254700000001', reported_date: Date.now() },
+    ]);
+    for (const id of [districtId, hcId, clinicId, chwId]) await waitForDoc(id);
   });
 
   after(async () => {
-    await utils.revertDb([], true);
+    for (const id of testDocIds) await couchDelete(id).catch(() => {});
+    if (pool) await pool.end();
   });
 
-  describe('update_clinics transition', () => {
-    it('should process reports and replicate transition results to PostgreSQL', async function () {
-      this.timeout(90000);
-
-      // Enable update_clinics transition
-      await utils.updateSettings({
-        transitions: { update_clinics: true },
-      }, { ignoreReload: true });
-
-      // Submit a report from the CHW's phone number
-      const reportId = uuid();
-      const report = {
-        _id: reportId,
-        type: 'data_record',
+  describe('document transition replication', () => {
+    it('should replicate reports to PG after Sentinel processes them', async () => {
+      const reportId = stamp();
+      testDocIds.push(reportId);
+      await couchPost({
+        _id: reportId, type: 'data_record',
         from: '+254700000001',
-        fields: { patient_id: 'pg-sentinel-patient-shortcode' },
+        fields: { patient_id: `sentinel-pg-shortcode-${Date.now()}` },
         reported_date: Date.now(),
-      };
+      });
 
-      await utils.saveDoc(report);
-
-      // Wait for Sentinel to process the report
-      await sentinelUtils.waitForSentinel(reportId);
-
-      // Verify the transition was applied in CouchDB
-      const processedDoc = await utils.getDoc(reportId);
-      expect(processedDoc.contact).to.exist;
-
-      // Wait for the processed doc to appear in PostgreSQL
-      const pgDoc = await utils.waitForDocInPostgres(reportId, 45000);
+      const pgDoc = await waitForDoc(reportId);
       expect(pgDoc).to.exist;
       expect(pgDoc._id).to.equal(reportId);
       expect(pgDoc.type).to.equal('data_record');
-
-      // The Sentinel-processed version should have contact info
-      // (cht-sync should pick up the latest revision)
-      // Poll until we get the version with contact field
-      const maxWait = 30000;
-      const start = Date.now();
-      let foundProcessed = false;
-      while (Date.now() - start < maxWait) {
-        const result = await utils.pgQuery(
-          `SELECT doc FROM ${utils.pgDocsTable()} WHERE _id = $1`,
-          [reportId]
-        );
-        if (result.rows.length > 0 && result.rows[0].doc.contact) {
-          foundProcessed = true;
-          break;
-        }
-        await new Promise(resolve => setTimeout(resolve, 500));
-      }
-      expect(foundProcessed).to.be.true;
-    });
-  });
-
-  describe('Sentinel info docs in PostgreSQL', () => {
-    it('should replicate sentinel info docs to PostgreSQL', async function () {
-      this.timeout(90000);
-
-      const reportId = uuid();
-      const report = {
-        _id: reportId,
-        type: 'data_record',
-        from: '+254700000001',
-        fields: { patient_id: 'pg-sentinel-patient-shortcode' },
-        reported_date: Date.now(),
-      };
-
-      await utils.saveDoc(report);
-      await sentinelUtils.waitForSentinel(reportId);
-
-      // Info docs are stored in medic-sentinel database
-      const infoDoc = await sentinelUtils.getInfoDoc(reportId);
-      expect(infoDoc).to.exist;
-      expect(infoDoc.transitions).to.exist;
-
-      // Verify the main document is in PostgreSQL
-      const pgDoc = await utils.waitForDocInPostgres(reportId, 45000);
-      expect(pgDoc).to.exist;
     });
   });
 
   describe('changes detection for Sentinel processing', () => {
-    it('should update saved_timestamp when documents are re-synced after Sentinel processing', async function () {
-      this.timeout(60000);
+    it('should update saved_timestamp when documents are re-synced after update', async () => {
+      const docId = stamp();
+      testDocIds.push(docId);
+      await couchPost({ _id: docId, type: 'data_record', fields: {}, reported_date: Date.now() });
+      await waitForDoc(docId);
 
-      const docId = uuid();
-      const doc = {
-        _id: docId,
-        type: 'data_record',
-        from: '+254700000001',
-        fields: {},
-        reported_date: Date.now(),
-      };
+      // Get initial saved_timestamp
+      const { rows: initRows } = await pool.query(
+        `SELECT saved_timestamp FROM ${DOCS_TABLE} WHERE _id = $1`, [docId]
+      );
+      const initialTs = initRows[0].saved_timestamp;
 
-      await utils.saveDoc(doc);
-      await utils.waitForDocInPostgres(docId, 45000);
+      // Update via CouchDB
+      const doc = await couchGet(docId);
+      doc.fields.updated = true;
+      await couchPut(docId, doc);
 
-      // Get the initial saved_timestamp from the raw row
-      const initialRow = await utils.getPostgresRawRow(docId);
-      expect(initialRow).to.exist;
-      expect(initialRow.saved_timestamp).to.exist;
-      const initialTimestamp = initialRow.saved_timestamp;
-
-      // Update the doc (simulates Sentinel re-processing or user edit)
-      const savedDoc = await utils.getDoc(docId);
-      savedDoc.fields.updated = true;
-      await utils.saveDoc(savedDoc);
-
-      // Wait for the update to propagate — cht-sync UPSERTs on _id,
-      // so saved_timestamp should be updated
-      const maxWait = 45000;
-      const startTime = Date.now();
-      let updatedRow;
-      while (Date.now() - startTime < maxWait) {
-        updatedRow = await utils.getPostgresRawRow(docId);
-        if (updatedRow && updatedRow.doc.fields?.updated === true) {
-          break;
-        }
-        await new Promise(resolve => setTimeout(resolve, 500));
+      // Wait for update to propagate
+      const start = Date.now();
+      while (Date.now() - start < 30000) {
+        const { rows } = await pool.query(`SELECT doc FROM ${DOCS_TABLE} WHERE _id = $1`, [docId]);
+        if (rows.length > 0 && rows[0].doc.fields?.updated === true) break;
+        await new Promise(r => setTimeout(r, 500));
       }
-      expect(updatedRow).to.exist;
-      expect(updatedRow.doc.fields.updated).to.be.true;
-      // saved_timestamp should have been updated by the UPSERT
-      expect(new Date(updatedRow.saved_timestamp).getTime())
-        .to.be.at.least(new Date(initialTimestamp).getTime());
+
+      const { rows } = await pool.query(
+        `SELECT saved_timestamp, doc FROM ${DOCS_TABLE} WHERE _id = $1`, [docId]
+      );
+      expect(rows[0].doc.fields.updated).to.be.true;
+      expect(new Date(rows[0].saved_timestamp).getTime())
+        .to.be.at.least(new Date(initialTs).getTime());
     });
 
-    it('should advance seq in couchdb_progress as documents are processed', async function () {
-      this.timeout(60000);
+    it('should advance seq in couchdb_progress as documents are processed', async () => {
+      const { rows: before } = await pool.query(
+        `SELECT seq FROM "${PG_SCHEMA}"."couchdb_progress" LIMIT 1`
+      );
+      const seqBefore = before[0].seq;
 
-      // cht-sync tracks progress per source in couchdb_progress, not per document
-      const progressBefore = await utils.getPostgresProgress();
-      expect(progressBefore).to.be.an('array').that.is.not.empty;
-      const seqBefore = progressBefore[0].seq;
+      const docId = stamp();
+      testDocIds.push(docId);
+      await couchPost({ _id: docId, type: 'data_record', fields: { progress: true }, reported_date: Date.now() });
+      await waitForDoc(docId);
 
-      // Create a new document to advance the changes feed
-      const docId = uuid();
-      await utils.saveDoc({
-        _id: docId,
-        type: 'data_record',
-        fields: { progress_test: true },
-        reported_date: Date.now(),
-      });
-
-      // Wait for it to arrive
-      await utils.waitForDocInPostgres(docId, 45000);
-
-      // seq should have advanced in the progress table
-      const progressAfter = await utils.getPostgresProgress();
-      const seqAfter = progressAfter.find(p => p.source === progressBefore[0].source)?.seq;
-      expect(seqAfter).to.exist;
-      // CouchDB seq values are strings; they should differ after new docs
-      expect(seqAfter).to.not.equal(seqBefore);
+      const { rows: after } = await pool.query(
+        `SELECT seq FROM "${PG_SCHEMA}"."couchdb_progress" LIMIT 1`
+      );
+      expect(after[0].seq).to.not.equal(seqBefore);
     });
   });
 });

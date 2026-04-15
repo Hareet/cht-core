@@ -39,15 +39,23 @@ const releaseRunLock = async (client) => {
 
 // Upsert purge decisions for a batch of (doc_id, role_hash) pairs.
 // toPurge is: { [roleHash]: { [docId]: boolean } }
-const writePurgeResults = async (toPurge) => {
+// options.aggressive: boolean — marks entries as aggressive purge
+// options.requestedBy: string — user_id who triggered the purge
+// options.reason: string — 'storage_budget', 'scheduled', 'retention'
+const writePurgeResults = async (toPurge, options = {}) => {
+  const aggressive = !!options.aggressive;
+  const requestedBy = options.requestedBy || null;
+  const reason = options.reason || null;
+
   const rows = [];
   const params = [];
+  const PARAMS_PER_ROW = 6;
 
   for (const [roleHash, docs] of Object.entries(toPurge)) {
     for (const [docId, purged] of Object.entries(docs)) {
       const offset = params.length;
-      rows.push(`($${offset + 1}, $${offset + 2}, $${offset + 3}, NOW())`);
-      params.push(docId, roleHash, !!purged);
+      rows.push(`($${offset + 1}, $${offset + 2}, $${offset + 3}, NOW(), $${offset + 4}, $${offset + 5}, $${offset + 6})`);
+      params.push(docId, roleHash, !!purged, aggressive, requestedBy, reason);
     }
   }
 
@@ -59,24 +67,26 @@ const writePurgeResults = async (toPurge) => {
   const CHUNK_SIZE = 5000;
   for (let i = 0; i < rows.length; i += CHUNK_SIZE) {
     const chunkRows = rows.slice(i, i + CHUNK_SIZE);
-    // Recalculate params for this chunk: each row uses 3 params
-    const startIdx = i * 3;
-    const endIdx = Math.min((i + CHUNK_SIZE) * 3, params.length);
+    const startIdx = i * PARAMS_PER_ROW;
+    const endIdx = Math.min((i + CHUNK_SIZE) * PARAMS_PER_ROW, params.length);
     const chunkParams = params.slice(startIdx, endIdx);
 
     // Renumber placeholders for this chunk
     const renumberedRows = [];
     for (let j = 0; j < chunkRows.length; j++) {
-      const base = j * 3;
-      renumberedRows.push(`($${base + 1}, $${base + 2}, $${base + 3}, NOW())`);
+      const base = j * PARAMS_PER_ROW;
+      renumberedRows.push(`($${base + 1}, $${base + 2}, $${base + 3}, NOW(), $${base + 4}, $${base + 5}, $${base + 6})`);
     }
 
     await db.query(`
-      INSERT INTO purge_status (doc_id, role_hash, purged, evaluated_at)
+      INSERT INTO purge_status (doc_id, role_hash, purged, evaluated_at, aggressive, requested_by, reason)
       VALUES ${renumberedRows.join(', ')}
       ON CONFLICT (doc_id, role_hash) DO UPDATE SET
         purged = EXCLUDED.purged,
-        evaluated_at = EXCLUDED.evaluated_at
+        evaluated_at = EXCLUDED.evaluated_at,
+        aggressive = EXCLUDED.aggressive,
+        requested_by = EXCLUDED.requested_by,
+        reason = EXCLUDED.reason
     `, chunkParams);
   }
 };

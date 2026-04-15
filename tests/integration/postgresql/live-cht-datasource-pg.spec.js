@@ -1,8 +1,9 @@
 /**
- * Live Integration Tests: cht-datasource PostgreSQL Adapter (Agent 1)
+ * Live Integration Tests: cht-datasource PostgreSQL Adapter
  *
- * Tests the PostgreSQL adapter in shared-libs/cht-datasource/src/postgres/
- * against the live v1.couchdb table. Validates:
+ * Tests the PostgreSQL adapter query patterns in shared-libs/cht-datasource/src/postgres/
+ * against the live v1.couchdb table. Seeds data directly into PostgreSQL (no cht-sync
+ * dependency). Validates:
  *   - getDocById / getDocsByIds
  *   - queryDocsByType / queryDocIdsByType with pagination
  *   - Recursive CTE lineage (getLineageDocsById)
@@ -28,37 +29,47 @@ let pool;
 const stamp = () => `ds-test-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
 const testDocIds = [];
 
-// CouchDB helpers for seeding test data
-const COUCH_URL = process.env.COUCH_URL || 'http://admin:secret21512@couchdb:5984/medic';
-const parsedCouch = new URL(COUCH_URL);
-const COUCH_HOST = `${parsedCouch.protocol}//${parsedCouch.host}`;
-const COUCH_DB = parsedCouch.pathname.replace(/^\//, '');
-const COUCH_AUTH = 'Basic ' + Buffer.from(`${parsedCouch.username}:${parsedCouch.password}`).toString('base64');
-const couchFetch = (path, opts = {}) => {
-  opts.headers = { ...opts.headers, Authorization: COUCH_AUTH, Accept: 'application/json' };
-  return fetch(`${COUCH_HOST}${path}`, opts);
-};
-const couchPost = async (doc) => (await couchFetch(`/${COUCH_DB}`, {
-  method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(doc),
-})).json();
-const couchDelete = async (id) => {
-  const resp = await couchFetch(`/${COUCH_DB}/${encodeURIComponent(id)}`);
-  const doc = await resp.json();
-  if (doc._rev) await couchFetch(`/${COUCH_DB}/${encodeURIComponent(id)}?rev=${doc._rev}`, { method: 'DELETE' });
-};
-const waitForDoc = async (docId, timeout = 45000) => {
-  const start = Date.now();
-  while (Date.now() - start < timeout) {
-    const { rows } = await pool.query(
-      `SELECT doc FROM ${DOCS_TABLE} WHERE _id = $1 AND (_deleted IS NULL OR _deleted = false)`, [docId]
-    );
-    if (rows.length > 0) return rows[0].doc;
-    await new Promise(r => setTimeout(r, 500));
-  }
-  throw new Error(`${docId} not in PG within ${timeout}ms`);
+// Seed a document directly into PostgreSQL (bypasses cht-sync)
+const pgInsert = async (doc) => {
+  await pool.query(
+    `INSERT INTO ${DOCS_TABLE} (_id, doc, saved_timestamp, _deleted, source)
+     VALUES ($1, $2, NOW(), false, 'integration-test')
+     ON CONFLICT (_id) DO UPDATE SET doc = $2, saved_timestamp = NOW(), _deleted = false`,
+    [doc._id, JSON.stringify(doc)]
+  );
 };
 
-describe('cht-datasource PostgreSQL adapter (Agent 1) — live', function () {
+// Seed multiple documents into PostgreSQL
+const pgInsertBulk = async (docs) => {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    for (const doc of docs) {
+      await client.query(
+        `INSERT INTO ${DOCS_TABLE} (_id, doc, saved_timestamp, _deleted, source)
+         VALUES ($1, $2, NOW(), false, 'integration-test')
+         ON CONFLICT (_id) DO UPDATE SET doc = $2, saved_timestamp = NOW(), _deleted = false`,
+        [doc._id, JSON.stringify(doc)]
+      );
+    }
+    await client.query('COMMIT');
+  } catch (e) {
+    await client.query('ROLLBACK');
+    throw e;
+  } finally {
+    client.release();
+  }
+};
+
+// Soft-delete a document in PostgreSQL
+const pgSoftDelete = async (docId) => {
+  await pool.query(
+    `UPDATE ${DOCS_TABLE} SET _deleted = true, saved_timestamp = NOW() WHERE _id = $1`,
+    [docId]
+  );
+};
+
+describe('cht-datasource PostgreSQL adapter — live', function () {
   this.timeout(120000);
 
   before(async () => {
@@ -68,7 +79,10 @@ describe('cht-datasource PostgreSQL adapter (Agent 1) — live', function () {
   });
 
   after(async () => {
-    for (const id of testDocIds) await couchDelete(id).catch(() => {});
+    // Clean up test documents from PG
+    if (testDocIds.length > 0) {
+      await pool.query(`DELETE FROM ${DOCS_TABLE} WHERE _id = ANY($1)`, [testDocIds]).catch(() => {});
+    }
     if (pool) await pool.end();
   });
 
@@ -78,8 +92,7 @@ describe('cht-datasource PostgreSQL adapter (Agent 1) — live', function () {
     it('should fetch a document by _id from v1.couchdb', async () => {
       const docId = stamp();
       testDocIds.push(docId);
-      await couchPost({ _id: docId, type: 'person', name: 'Get Test', reported_date: Date.now() });
-      await waitForDoc(docId);
+      await pgInsert({ _id: docId, type: 'person', name: 'Get Test', reported_date: Date.now() });
 
       const { rows } = await pool.query(
         `SELECT doc FROM ${DOCS_TABLE} WHERE _id = $1 AND (_deleted IS NULL OR _deleted = false)`,
@@ -100,19 +113,10 @@ describe('cht-datasource PostgreSQL adapter (Agent 1) — live', function () {
 
     it('should exclude soft-deleted documents', async () => {
       const docId = stamp();
-      await couchPost({ _id: docId, type: 'data_record', fields: {}, reported_date: Date.now() });
-      await waitForDoc(docId);
-      await couchDelete(docId);
+      testDocIds.push(docId);
+      await pgInsert({ _id: docId, type: 'data_record', fields: {}, reported_date: Date.now() });
+      await pgSoftDelete(docId);
 
-      // Wait for deletion to propagate
-      const start = Date.now();
-      while (Date.now() - start < 30000) {
-        const { rows } = await pool.query(`SELECT _deleted FROM ${DOCS_TABLE} WHERE _id = $1`, [docId]);
-        if (rows.length > 0 && rows[0]._deleted === true) break;
-        await new Promise(r => setTimeout(r, 500));
-      }
-
-      // The adapter query pattern excludes deleted docs
       const { rows } = await pool.query(
         `SELECT doc FROM ${DOCS_TABLE} WHERE _id = $1 AND (_deleted IS NULL OR _deleted = false)`,
         [docId]
@@ -128,11 +132,7 @@ describe('cht-datasource PostgreSQL adapter (Agent 1) — live', function () {
       const ids = [stamp(), stamp(), stamp()];
       testDocIds.push(...ids);
       const docs = ids.map((id, i) => ({ _id: id, type: 'person', name: `Bulk ${i}`, reported_date: Date.now() }));
-      await couchFetch(`/${COUCH_DB}/_bulk_docs`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ docs }),
-      });
-      for (const id of ids) await waitForDoc(id);
+      await pgInsertBulk(docs);
 
       const { rows } = await pool.query(
         `SELECT _id, doc FROM ${DOCS_TABLE} WHERE _id = ANY($1) AND (_deleted IS NULL OR _deleted = false)`,
@@ -150,9 +150,7 @@ describe('cht-datasource PostgreSQL adapter (Agent 1) — live', function () {
     it('should query contacts by COALESCE(contact_type, type)', async () => {
       const docId = stamp();
       testDocIds.push(docId);
-      // Use contact_type field (new format) alongside type='contact'
-      await couchPost({ _id: docId, type: 'contact', contact_type: 'chw', name: 'CHW Test', reported_date: Date.now() });
-      await waitForDoc(docId);
+      await pgInsert({ _id: docId, type: 'contact', contact_type: 'chw', name: 'CHW Test', reported_date: Date.now() });
 
       const { rows } = await pool.query(
         `SELECT doc FROM ${DOCS_TABLE}
@@ -209,11 +207,7 @@ describe('cht-datasource PostgreSQL adapter (Agent 1) — live', function () {
         { _id: personId, type: 'person', name: 'Lineage Person', patient_id: 'lineage-shortcode',
           parent: { _id: clinicId, parent: { _id: hcId, parent: { _id: districtId } } }, reported_date: Date.now() },
       ];
-      await couchFetch(`/${COUCH_DB}/_bulk_docs`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ docs }),
-      });
-      for (const id of [districtId, hcId, clinicId, personId]) await waitForDoc(id);
+      await pgInsertBulk(docs);
     });
 
     it('should walk the parent chain via recursive CTE', async () => {
