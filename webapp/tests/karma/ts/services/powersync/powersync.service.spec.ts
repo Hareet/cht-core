@@ -6,6 +6,8 @@ import { NgZone } from '@angular/core';
 import { PowerSyncService, PowerSyncStatus } from '@mm-services/powersync/powersync.service';
 import { SessionService } from '@mm-services/session.service';
 import { LocationService } from '@mm-services/location.service';
+import { DeviceTierService } from '@mm-services/powersync/device-tier.service';
+import { StorageHealthService } from '@mm-services/powersync/storage-health.service';
 
 /**
  * Mock WatchedQuery returned by db.query().watch().
@@ -93,6 +95,8 @@ describe('PowerSync Service', () => {
   let service: PowerSyncService;
   let sessionService: any;
   let locationService: any;
+  let deviceTierService: any;
+  let storageHealthService: any;
   let mockDb: MockPowerSyncDatabase;
 
   beforeEach(() => {
@@ -104,6 +108,27 @@ describe('PowerSync Service', () => {
       dbName: 'medic',
       url: 'http://localhost:5988/medic',
     };
+    deviceTierService = {
+      detect: sinon.stub().resolves({
+        tier: 'standard',
+        opfsAvailable: true,
+        storageFreeGB: 20,
+        storageTotalGB: 64,
+        webviewMajor: 122,
+      }),
+      getConfig: sinon.stub().returns({
+        cacheSizeKb: 51200,
+        dbSizeBudgetMB: 1024,
+      }),
+      getCachedTier: sinon.stub().returns(null),
+    };
+    storageHealthService = {
+      startMonitoring: sinon.stub(),
+      stopMonitoring: sinon.stub(),
+      checkStorage: sinon.stub().resolves({ level: 'healthy', usedBytes: 0, totalBytes: 0, freeBytes: 0, usagePercent: 0 }),
+      getCurrentStatus: sinon.stub().returns({ level: 'healthy' }),
+      isMonitoring: sinon.stub().returns(false),
+    };
 
     mockDb = new MockPowerSyncDatabase();
 
@@ -112,6 +137,8 @@ describe('PowerSync Service', () => {
         PowerSyncService,
         { provide: SessionService, useValue: sessionService },
         { provide: LocationService, useValue: locationService },
+        { provide: DeviceTierService, useValue: deviceTierService },
+        { provide: StorageHealthService, useValue: storageHealthService },
       ],
     });
 
@@ -632,6 +659,26 @@ describe('PowerSync Service', () => {
         expect(result).to.be.true;
       });
 
+      it('should pass priority to SDK waitForFirstSync', async () => {
+        mockDb.currentStatus.hasSynced = false;
+        mockDb.waitForFirstSync.resolves();
+
+        await service.waitForFirstSync(2);
+
+        const opts = mockDb.waitForFirstSync.firstCall.args[0];
+        expect(opts.priority).to.equal(2);
+      });
+
+      it('should default priority to 1 (contacts)', async () => {
+        mockDb.currentStatus.hasSynced = false;
+        mockDb.waitForFirstSync.resolves();
+
+        await service.waitForFirstSync();
+
+        const opts = mockDb.waitForFirstSync.firstCall.args[0];
+        expect(opts.priority).to.equal(1);
+      });
+
       it('should return false on timeout', async () => {
         mockDb.currentStatus.hasSynced = false;
         mockDb.waitForFirstSync.callsFake(() => new Promise((_, reject) => {
@@ -639,7 +686,7 @@ describe('PowerSync Service', () => {
           setTimeout(() => reject(new Error('Aborted')), 10);
         }));
 
-        const result = await service.waitForFirstSync(50);
+        const result = await service.waitForFirstSync(1, 50);
 
         expect(result).to.be.false;
       });
@@ -980,6 +1027,12 @@ describe('PowerSync Service', () => {
         expect((service as any).connector).to.be.null;
         expect((service as any).initialized).to.be.false;
       });
+
+      it('should stop storage health monitoring on disconnect', async () => {
+        await service.disconnectAndClear();
+
+        expect(storageHealthService.stopMonitoring.called).to.be.true;
+      });
     });
 
     describe('reconnect / disconnectAndClear race', () => {
@@ -1067,6 +1120,12 @@ describe('PowerSync Service', () => {
         service.ngOnDestroy();
 
         expect(spy.calledOnce).to.be.true;
+      });
+
+      it('should stop storage health monitoring on destroy', () => {
+        service.ngOnDestroy();
+
+        expect(storageHealthService.stopMonitoring.called).to.be.true;
       });
 
       it('should complete the destroyed$ subject on destroy', () => {

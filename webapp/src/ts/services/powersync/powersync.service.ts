@@ -13,14 +13,17 @@
  */
 import { Injectable, NgZone, OnDestroy } from '@angular/core';
 import { Observable, BehaviorSubject, Subject } from 'rxjs';
-import { PowerSyncDatabase } from '@powersync/web';
+import { PowerSyncDatabase, WASQLiteOpenFactory, WASQLiteVFS } from '@powersync/web';
 import type { SyncStatus } from '@powersync/web';
 
 import { SessionService } from '@mm-services/session.service';
 import { LocationService } from '@mm-services/location.service';
+import { DeviceTierService } from './device-tier.service';
+import { StorageHealthService } from './storage-health.service';
 import { ChtPowerSyncSchema } from './powersync-schema';
 import { ChtPowerSyncConnector } from './powersync-connector';
 import type { ContactRow, ReportRow, TaskRow, TargetRow, SettingsRow } from './powersync-schema';
+import type { DeviceTier } from './device-tier.service';
 
 export { ContactRow, ReportRow, TaskRow, TargetRow, SettingsRow };
 
@@ -81,6 +84,8 @@ export class PowerSyncService implements OnDestroy {
   constructor(
     private sessionService: SessionService,
     private locationService: LocationService,
+    private deviceTierService: DeviceTierService,
+    private storageHealthService: StorageHealthService,
     private ngZone: NgZone,
   ) {}
 
@@ -90,6 +95,13 @@ export class PowerSyncService implements OnDestroy {
    *
    * Call this during app bootstrap after authentication is confirmed.
    *
+   * Adaptive behavior:
+   * - Detects device tier (go/budget/standard/high) via DeviceTierService
+   * - Selects VFS: OPFSCoopSyncVFS if available, IDBBatchAtomicVFS fallback
+   * - Sets cacheSizeKb per device tier
+   * - Requests persistent storage via navigator.storage.persist()
+   * - Starts StorageHealthMonitor for resource-constrained devices
+   *
    * @param config - Optional configuration. In dev mode, provide devUser
    *   to enable client-side JWT generation.
    */
@@ -98,13 +110,36 @@ export class PowerSyncService implements OnDestroy {
       return;
     }
 
+    // Detect device capabilities
+    const deviceTier = await this.deviceTierService.detect();
+    const tierConfig = this.deviceTierService.getConfig(deviceTier.tier);
+
+    // Request persistent storage to prevent OPFS/IndexedDB eviction
+    this.requestPersistentStorage();
+
+    // Select VFS: OPFS for performance, IndexedDB fallback for non-OPFS devices
+    const vfs = deviceTier.opfsAvailable
+      ? WASQLiteVFS.OPFSCoopSyncVFS
+      : WASQLiteVFS.IDBBatchAtomicVFS;
+
+    console.info(
+      `PowerSync: Device tier=${deviceTier.tier}, VFS=${vfs}, ` +
+      `cacheSizeKb=${tierConfig.cacheSizeKb}, OPFS=${deviceTier.opfsAvailable}, ` +
+      `storage=${deviceTier.storageFreeGB.toFixed(1)}GB free / ${deviceTier.storageTotalGB.toFixed(1)}GB total, ` +
+      `WebView=${deviceTier.webviewMajor}`
+    );
+
     this.ngZone.runOutsideAngular(() => {
       this.db = new PowerSyncDatabase({
         schema: ChtPowerSyncSchema,
-        database: { dbFilename: DB_FILENAME },
+        database: new WASQLiteOpenFactory({
+          dbFilename: DB_FILENAME,
+          vfs,
+          cacheSizeKb: tierConfig.cacheSizeKb,
+        }),
         flags: {
           useWebWorker: true,
-          enableMultiTabs: true,
+          enableMultiTabs: false, // Android WebView does not support multi-tab
         },
       });
     });
@@ -140,15 +175,23 @@ export class PowerSyncService implements OnDestroy {
     // connect() is fire-and-forget; sync happens in the background
     this.db!.connect(this.connector);
     this.initialized = true;
+
+    // Start storage monitoring for resource-constrained devices
+    this.storageHealthService.startMonitoring();
   }
 
   /**
-   * Wait for the first full sync to complete.
-   * Use this to gate rendering of data-dependent screens.
+   * Wait for the first sync to complete up to the given priority level.
    *
+   * Uses Prioritized Sync so contacts (priority 1) appear before the full
+   * dataset finishes syncing — critical for Go edition devices where full
+   * sync can take 10-16 seconds on cold start.
+   *
+   * @param priority - Sync priority level to wait for (default: 1 = contacts).
+   *   Lower numbers = higher priority. Omit to wait for all priorities.
    * @param timeoutMs - Optional timeout in milliseconds (default: 30s)
    */
-  async waitForFirstSync(timeoutMs = 30_000): Promise<boolean> {
+  async waitForFirstSync(priority = 1, timeoutMs = 30_000): Promise<boolean> {
     if (!this.db) {
       return false;
     }
@@ -161,7 +204,7 @@ export class PowerSyncService implements OnDestroy {
     const timeout = setTimeout(() => controller.abort(), timeoutMs);
 
     try {
-      await this.db.waitForFirstSync({ signal: controller.signal });
+      await this.db.waitForFirstSync({ signal: controller.signal, priority });
       return true;
     } catch {
       console.warn('PowerSync: First sync timed out or was aborted');
@@ -388,6 +431,7 @@ export class PowerSyncService implements OnDestroy {
    * Call on user logout to ensure no data persists.
    */
   async disconnectAndClear(): Promise<void> {
+    this.storageHealthService.stopMonitoring();
     if (this.db) {
       try {
         await this.db.disconnectAndClear();
@@ -484,6 +528,24 @@ export class PowerSyncService implements OnDestroy {
   }
 
   /**
+   * Request persistent storage so the browser does not evict OPFS/IndexedDB data.
+   * Fire-and-forget — failure is non-fatal (some browsers/contexts deny this).
+   */
+  private requestPersistentStorage(): void {
+    try {
+      if (navigator?.storage?.persist) {
+        navigator.storage.persist().then(granted => {
+          console.info(`PowerSync: Persistent storage ${granted ? 'granted' : 'denied'}`);
+        }).catch(() => {
+          // Non-fatal
+        });
+      }
+    } catch {
+      // navigator.storage not available
+    }
+  }
+
+  /**
    * Derive the PowerSync service URL from the current browser location.
    * In the dev container, PowerSync is proxied at /powersync.
    * In production, this would be configured via environment.
@@ -500,6 +562,7 @@ export class PowerSyncService implements OnDestroy {
   ngOnDestroy(): void {
     this.destroyed$.next();
     this.destroyed$.complete();
+    this.storageHealthService.stopMonitoring();
     this.disconnectAndClear();
   }
 }
