@@ -13,3 +13,5 @@ export { initializePowerSync } from './powersync-init';
 export type { PowerSyncInitResult, PowerSyncInitOptions } from './powersync-init';
 export { generateDevToken, md5Hash } from './dev-token-provider';
 export type { DevTokenOptions } from './dev-token-provider';
+export { PowerSyncBenchmarkService, runBenchmark, formatBenchmarkReport } from './benchmark';
+export type { BenchmarkConfig, BenchmarkResult, BenchmarkMetric } from './benchmark';
