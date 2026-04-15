@@ -22,40 +22,79 @@ describe('PowerSync Init', () => {
   });
 
   describe('session checks', () => {
-    it('should skip initialization when user is online-only', async () => {
+    it('should skip initialization when user is online-only', () => {
       sessionService.isOnlineOnly.returns(true);
 
-      await initializePowerSync(powerSyncService, sessionService);
+      const result = initializePowerSync(powerSyncService, sessionService);
 
+      expect(result.attempted).to.be.false;
       expect(powerSyncService.initialize.called).to.be.false;
     });
 
-    it('should skip initialization when no user session exists', async () => {
+    it('should skip initialization when no user session exists', () => {
       sessionService.userCtx.returns(null);
 
-      await initializePowerSync(powerSyncService, sessionService);
+      const result = initializePowerSync(powerSyncService, sessionService);
 
+      expect(result.attempted).to.be.false;
       expect(powerSyncService.initialize.called).to.be.false;
     });
 
-    it('should skip initialization when user has no name', async () => {
+    it('should skip initialization when user has no name', () => {
       sessionService.userCtx.returns({ name: '', roles: ['chw'] });
 
-      await initializePowerSync(powerSyncService, sessionService);
+      const result = initializePowerSync(powerSyncService, sessionService);
 
+      expect(result.attempted).to.be.false;
       expect(powerSyncService.initialize.called).to.be.false;
     });
 
-    it('should skip initialization when userCtx returns undefined name', async () => {
+    it('should skip initialization when userCtx returns undefined name', () => {
       sessionService.userCtx.returns({ roles: ['chw'] });
 
-      await initializePowerSync(powerSyncService, sessionService);
+      const result = initializePowerSync(powerSyncService, sessionService);
 
-      expect(powerSyncService.initialize.called).to.be.false;
+      expect(result.attempted).to.be.false;
+    });
+
+    it('should return ready promise that resolves for skipped init', async () => {
+      sessionService.isOnlineOnly.returns(true);
+
+      const result = initializePowerSync(powerSyncService, sessionService);
+
+      // ready should resolve immediately, not reject
+      await result.ready;
     });
 
     it('should initialize for offline users with valid session', async () => {
-      await initializePowerSync(powerSyncService, sessionService);
+      const result = initializePowerSync(powerSyncService, sessionService);
+
+      expect(result.attempted).to.be.true;
+      await result.ready;
+      expect(powerSyncService.initialize.calledOnce).to.be.true;
+    });
+  });
+
+  describe('non-blocking behavior', () => {
+    it('should return synchronously before initialization completes', () => {
+      let initResolved = false;
+      powerSyncService.initialize = sinon.stub().callsFake(() => {
+        return new Promise(resolve => {
+          setTimeout(() => { initResolved = true; resolve(undefined); }, 100);
+        });
+      });
+
+      const result = initializePowerSync(powerSyncService, sessionService);
+
+      // Function returns immediately — init hasn't resolved yet
+      expect(result.attempted).to.be.true;
+      expect(initResolved).to.be.false;
+    });
+
+    it('should resolve ready promise when initialization completes', async () => {
+      const result = initializePowerSync(powerSyncService, sessionService);
+
+      await result.ready;
 
       expect(powerSyncService.initialize.calledOnce).to.be.true;
     });
@@ -63,7 +102,8 @@ describe('PowerSync Init', () => {
 
   describe('production mode (default)', () => {
     it('should call initialize without devMode config', async () => {
-      await initializePowerSync(powerSyncService, sessionService);
+      const result = initializePowerSync(powerSyncService, sessionService);
+      await result.ready;
 
       const config = powerSyncService.initialize.firstCall.args[0];
       expect(config.devMode).to.be.undefined;
@@ -71,16 +111,18 @@ describe('PowerSync Init', () => {
     });
 
     it('should pass powerSyncUrl when provided', async () => {
-      await initializePowerSync(powerSyncService, sessionService, {
+      const result = initializePowerSync(powerSyncService, sessionService, {
         powerSyncUrl: 'http://powersync:8080',
       });
+      await result.ready;
 
       const config = powerSyncService.initialize.firstCall.args[0];
       expect(config.powerSyncUrl).to.equal('http://powersync:8080');
     });
 
     it('should leave powerSyncUrl undefined when not provided', async () => {
-      await initializePowerSync(powerSyncService, sessionService);
+      const result = initializePowerSync(powerSyncService, sessionService);
+      await result.ready;
 
       const config = powerSyncService.initialize.firstCall.args[0];
       expect(config.powerSyncUrl).to.be.undefined;
@@ -89,7 +131,8 @@ describe('PowerSync Init', () => {
 
   describe('dev mode', () => {
     it('should set devMode and devUser in config', async () => {
-      await initializePowerSync(powerSyncService, sessionService, { devMode: true });
+      const result = initializePowerSync(powerSyncService, sessionService, { devMode: true });
+      await result.ready;
 
       const config = powerSyncService.initialize.firstCall.args[0];
       expect(config.devMode).to.be.true;
@@ -99,7 +142,8 @@ describe('PowerSync Init', () => {
     it('should construct userId from CouchDB user format', async () => {
       sessionService.userCtx.returns({ name: 'mary', roles: ['chw'] });
 
-      await initializePowerSync(powerSyncService, sessionService, { devMode: true });
+      const result = initializePowerSync(powerSyncService, sessionService, { devMode: true });
+      await result.ready;
 
       const config = powerSyncService.initialize.firstCall.args[0];
       expect(config.devUser.userId).to.equal('org.couchdb.user:mary');
@@ -108,7 +152,8 @@ describe('PowerSync Init', () => {
     it('should pass user roles from session', async () => {
       sessionService.userCtx.returns({ name: 'supervisor', roles: ['chw_supervisor', 'data_entry'] });
 
-      await initializePowerSync(powerSyncService, sessionService, { devMode: true });
+      const result = initializePowerSync(powerSyncService, sessionService, { devMode: true });
+      await result.ready;
 
       const config = powerSyncService.initialize.firstCall.args[0];
       expect(config.devUser.roles).to.deep.equal(['chw_supervisor', 'data_entry']);
@@ -117,24 +162,27 @@ describe('PowerSync Init', () => {
     it('should default roles to empty array when not in session', async () => {
       sessionService.userCtx.returns({ name: 'norolesuser' });
 
-      await initializePowerSync(powerSyncService, sessionService, { devMode: true });
+      const result = initializePowerSync(powerSyncService, sessionService, { devMode: true });
+      await result.ready;
 
       const config = powerSyncService.initialize.firstCall.args[0];
       expect(config.devUser.roles).to.deep.equal([]);
     });
 
     it('should set default reportDepth of 1', async () => {
-      await initializePowerSync(powerSyncService, sessionService, { devMode: true });
+      const result = initializePowerSync(powerSyncService, sessionService, { devMode: true });
+      await result.ready;
 
       const config = powerSyncService.initialize.firstCall.args[0];
       expect(config.devUser.reportDepth).to.equal(1);
     });
 
     it('should pass powerSyncUrl in dev mode', async () => {
-      await initializePowerSync(powerSyncService, sessionService, {
+      const result = initializePowerSync(powerSyncService, sessionService, {
         devMode: true,
         powerSyncUrl: 'http://powersync:8080',
       });
+      await result.ready;
 
       const config = powerSyncService.initialize.firstCall.args[0];
       expect(config.powerSyncUrl).to.equal('http://powersync:8080');
@@ -145,14 +193,87 @@ describe('PowerSync Init', () => {
     it('should not throw when initialization fails', async () => {
       powerSyncService.initialize.rejects(new Error('WASM failed to load'));
 
-      // Should not throw — falls back to PouchDB
-      await initializePowerSync(powerSyncService, sessionService);
+      const result = initializePowerSync(powerSyncService, sessionService);
+
+      // ready promise should resolve (not reject) even on init failure
+      await result.ready;
     });
 
     it('should not throw when initialization rejects with network error', async () => {
       powerSyncService.initialize.rejects(new TypeError('Failed to fetch'));
 
-      await initializePowerSync(powerSyncService, sessionService);
+      const result = initializePowerSync(powerSyncService, sessionService);
+
+      await result.ready;
+    });
+
+    it('should still set attempted to true when init fails', async () => {
+      powerSyncService.initialize.rejects(new Error('WASM failed'));
+
+      const result = initializePowerSync(powerSyncService, sessionService);
+
+      expect(result.attempted).to.be.true;
+      await result.ready;
+    });
+  });
+
+  describe('feature flag', () => {
+    it('should not initialize when powersync.enabled is false in settings', async () => {
+      const getSettings = sinon.stub().resolves({ powersync: { enabled: false } });
+
+      const result = initializePowerSync(powerSyncService, sessionService, { getSettings });
+      await result.ready;
+
+      expect(result.attempted).to.be.true;
+      expect(powerSyncService.initialize.called).to.be.false;
+    });
+
+    it('should not initialize when powersync key is missing from settings', async () => {
+      const getSettings = sinon.stub().resolves({});
+
+      const result = initializePowerSync(powerSyncService, sessionService, { getSettings });
+      await result.ready;
+
+      expect(powerSyncService.initialize.called).to.be.false;
+    });
+
+    it('should initialize when powersync.enabled is true', async () => {
+      const getSettings = sinon.stub().resolves({ powersync: { enabled: true } });
+
+      const result = initializePowerSync(powerSyncService, sessionService, { getSettings });
+      await result.ready;
+
+      expect(powerSyncService.initialize.calledOnce).to.be.true;
+    });
+
+    it('should initialize when no getSettings callback is provided (default enabled)', async () => {
+      const result = initializePowerSync(powerSyncService, sessionService);
+      await result.ready;
+
+      expect(powerSyncService.initialize.calledOnce).to.be.true;
+    });
+
+    it('should not initialize when getSettings throws (fail-safe to disabled)', async () => {
+      const getSettings = sinon.stub().rejects(new Error('DB error'));
+
+      const result = initializePowerSync(powerSyncService, sessionService, { getSettings });
+      await result.ready;
+
+      expect(powerSyncService.initialize.called).to.be.false;
+    });
+
+    it('should pass devMode config when feature flag is enabled', async () => {
+      const getSettings = sinon.stub().resolves({ powersync: { enabled: true } });
+
+      const result = initializePowerSync(powerSyncService, sessionService, {
+        getSettings,
+        devMode: true,
+      });
+      await result.ready;
+
+      const config = powerSyncService.initialize.firstCall.args[0];
+      expect(config.devMode).to.be.true;
+      expect(config.devUser).to.be.an('object');
     });
   });
 });
