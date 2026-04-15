@@ -307,6 +307,46 @@ describe('db-postgresql', () => {
         done();
       });
     });
+
+    it('sentinel db wrapper supports callback-style put', (done) => {
+      // Sentinel methods are doubly-wrapped: init wrapper → withCallback wrapper
+      // CREATE SCHEMA / CREATE TABLE calls from init
+      mockPool.query.resolves({ rows: [], rowCount: 1 });
+
+      const doc = { _id: 'info-doc-1', type: 'info', doc_id: 'report-1' };
+      dbPg.sentinel.put(doc, (err, result) => {
+        expect(err).to.be.null;
+        expect(result.ok).to.equal(true);
+        expect(result.id).to.equal('info-doc-1');
+        done();
+      });
+    });
+
+    it('sentinel db wrapper supports callback-style get', (done) => {
+      const testDoc = { _id: 'info-doc-1', _rev: '1-pg123', type: 'info' };
+      // First calls: CREATE SCHEMA + CREATE TABLE from init
+      // Then: SELECT for get
+      mockPool.query.resolves({
+        rows: [{ _id: 'info-doc-1', doc: testDoc, _deleted: false }],
+        rowCount: 1
+      });
+
+      dbPg.sentinel.get('info-doc-1', (err, result) => {
+        expect(err).to.be.null;
+        expect(result._id).to.equal('info-doc-1');
+        done();
+      });
+    });
+
+    it('sentinel db wrapper passes init errors to callback', (done) => {
+      mockPool.query.rejects(new Error('connection refused'));
+
+      dbPg.sentinel.get('some-id', (err) => {
+        expect(err).to.exist;
+        expect(err.message).to.equal('connection refused');
+        done();
+      });
+    });
   });
 
   describe('revision generation', () => {

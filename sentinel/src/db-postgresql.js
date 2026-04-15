@@ -656,13 +656,22 @@ const createSentinelDb = () => {
 
   const proxy = createDbProxy('docs', 'sentinel');
 
-  // Wrap each method to ensure table exists
+  // Wrap each method to ensure table exists, preserving callback support
   const wrapped = {};
   for (const [key, fn] of Object.entries(proxy)) {
     if (typeof fn === 'function') {
-      wrapped[key] = async (...args) => {
-        await init();
-        return fn(...args);
+      wrapped[key] = function(...args) {
+        const lastArg = args[args.length - 1];
+        if (typeof lastArg === 'function') {
+          // Callback style: init first, then delegate (callback handled by fn's withCallback)
+          const callback = lastArg;
+          init()
+            .then(() => fn(...args))
+            .catch(err => callback(err));
+          return;
+        }
+        // Promise style
+        return init().then(() => fn(...args));
       };
     } else {
       wrapped[key] = fn;
