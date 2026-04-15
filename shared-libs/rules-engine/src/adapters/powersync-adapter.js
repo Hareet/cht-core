@@ -132,28 +132,30 @@ const powersyncProvider = (db) => {
      */
     allTaskData: async (userSettingsDoc) => {
       const userSettingsId = userSettingsDoc?._id;
-      const [contactDocs, reportDocs, taskDocs] = await Promise.all([
-        // contacts_by_type: all contacts (person, clinic, health_center, district_hospital, or contact_type)
-        db.getAll(
-          `SELECT doc FROM contacts
-           WHERE type = 'contact'
-              OR type IN ('district_hospital', 'health_center', 'clinic', 'person')`
-        )
-          .then(parseDocs),
-        // reports_by_subject: all reports (data_records with a form) that have at least one subject identifier.
-        // The CouchDB view uses JavaScript truthiness: `if (doc.form)` and `if (obj[field])`.
-        // Empty strings are falsy in JS but non-NULL in SQL, so we must exclude them explicitly
-        // with `!= ''` to match view behavior. This ensures reports with empty form names or
-        // empty subject identifiers are excluded, matching PouchDB parity.
-        db.getAll(`SELECT doc FROM reports WHERE type = 'data_record'
-                   AND form IS NOT NULL AND form != ''
-                   AND ((patient_id IS NOT NULL AND patient_id != '')
-                     OR (place_id IS NOT NULL AND place_id != '')
-                     OR (subject_id IS NOT NULL AND subject_id != '')
-                     OR (case_id IS NOT NULL AND case_id != ''))`)
-          .then(parseDocs),
+      // contacts_by_type: all contacts (person, clinic, health_center, district_hospital, or contact_type)
+      const contactSql = `SELECT doc FROM contacts
+         WHERE type = 'contact'
+            OR type IN ('district_hospital', 'health_center', 'clinic', 'person')`;
+      // reports_by_subject: all reports (data_records with a form) that have at least one subject identifier.
+      // The CouchDB view uses JavaScript truthiness: `if (doc.form)` and `if (obj[field])`.
+      // Empty strings are falsy in JS but non-NULL in SQL, so we must exclude them explicitly
+      // with `!= ''` to match view behavior. This ensures reports with empty form names or
+      // empty subject identifiers are excluded, matching PouchDB parity.
+      const reportSql = `SELECT doc FROM reports WHERE type = 'data_record'
+         AND form IS NOT NULL AND form != ''
+         AND ((patient_id IS NOT NULL AND patient_id != '')
+           OR (place_id IS NOT NULL AND place_id != '')
+           OR (subject_id IS NOT NULL AND subject_id != '')
+           OR (case_id IS NOT NULL AND case_id != ''))`;
+
+      const [contactRows, reportRows, taskDocs] = await Promise.all([
+        db.getAll(contactSql),
+        db.getAll(reportSql),
         self.allTasks('requester'),
       ]);
+
+      const contactDocs = parseDocs(contactRows);
+      const reportDocs = parseDocs(reportRows);
       return { contactDocs, reportDocs, taskDocs, userSettingsId };
     },
 
