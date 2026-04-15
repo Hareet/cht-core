@@ -40,6 +40,45 @@ const generateRev = (currentRev) => {
   return `${revNum}-pg${suffix}`;
 };
 
+/**
+ * Wrap an async function to support PouchDB-style Node callbacks.
+ * If the last argument is a function, it's treated as a (err, result) callback.
+ * Otherwise the promise is returned as-is.
+ */
+const withCallback = (asyncFn) => {
+  return function(...args) {
+    const lastArg = args[args.length - 1];
+    if (typeof lastArg === 'function') {
+      const callback = lastArg;
+      const fnArgs = args.slice(0, -1);
+      asyncFn.apply(this, fnArgs)
+        .then(result => callback(null, result))
+        .catch(err => callback(err));
+      return; // PouchDB callback style doesn't return a promise
+    }
+    return asyncFn.apply(this, args);
+  };
+};
+
+/**
+ * Throw a 409 conflict error if a document exists with a different _rev.
+ * Returns silently if the document doesn't exist at all.
+ */
+const throwIfConflict = async (qt, id, expectedRev) => {
+  const { rows } = await pool.query(
+    `SELECT doc->>'_rev' as current_rev FROM ${qt} WHERE _id = $1`,
+    [id]
+  );
+  if (rows.length > 0) {
+    const err = new Error('Document update conflict.');
+    err.status = 409;
+    err.name = 'conflict';
+    err.error = 'conflict';
+    err.docId = id;
+    throw err;
+  }
+};
+
 // ─── PouchDB-compatible database wrapper ───────────────────────────────
 
 const createDbProxy = (tableName, schema = SCHEMA) => {
@@ -48,9 +87,9 @@ const createDbProxy = (tableName, schema = SCHEMA) => {
 
   return {
     /**
-     * PouchDB .get(id) → SELECT doc
+     * PouchDB .get(id) → SELECT doc. Supports callback as second argument.
      */
-    get: async (id) => {
+    get: withCallback(async (id) => {
       const { rows } = await pool.query(
         `SELECT _id, doc, _deleted, saved_timestamp FROM ${qt}
          WHERE _id = $1`,
@@ -70,25 +109,43 @@ const createDbProxy = (tableName, schema = SCHEMA) => {
         throw err;
       }
       return row.doc;
-    },
+    }),
 
     /**
-     * PouchDB .put(doc) → INSERT or UPDATE
+     * PouchDB .put(doc) → INSERT or UPDATE with _rev optimistic locking.
+     *
+     * When doc._rev is provided, the update only succeeds if the stored
+     * document has the same _rev (CouchDB-compatible conflict detection).
+     * Throws a 409 error if another writer changed the doc first.
+     * Supports PouchDB-style callback as optional second argument.
      */
-    put: async (doc) => {
+    put: withCallback(async (doc) => {
       const id = doc._id;
       const newRev = generateRev(doc._rev);
       const newDoc = { ...doc, _rev: newRev };
 
       if (doc._deleted) {
-        const { rowCount } = await pool.query(
-          `UPDATE ${qt} SET _deleted = true, doc = $1, saved_timestamp = NOW() WHERE _id = $2`,
-          [JSON.stringify(newDoc), id]
-        );
-        if (rowCount === 0) {
-          // Doc doesn't exist, insert the deletion marker
+        if (doc._rev) {
+          // Optimistic lock: only delete if _rev matches
+          const { rowCount } = await pool.query(
+            `UPDATE ${qt} SET _deleted = true, doc = $1, saved_timestamp = NOW()
+             WHERE _id = $2 AND doc->>'_rev' = $3`,
+            [JSON.stringify(newDoc), id, doc._rev]
+          );
+          if (rowCount === 0) {
+            await throwIfConflict(qt, id, doc._rev);
+            // Doc doesn't exist — insert deletion marker
+            await pool.query(
+              `INSERT INTO ${qt} (_id, doc, _deleted, saved_timestamp, source)
+               VALUES ($1, $2, true, NOW(), 'sentinel')`,
+              [id, JSON.stringify(newDoc)]
+            );
+          }
+        } else {
+          // No _rev — upsert deletion
           await pool.query(
-            `INSERT INTO ${qt} (_id, doc, _deleted, saved_timestamp, source) VALUES ($1, $2, true, NOW(), 'sentinel')
+            `INSERT INTO ${qt} (_id, doc, _deleted, saved_timestamp, source)
+             VALUES ($1, $2, true, NOW(), 'sentinel')
              ON CONFLICT (_id) DO UPDATE SET _deleted = true, doc = $2, saved_timestamp = NOW()`,
             [id, JSON.stringify(newDoc)]
           );
@@ -96,18 +153,38 @@ const createDbProxy = (tableName, schema = SCHEMA) => {
         return { ok: true, id, rev: newRev };
       }
 
-      const { rowCount } = await pool.query(
-        `INSERT INTO ${qt} (_id, doc, _deleted, saved_timestamp, source) VALUES ($1, $2, false, NOW(), 'sentinel')
-         ON CONFLICT (_id) DO UPDATE SET doc = $2, _deleted = false, saved_timestamp = NOW()`,
-        [id, JSON.stringify(newDoc)]
-      );
+      if (doc._rev) {
+        // Optimistic lock: only update if _rev matches
+        const { rowCount } = await pool.query(
+          `UPDATE ${qt} SET doc = $1, _deleted = false, saved_timestamp = NOW()
+           WHERE _id = $2 AND doc->>'_rev' = $3`,
+          [JSON.stringify(newDoc), id, doc._rev]
+        );
+        if (rowCount === 0) {
+          await throwIfConflict(qt, id, doc._rev);
+          // Doc doesn't exist — insert as new
+          await pool.query(
+            `INSERT INTO ${qt} (_id, doc, _deleted, saved_timestamp, source)
+             VALUES ($1, $2, false, NOW(), 'sentinel')`,
+            [id, JSON.stringify(newDoc)]
+          );
+        }
+      } else {
+        // New doc (no _rev) — upsert
+        await pool.query(
+          `INSERT INTO ${qt} (_id, doc, _deleted, saved_timestamp, source)
+           VALUES ($1, $2, false, NOW(), 'sentinel')
+           ON CONFLICT (_id) DO UPDATE SET doc = $2, _deleted = false, saved_timestamp = NOW()`,
+          [id, JSON.stringify(newDoc)]
+        );
+      }
       return { ok: true, id, rev: newRev };
-    },
+    }),
 
     /**
      * PouchDB .post(doc) → INSERT with generated ID
      */
-    post: async (doc) => {
+    post: withCallback(async (doc) => {
       const id = doc._id || require('crypto').randomUUID();
       const rev = generateRev();
       const newDoc = { ...doc, _id: id, _rev: rev };
@@ -117,12 +194,12 @@ const createDbProxy = (tableName, schema = SCHEMA) => {
         [id, JSON.stringify(newDoc)]
       );
       return { ok: true, id, rev };
-    },
+    }),
 
     /**
      * PouchDB .remove(doc) → mark _deleted = true
      */
-    remove: async (doc) => {
+    remove: withCallback(async (doc) => {
       const id = typeof doc === 'string' ? doc : doc._id;
       const rev = typeof doc === 'string' ? undefined : doc._rev;
       const newRev = generateRev(rev);
@@ -132,12 +209,12 @@ const createDbProxy = (tableName, schema = SCHEMA) => {
         [id]
       );
       return { ok: true, id, rev: newRev };
-    },
+    }),
 
     /**
      * PouchDB .allDocs(opts) → SELECT with various filtering modes
      */
-    allDocs: async (opts = {}) => {
+    allDocs: withCallback(async (opts = {}) => {
       const params = [];
       let sql;
 
@@ -207,12 +284,12 @@ const createDbProxy = (tableName, schema = SCHEMA) => {
         })),
         total_rows: rows.length,
       };
-    },
+    }),
 
     /**
-     * PouchDB .bulkDocs(docs) → batch INSERT/UPDATE
+     * PouchDB .bulkDocs(docs) → batch INSERT/UPDATE with _rev optimistic locking
      */
-    bulkDocs: async (docsOrObj) => {
+    bulkDocs: withCallback(async (docsOrObj) => {
       const docs = Array.isArray(docsOrObj) ? docsOrObj : docsOrObj.docs;
       if (!docs || docs.length === 0) {
         return [];
@@ -228,12 +305,43 @@ const createDbProxy = (tableName, schema = SCHEMA) => {
           const newDoc = { ...doc, _rev: newRev };
           const deleted = !!doc._deleted;
 
-          await client.query(
-            `INSERT INTO ${qt} (_id, doc, _deleted, saved_timestamp, source)
-             VALUES ($1, $2, $3, NOW(), 'sentinel')
-             ON CONFLICT (_id) DO UPDATE SET doc = $2, _deleted = $3, saved_timestamp = NOW()`,
-            [id, JSON.stringify(newDoc), deleted]
-          );
+          if (doc._rev) {
+            // Optimistic lock: only update if _rev matches
+            const { rowCount } = await client.query(
+              `UPDATE ${qt} SET doc = $1, _deleted = $2, saved_timestamp = NOW()
+               WHERE _id = $3 AND doc->>'_rev' = $4`,
+              [JSON.stringify(newDoc), deleted, id, doc._rev]
+            );
+            if (rowCount === 0) {
+              // Check if doc exists with different rev
+              const { rows } = await client.query(
+                `SELECT doc->>'_rev' as current_rev FROM ${qt} WHERE _id = $1`,
+                [id]
+              );
+              if (rows.length > 0) {
+                const err = new Error('Document update conflict.');
+                err.status = 409;
+                err.name = 'conflict';
+                err.error = 'conflict';
+                err.docId = id;
+                throw err;
+              }
+              // Doc doesn't exist — insert
+              await client.query(
+                `INSERT INTO ${qt} (_id, doc, _deleted, saved_timestamp, source)
+                 VALUES ($1, $2, $3, NOW(), 'sentinel')`,
+                [id, JSON.stringify(newDoc), deleted]
+              );
+            }
+          } else {
+            // No _rev — upsert
+            await client.query(
+              `INSERT INTO ${qt} (_id, doc, _deleted, saved_timestamp, source)
+               VALUES ($1, $2, $3, NOW(), 'sentinel')
+               ON CONFLICT (_id) DO UPDATE SET doc = $2, _deleted = $3, saved_timestamp = NOW()`,
+              [id, JSON.stringify(newDoc), deleted]
+            );
+          }
           results.push({ ok: true, id, rev: newRev });
         }
         await client.query('COMMIT');
@@ -244,14 +352,14 @@ const createDbProxy = (tableName, schema = SCHEMA) => {
         client.release();
       }
       return results;
-    },
+    }),
 
     /**
      * PouchDB .query(viewName, opts) → SQL equivalent of CouchDB views
      */
-    query: async (viewName, opts = {}) => {
+    query: withCallback(async (viewName, opts = {}) => {
       return queryView(viewName, opts);
-    },
+    }),
 
     /**
      * PouchDB .changes(opts) → delegate to pg-changes module
@@ -271,14 +379,14 @@ const createDbProxy = (tableName, schema = SCHEMA) => {
     /**
      * PouchDB .info() → basic db stats
      */
-    info: async () => {
+    info: withCallback(async () => {
       const { rows } = await pool.query(`SELECT count(*) as count FROM ${qt}`);
       return {
         db_name: `${schema}.${tableName}`,
         doc_count: parseInt(rows[0].count, 10),
         update_seq: 'postgresql',
       };
-    },
+    }),
   };
 };
 
@@ -642,5 +750,8 @@ module.exports.queryMedic = queryMedic;
 
 module.exports.medicDbName = () => `${SCHEMA}.${TABLE}`;
 
-// Export pool for direct access when needed
+// Export pool for direct access when needed (data-context, integration tests)
 module.exports._pool = pool;
+
+// Export generateRev for testing
+module.exports._generateRev = generateRev;
