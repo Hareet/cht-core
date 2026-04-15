@@ -133,6 +133,38 @@ CREATE INDEX IF NOT EXISTS idx_couchdb_place_id
   ON v1.couchdb ((doc ->> 'place_id'))
   WHERE doc ->> 'place_id' IS NOT NULL;
 
+-- Indexes for Sync Stream queries with purge JOIN.
+-- These help PostgreSQL choose the right join order: drive from
+-- couchdb (selective type/user conditions) → PK lookup into purge_status,
+-- rather than scanning all purge_status rows for a role.
+CREATE INDEX IF NOT EXISTS idx_couchdb_tasks_by_user
+  ON v1.couchdb ((doc ->> 'user'))
+  WHERE doc ->> 'type' = 'task' AND NOT COALESCE(_deleted, false);
+
+CREATE INDEX IF NOT EXISTS idx_couchdb_reports_by_submitter
+  ON v1.couchdb ((doc -> 'contact' ->> '_id'))
+  WHERE doc ->> 'type' = 'data_record'
+    AND doc ->> 'form' IS NOT NULL
+    AND NOT COALESCE(_deleted, false);
+
+CREATE INDEX IF NOT EXISTS idx_couchdb_targets_by_owner
+  ON v1.couchdb ((doc ->> 'owner'))
+  WHERE doc ->> 'type' = 'target' AND NOT COALESCE(_deleted, false);
+
+CREATE INDEX IF NOT EXISTS idx_couchdb_reports_by_subject_place
+  ON v1.couchdb (resolved_subject_place_id)
+  WHERE resolved_subject_place_id IS NOT NULL
+    AND NOT COALESCE(_deleted, false)
+    AND doc ->> 'type' = 'data_record'
+    AND doc ->> 'form' IS NOT NULL;
+
+-- Expression statistics for JSONB conditions.
+-- PostgreSQL defaults to 0.5% selectivity for JSONB ->> 'x' = 'y' expressions.
+-- These statistics give the planner actual value distributions so it can
+-- choose better join orders (drive from couchdb, not from purge_status).
+CREATE STATISTICS IF NOT EXISTS stat_couchdb_doc_type ON (doc ->> 'type') FROM v1.couchdb;
+CREATE STATISTICS IF NOT EXISTS stat_couchdb_doc_form ON (doc ->> 'form') FROM v1.couchdb;
+
 -- ============================================================
 -- 2d. Needs-signoff Visibility (pre-computed)
 -- Maps each needs_signoff report to the users who should see it
