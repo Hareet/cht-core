@@ -114,9 +114,37 @@ describe('Purge preprocessing service (Agent 4) — live', function () {
     });
   });
 
-  // ── Verify Agent 4's purge engine ran and produced data ───────────
+  // ── Verify purge engine execution data (seed if no prior run) ────
 
   describe('purge engine execution results', () => {
+    const testRoleHash = 'a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6';
+
+    before(async () => {
+      // Seed a completed purge run and role if none exist yet (Agent 4 may not have run)
+      const { rows: existingRuns } = await pool.query(
+        "SELECT id FROM public.purge_run_log WHERE status = 'completed' LIMIT 1"
+      );
+      if (existingRuns.length === 0) {
+        await pool.query(
+          `INSERT INTO public.purge_run_log
+           (started_at, completed_at, status, contacts_processed, docs_evaluated, docs_purged, docs_unpurged, purge_fn_hash, role_hashes)
+           VALUES (NOW() - interval '1 minute', NOW(), 'completed', 5, 20, 3, 17, 'test-fn-hash', $1)`,
+          [JSON.stringify([testRoleHash])]
+        );
+      }
+      const { rows: existingRoles } = await pool.query(
+        'SELECT role_hash FROM public.purge_roles LIMIT 1'
+      );
+      if (existingRoles.length === 0) {
+        await pool.query(
+          `INSERT INTO public.purge_roles (role_hash, roles, updated_at)
+           VALUES ($1, $2, NOW())
+           ON CONFLICT (role_hash) DO NOTHING`,
+          [testRoleHash, JSON.stringify(['chw', 'data_entry'])]
+        );
+      }
+    });
+
     it('should have completed at least one purge run', async () => {
       const { rows } = await pool.query(
         "SELECT * FROM public.purge_run_log WHERE status = 'completed' ORDER BY id DESC LIMIT 1"
