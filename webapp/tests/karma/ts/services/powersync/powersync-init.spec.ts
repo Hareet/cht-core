@@ -216,4 +216,64 @@ describe('PowerSync Init', () => {
       await result.ready;
     });
   });
+
+  describe('feature flag', () => {
+    it('should not initialize when powersync.enabled is false in settings', async () => {
+      const getSettings = sinon.stub().resolves({ powersync: { enabled: false } });
+
+      const result = initializePowerSync(powerSyncService, sessionService, { getSettings });
+      await result.ready;
+
+      expect(result.attempted).to.be.true;
+      expect(powerSyncService.initialize.called).to.be.false;
+    });
+
+    it('should not initialize when powersync key is missing from settings', async () => {
+      const getSettings = sinon.stub().resolves({});
+
+      const result = initializePowerSync(powerSyncService, sessionService, { getSettings });
+      await result.ready;
+
+      expect(powerSyncService.initialize.called).to.be.false;
+    });
+
+    it('should initialize when powersync.enabled is true', async () => {
+      const getSettings = sinon.stub().resolves({ powersync: { enabled: true } });
+
+      const result = initializePowerSync(powerSyncService, sessionService, { getSettings });
+      await result.ready;
+
+      expect(powerSyncService.initialize.calledOnce).to.be.true;
+    });
+
+    it('should initialize when no getSettings callback is provided (default enabled)', async () => {
+      const result = initializePowerSync(powerSyncService, sessionService);
+      await result.ready;
+
+      expect(powerSyncService.initialize.calledOnce).to.be.true;
+    });
+
+    it('should not initialize when getSettings throws (fail-safe to disabled)', async () => {
+      const getSettings = sinon.stub().rejects(new Error('DB error'));
+
+      const result = initializePowerSync(powerSyncService, sessionService, { getSettings });
+      await result.ready;
+
+      expect(powerSyncService.initialize.called).to.be.false;
+    });
+
+    it('should pass devMode config when feature flag is enabled', async () => {
+      const getSettings = sinon.stub().resolves({ powersync: { enabled: true } });
+
+      const result = initializePowerSync(powerSyncService, sessionService, {
+        getSettings,
+        devMode: true,
+      });
+      await result.ready;
+
+      const config = powerSyncService.initialize.firstCall.args[0];
+      expect(config.devMode).to.be.true;
+      expect(config.devUser).to.be.an('object');
+    });
+  });
 });

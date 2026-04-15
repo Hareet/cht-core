@@ -10,6 +10,6 @@ export type { DeviceTier, DeviceTierName, TierConfig } from './device-tier.servi
 export { StorageHealthService } from './storage-health.service';
 export type { StorageHealthStatus, StorageHealthLevel } from './storage-health.service';
 export { initializePowerSync } from './powersync-init';
-export type { PowerSyncInitResult } from './powersync-init';
+export type { PowerSyncInitResult, PowerSyncInitOptions } from './powersync-init';
 export { generateDevToken } from './dev-token-provider';
 export type { DevTokenOptions } from './dev-token-provider';
