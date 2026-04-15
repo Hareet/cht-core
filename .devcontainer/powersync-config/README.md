@@ -194,14 +194,44 @@ review them. CHT's index walks the submitter's entire parent chain and adds each
 `_id` as a replication key. We replicate this by checking 5 levels of nested `contact.parent`
 in the Sync Streams query (covers typical hierarchy depth).
 
-### Why purge uses a trigger-based soft-delete pattern?
-PowerSync Sync Streams explicitly do not support `NOT IN` with subqueries or `LEFT JOIN`.
-This makes it impossible to express "exclude docs in purge_status" directly in SQL.
-Instead, a PostgreSQL trigger on `purge_status` INSERT checks whether ALL active roles
-have purged the document. Only when every role agrees does it set `_deleted=true` on the
-corresponding `couchdb` row. Since all Sync Streams already filter on `_deleted != true`,
-universally-purged documents are automatically excluded without any SQL changes.
-The per-role check prevents a purge by one role from hiding a doc that other roles need.
+### Why purge uses a two-layer exclusion strategy?
+PowerSync Sync Streams do not support `NOT EXISTS`, `NOT IN`, or `LEFT JOIN`.
+`auth.parameter()` can ONLY be used with the `=` operator against row data — it
+cannot appear inside `ifnull()`, `instr()`, `->>`, or with `!=`.
+(Validated 2026-04-15 via `/api/admin/v1/validate`.)
+
+**Layer 1: Per-role purge (INNER JOIN)**
+Purgeable doc queries (reports, targets, tasks) use:
+```sql
+INNER JOIN "v1"."purge_status" ps ON ps.doc_id = t._id
+  AND ps.role_hash = auth.parameter('role_hash') AND ps.purged = false
+```
+This requires every purgeable doc to have a `purge_status` row. New docs get rows
+via the `auto_create_purge_status` trigger (purged=false for all active roles).
+Contacts are never purged and don't need the JOIN.
+
+**Layer 2: Universal purge (soft-delete trigger)**
+When ALL active roles have purged a doc, `purge_soft_delete` sets `_deleted=true`
+on the couchdb row. This is a safety net — universally-purged docs are excluded
+from ALL streams (including contacts) via the existing `_deleted != true` filter.
+
+### Purge JOIN performance (EXPLAIN ANALYZE at 600K docs)
+The purge_status PK lookup per row is 0.006-0.03ms — negligible overhead.
+However, PostgreSQL's planner may choose suboptimal batch query plans by driving
+from purge_status (268K rows per role) rather than from couchdb's selective
+conditions. This is a known issue with JSONB expression selectivity estimation.
+
+| Query | With purge JOIN | Per-row PK lookup | Notes |
+|-------|----------------|-------------------|-------|
+| Subject-matched reports | 10ms (NL) / 283ms (MJ) | 0.011ms | Merge join scans 73K index entries |
+| User's own reports | <1ms driven from couchdb | 0.006ms | PK lookup is the fast path |
+| Tasks | <1ms driven from couchdb | 0.003ms | 1 task per user, trivial |
+| Targets | <1ms driven from couchdb | 0.006ms | 47 targets, trivial |
+| Needs-signoff (dual JOIN) | 0.5ms | never executed | Tiny driving table |
+| Unassigned reports | <1ms driven from couchdb | 0.008ms | 3 unassigned docs |
+
+For PowerSync incremental sync (WAL-based), per-row cost is what matters.
+For a CHW with 5,000 docs: 5000 * 0.01ms = 50ms total purge check.
 
 ### Why pre-expand children in user_accessible_facilities?
 The contacts query originally had `_id IN accessible_facilities OR parent IN
@@ -251,7 +281,8 @@ as a column. This preserves backward compatibility with code expecting the full 
 
 1. **Full purge.js logic**: Turing-complete JS cannot be expressed in SQL.
    Requires Agent 4's purge preprocessing service to populate `purge_status` table.
-   Purge exclusion is handled via trigger-based soft-delete (see Design Decisions).
+   Purge exclusion uses two layers: per-role INNER JOIN on purgeable docs +
+   universal soft-delete trigger (see Design Decisions).
 
 2. **Sensitivity check simplified**: CHT's full `isSensitive()` checks subject/submitter
    relationship chains including whether the user can see the submitter. Our privacy filter
@@ -357,7 +388,9 @@ records, 1 task, 1 target, forms, translations). Test script: `test-sync-streams
 | No shortcode pollution in contacts/targets | PASS | After fix: 6 contact buckets (all non-empty, all UUIDs) |
 | SMS messages SQL (PostgreSQL test) | PASS | Correctly matches `test-sms-message` by contact hierarchy |
 | Unassigned reports SQL (PostgreSQL test) | PASS | Correctly matches `test-unassigned-report` when `can_view_unallocated=true` |
-| Purge soft-delete trigger | PASS | Trigger on purge_status sets `_deleted=true`, excluded by all streams |
+| Purge soft-delete trigger (Layer 2) | PASS | Trigger on purge_status sets `_deleted=true` when ALL roles purge |
+| Purge INNER JOIN filter (Layer 1) | PASS | Per-role purge via `INNER JOIN purge_status WHERE purged=false` |
+| Purge auto-init trigger | PASS | New data_record/task/target docs get purge_status rows on INSERT |
 | place_uuid subject matching | PASS | `test-report-place-uuid` matched via `place_uuid IN report_facilities` |
 | fields.place_uuid subject matching | PASS | `test-report-fields-place-uuid` matched via `fields.place_uuid IN report_facilities` |
 | fields.patient_uuid subject matching | PASS | `test-report-fields-patient-uuid` matched via `fields.patient_uuid` |
