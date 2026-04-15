@@ -758,12 +758,18 @@ DECLARE
   v_place_id TEXT;
   v_is_person BOOLEAN;
 BEGIN
-  -- Determine if this contact is a person
+  -- Determine if this contact is a person.
+  -- Uses person_contact_types view (from app_settings) for generic detection
+  -- that works for any CHT project hierarchy.
   v_is_person := (
     NEW.doc ->> 'type' = 'person'
     OR (
       NEW.doc ->> 'type' = 'contact'
-      AND COALESCE(NEW.doc ->> 'contact_type', 'person') = 'person'
+      AND (
+        EXISTS (SELECT 1 FROM v1.person_contact_types
+                WHERE contact_type_id = NEW.doc ->> 'contact_type')
+        OR NEW.doc ->> 'contact_type' IS NULL
+      )
     )
   );
 
@@ -946,6 +952,7 @@ SELECT v1.refresh_all_user_facilities();
 
 -- Batch-populate contact_parent_place (person → parent place lookup)
 -- Used by Sync Stream JOINs for person contacts and SMS matching.
+-- Uses person_contact_types view for generic person detection.
 TRUNCATE v1.contact_parent_place;
 INSERT INTO v1.contact_parent_place (contact_id, place_id)
 SELECT c._id, COALESCE(c.doc -> 'parent' ->> '_id', c.doc ->> 'parent')
@@ -954,7 +961,11 @@ WHERE NOT COALESCE(c._deleted, false)
   AND (
     c.doc ->> 'type' = 'person'
     OR (c.doc ->> 'type' = 'contact'
-        AND COALESCE(c.doc ->> 'contact_type', 'person') = 'person')
+        AND (
+          EXISTS (SELECT 1 FROM v1.person_contact_types
+                  WHERE contact_type_id = c.doc ->> 'contact_type')
+          OR c.doc ->> 'contact_type' IS NULL
+        ))
   )
   AND COALESCE(c.doc -> 'parent' ->> '_id', c.doc ->> 'parent') IS NOT NULL
 ON CONFLICT (contact_id) DO NOTHING;
