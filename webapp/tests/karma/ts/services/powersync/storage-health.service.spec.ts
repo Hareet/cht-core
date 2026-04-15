@@ -50,13 +50,14 @@ describe('StorageHealthService', () => {
       expect(status.usagePercent).to.be.closeTo(10, 0.1);
     });
 
-    it('should return warning when free space is below 100MB', async () => {
-      storageEstimateStub.resolves({ quota: 10 * GB, usage: 10 * GB - 80 * MB });
+    it('should return warning when free space is below 100MB but usage percent is under 80%', async () => {
+      // 150MB total, 80MB used → 70MB free (<100MB), 53% usage (<80%) → warning not critical
+      storageEstimateStub.resolves({ quota: 150 * MB, usage: 80 * MB });
 
       const status = await service.checkStorage();
 
       expect(status.level).to.equal('warning');
-      expect(status.freeBytes).to.equal(80 * MB);
+      expect(status.freeBytes).to.equal(70 * MB);
     });
 
     it('should return warning when usage exceeds 60%', async () => {
