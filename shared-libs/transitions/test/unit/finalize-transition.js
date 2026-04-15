@@ -24,7 +24,7 @@ describe('finalize transition', () => {
 
   it('save is called if transition results have changes', done => {
     const doc = { _rev: '1' };
-    const saveDoc = sinon.stub(db.medic, 'put').callsArgWith(1, null, { ok: true });
+    const saveDoc = sinon.stub(db.medic, 'put').resolves({ ok: true });
     sinon.stub(infodoc, 'saveTransitions').resolves();
     transitions.finalize(
       {
@@ -44,7 +44,7 @@ describe('finalize transition', () => {
 
   it('should callback with save errors', done => {
     const doc = { _rev: '1' };
-    const saveDoc = sinon.stub(db.medic, 'put').callsArgWith(1, { error: 'something' });
+    const saveDoc = sinon.stub(db.medic, 'put').rejects({ error: 'something' });
     sinon.stub(infodoc, 'saveTransitions').resolves();
     transitions.finalize(
       {

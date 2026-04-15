@@ -271,7 +271,9 @@ const finalize = ({ change, results }, callback) => {
 
 const saveDoc = (change, callback) => {
   lineage.minify(change.doc);
-  db.medic.put(change.doc, callback);
+  db.medic.put(change.doc)
+    .then(result => callback(null, result))
+    .catch(err => callback(err));
 };
 
 /*

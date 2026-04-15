@@ -41,26 +41,6 @@ const generateRev = (currentRev) => {
 };
 
 /**
- * Wrap an async function to support PouchDB-style Node callbacks.
- * If the last argument is a function, it's treated as a (err, result) callback.
- * Otherwise the promise is returned as-is.
- */
-const withCallback = (asyncFn) => {
-  return function(...args) {
-    const lastArg = args[args.length - 1];
-    if (typeof lastArg === 'function') {
-      const callback = lastArg;
-      const fnArgs = args.slice(0, -1);
-      asyncFn.apply(this, fnArgs)
-        .then(result => callback(null, result))
-        .catch(err => callback(err));
-      return; // PouchDB callback style doesn't return a promise
-    }
-    return asyncFn.apply(this, args);
-  };
-};
-
-/**
  * Throw a 409 conflict error if a document exists with a different _rev.
  * Returns silently if the document doesn't exist at all.
  */
@@ -87,9 +67,9 @@ const createDbProxy = (tableName, schema = SCHEMA) => {
 
   return {
     /**
-     * PouchDB .get(id) → SELECT doc. Supports callback as second argument.
+     * PouchDB .get(id) → SELECT doc
      */
-    get: withCallback(async (id) => {
+    get: async (id) => {
       const { rows } = await pool.query(
         `SELECT _id, doc, _deleted, saved_timestamp FROM ${qt}
          WHERE _id = $1`,
@@ -109,7 +89,7 @@ const createDbProxy = (tableName, schema = SCHEMA) => {
         throw err;
       }
       return row.doc;
-    }),
+    },
 
     /**
      * PouchDB .put(doc) → INSERT or UPDATE with _rev optimistic locking.
@@ -117,9 +97,8 @@ const createDbProxy = (tableName, schema = SCHEMA) => {
      * When doc._rev is provided, the update only succeeds if the stored
      * document has the same _rev (CouchDB-compatible conflict detection).
      * Throws a 409 error if another writer changed the doc first.
-     * Supports PouchDB-style callback as optional second argument.
      */
-    put: withCallback(async (doc) => {
+    put: async (doc) => {
       const id = doc._id;
       const newRev = generateRev(doc._rev);
       const newDoc = { ...doc, _rev: newRev };
@@ -179,12 +158,12 @@ const createDbProxy = (tableName, schema = SCHEMA) => {
         );
       }
       return { ok: true, id, rev: newRev };
-    }),
+    },
 
     /**
      * PouchDB .post(doc) → INSERT with generated ID
      */
-    post: withCallback(async (doc) => {
+    post: async (doc) => {
       const id = doc._id || require('crypto').randomUUID();
       const rev = generateRev();
       const newDoc = { ...doc, _id: id, _rev: rev };
@@ -194,12 +173,12 @@ const createDbProxy = (tableName, schema = SCHEMA) => {
         [id, JSON.stringify(newDoc)]
       );
       return { ok: true, id, rev };
-    }),
+    },
 
     /**
      * PouchDB .remove(doc) → mark _deleted = true
      */
-    remove: withCallback(async (doc) => {
+    remove: async (doc) => {
       const id = typeof doc === 'string' ? doc : doc._id;
       const rev = typeof doc === 'string' ? undefined : doc._rev;
       const newRev = generateRev(rev);
@@ -209,12 +188,12 @@ const createDbProxy = (tableName, schema = SCHEMA) => {
         [id]
       );
       return { ok: true, id, rev: newRev };
-    }),
+    },
 
     /**
      * PouchDB .allDocs(opts) → SELECT with various filtering modes
      */
-    allDocs: withCallback(async (opts = {}) => {
+    allDocs: async (opts = {}) => {
       const params = [];
       let sql;
 
@@ -284,12 +263,12 @@ const createDbProxy = (tableName, schema = SCHEMA) => {
         })),
         total_rows: rows.length,
       };
-    }),
+    },
 
     /**
      * PouchDB .bulkDocs(docs) → batch INSERT/UPDATE with _rev optimistic locking
      */
-    bulkDocs: withCallback(async (docsOrObj) => {
+    bulkDocs: async (docsOrObj) => {
       const docs = Array.isArray(docsOrObj) ? docsOrObj : docsOrObj.docs;
       if (!docs || docs.length === 0) {
         return [];
@@ -352,14 +331,14 @@ const createDbProxy = (tableName, schema = SCHEMA) => {
         client.release();
       }
       return results;
-    }),
+    },
 
     /**
      * PouchDB .query(viewName, opts) → SQL equivalent of CouchDB views
      */
-    query: withCallback(async (viewName, opts = {}) => {
+    query: async (viewName, opts = {}) => {
       return queryView(viewName, opts);
-    }),
+    },
 
     /**
      * PouchDB .changes(opts) → delegate to pg-changes module
@@ -379,14 +358,14 @@ const createDbProxy = (tableName, schema = SCHEMA) => {
     /**
      * PouchDB .info() → basic db stats
      */
-    info: withCallback(async () => {
+    info: async () => {
       const { rows } = await pool.query(`SELECT count(*) as count FROM ${qt}`);
       return {
         db_name: `${schema}.${tableName}`,
         doc_count: parseInt(rows[0].count, 10),
         update_seq: 'postgresql',
       };
-    }),
+    },
   };
 };
 
@@ -656,22 +635,13 @@ const createSentinelDb = () => {
 
   const proxy = createDbProxy('docs', 'sentinel');
 
-  // Wrap each method to ensure table exists, preserving callback support
+  // Wrap each method to ensure table exists before first use
   const wrapped = {};
   for (const [key, fn] of Object.entries(proxy)) {
     if (typeof fn === 'function') {
-      wrapped[key] = function(...args) {
-        const lastArg = args[args.length - 1];
-        if (typeof lastArg === 'function') {
-          // Callback style: init first, then delegate (callback handled by fn's withCallback)
-          const callback = lastArg;
-          init()
-            .then(() => fn(...args))
-            .catch(err => callback(err));
-          return;
-        }
-        // Promise style
-        return init().then(() => fn(...args));
+      wrapped[key] = async (...args) => {
+        await init();
+        return fn(...args);
       };
     } else {
       wrapped[key] = fn;

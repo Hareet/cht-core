@@ -233,119 +233,64 @@ describe('db-postgresql', () => {
     });
   });
 
-  describe('callback support', () => {
+  describe('promise API', () => {
 
-    it('put supports PouchDB-style callback on success', (done) => {
-      mockPool.query.resolves({ rows: [], rowCount: 1 });
-
-      const doc = { _id: 'doc-1', type: 'data_record' };
-      dbPg.medic.put(doc, (err, result) => {
-        expect(err).to.be.null;
-        expect(result.ok).to.equal(true);
-        expect(result.id).to.equal('doc-1');
-        done();
-      });
-    });
-
-    it('put supports PouchDB-style callback on error', (done) => {
-      mockPool.query.rejects(new Error('connection lost'));
-
-      const doc = { _id: 'doc-1', type: 'data_record' };
-      dbPg.medic.put(doc, (err) => {
-        expect(err).to.exist;
-        expect(err.message).to.equal('connection lost');
-        done();
-      });
-    });
-
-    it('put returns promise when no callback', async () => {
+    it('put returns promise that resolves on success', async () => {
       mockPool.query.resolves({ rows: [], rowCount: 1 });
       const doc = { _id: 'doc-1', type: 'data_record' };
       const result = await dbPg.medic.put(doc);
       expect(result.ok).to.equal(true);
+      expect(result.id).to.equal('doc-1');
     });
 
-    it('get supports PouchDB-style callback on success', (done) => {
+    it('put returns promise that rejects on error', async () => {
+      mockPool.query.rejects(new Error('connection lost'));
+      const doc = { _id: 'doc-1', type: 'data_record' };
+      try {
+        await dbPg.medic.put(doc);
+        expect.fail('should have thrown');
+      } catch (err) {
+        expect(err.message).to.equal('connection lost');
+      }
+    });
+
+    it('get returns promise that resolves with doc', async () => {
       const testDoc = { _id: 'doc-1', _rev: '1-abc', type: 'person' };
       mockPool.query.resolves({
         rows: [{ _id: 'doc-1', doc: testDoc, _deleted: false }],
         rowCount: 1
       });
-
-      dbPg.medic.get('doc-1', (err, result) => {
-        expect(err).to.be.null;
-        expect(result._id).to.equal('doc-1');
-        expect(result.type).to.equal('person');
-        done();
-      });
+      const result = await dbPg.medic.get('doc-1');
+      expect(result._id).to.equal('doc-1');
+      expect(result.type).to.equal('person');
     });
 
-    it('get supports PouchDB-style callback on 404', (done) => {
+    it('get returns promise that rejects with 404', async () => {
       mockPool.query.resolves({ rows: [], rowCount: 0 });
-
-      dbPg.medic.get('missing-doc', (err) => {
-        expect(err).to.exist;
+      try {
+        await dbPg.medic.get('missing-doc');
+        expect.fail('should have thrown');
+      } catch (err) {
         expect(err.status).to.equal(404);
-        done();
-      });
+      }
     });
 
-    it('put calls callback with 409 conflict error', (done) => {
-      // UPDATE fails
-      mockPool.query.onFirstCall().resolves({ rows: [], rowCount: 0 });
-      // Doc exists with different rev
-      mockPool.query.onSecondCall().resolves({
-        rows: [{ current_rev: '2-pgother' }],
-        rowCount: 1
-      });
-
-      const doc = { _id: 'doc-1', _rev: '1-pgstale', type: 'data_record' };
-      dbPg.medic.put(doc, (err) => {
-        expect(err).to.exist;
-        expect(err.status).to.equal(409);
-        expect(err.name).to.equal('conflict');
-        done();
-      });
-    });
-
-    it('sentinel db wrapper supports callback-style put', (done) => {
-      // Sentinel methods are doubly-wrapped: init wrapper → withCallback wrapper
-      // CREATE SCHEMA / CREATE TABLE calls from init
+    it('sentinel wrapper resolves via promise', async () => {
       mockPool.query.resolves({ rows: [], rowCount: 1 });
-
       const doc = { _id: 'info-doc-1', type: 'info', doc_id: 'report-1' };
-      dbPg.sentinel.put(doc, (err, result) => {
-        expect(err).to.be.null;
-        expect(result.ok).to.equal(true);
-        expect(result.id).to.equal('info-doc-1');
-        done();
-      });
+      const result = await dbPg.sentinel.put(doc);
+      expect(result.ok).to.equal(true);
+      expect(result.id).to.equal('info-doc-1');
     });
 
-    it('sentinel db wrapper supports callback-style get', (done) => {
-      const testDoc = { _id: 'info-doc-1', _rev: '1-pg123', type: 'info' };
-      // First calls: CREATE SCHEMA + CREATE TABLE from init
-      // Then: SELECT for get
-      mockPool.query.resolves({
-        rows: [{ _id: 'info-doc-1', doc: testDoc, _deleted: false }],
-        rowCount: 1
-      });
-
-      dbPg.sentinel.get('info-doc-1', (err, result) => {
-        expect(err).to.be.null;
-        expect(result._id).to.equal('info-doc-1');
-        done();
-      });
-    });
-
-    it('sentinel db wrapper passes init errors to callback', (done) => {
+    it('sentinel wrapper rejects on init error', async () => {
       mockPool.query.rejects(new Error('connection refused'));
-
-      dbPg.sentinel.get('some-id', (err) => {
-        expect(err).to.exist;
+      try {
+        await dbPg.sentinel.get('some-id');
+        expect.fail('should have thrown');
+      } catch (err) {
         expect(err.message).to.equal('connection refused');
-        done();
-      });
+      }
     });
   });
 

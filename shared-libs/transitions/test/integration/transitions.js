@@ -41,7 +41,7 @@ describe('functional transitions', () => {
     });
     const infoDocSave = sinon.stub(infodoc, 'saveTransitions').resolves();
     sinon.stub(db.medic, 'get').rejects({ status: 404 });
-    const saveDoc = sinon.stub(db.medic, 'put').callsArgWith(1, null, { ok: true });
+    const saveDoc = sinon.stub(db.medic, 'put').resolves({ ok: true });
 
     transitions.loadTransitions();
     const change1 = {
@@ -96,7 +96,7 @@ describe('functional transitions', () => {
       },
     });
 
-    const saveDoc = sinon.stub(db.medic, 'put').callsArgWith(1, null, { ok: true });
+    const saveDoc = sinon.stub(db.medic, 'put').resolves({ ok: true });
     const infoDoc = sinon.stub(infodoc, 'saveTransitions').resolves();
 
     transitions.loadTransitions();
@@ -163,7 +163,7 @@ describe('functional transitions', () => {
     });
     configGet.withArgs('forms').returns({ V: { }});
 
-    const saveDoc = sinon.stub(db.medic, 'put').callsArgWith(1, null, { ok: true });
+    const saveDoc = sinon.stub(db.medic, 'put').resolves({ ok: true });
     const infoDoc = sinon.stub(infodoc, 'saveTransitions').resolves();
 
     transitions.loadTransitions();
@@ -293,7 +293,7 @@ describe('functional transitions', () => {
         sinon.stub(infodoc, 'get').resolves(info);
         sinon.stub(infodoc, 'saveTransitions').resolves();
 
-        sinon.stub(db.medic, 'put').callsArgWith(1, null, { ok: true });
+        sinon.stub(db.medic, 'put').resolves({ ok: true });
         sinon.spy(transitions, 'applyTransitions');
 
         const doc = {
@@ -350,7 +350,7 @@ describe('functional transitions', () => {
 
       sinon.stub(infodoc, 'get').resolves({});
       sinon.stub(infodoc, 'saveTransitions').resolves();
-      sinon.stub(db.medic, 'put').callsArgWith(1, { error: 'something' });
+      sinon.stub(db.medic, 'put').rejects({ error: 'something' });
 
       const doc = {
         _id: 'my_id',
@@ -521,7 +521,7 @@ describe('functional transitions', () => {
       sinon.stub(db.sentinel, 'get').callsFake(id => Promise.resolve({ id, doc_id: id.replace('-info', '') }));
       sinon.stub(db.sentinel, 'put').resolves();
 
-      sinon.stub(db.medic, 'put').callsArgWith(1, null, { ok: true });
+      sinon.stub(db.medic, 'put').resolves({ ok: true });
 
       sinon.stub(db.medic, 'query')
       // update_clinics
