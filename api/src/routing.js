@@ -522,6 +522,7 @@ app.putJson('/api/v1/report/:uuid', report.v1.update);
 app.postJson('/api/v1/bulk-delete', bulkDocs.bulkDelete);
 
 app.postJson('/api/v1/powersync/upload', powersyncUpload.upload);
+app.get('/api/v1/powersync/status', powersyncUpload.status);
 
 app.get('/api/v1/admin/feature-flags/:feature', featureFlagsController.get);
 app.putJson('/api/v1/admin/feature-flags/:feature', featureFlagsController.put);

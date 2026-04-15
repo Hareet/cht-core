@@ -387,4 +387,25 @@ describe('PowerSync Upload Controller', () => {
       expect(createArg.type).to.equal('data_record');
     });
   });
+
+  describe('status', () => {
+    it('returns powersync_enabled true when feature is enabled', async () => {
+      // getUserCtx, getUserSettings, isFeatureEnabled already stubbed in beforeEach
+      req = {};
+      await controller.status(req, res);
+
+      expect(res.json.calledOnce).to.be.true;
+      expect(res.json.firstCall.args[0]).to.deep.equal({ powersync_enabled: true });
+    });
+
+    it('returns powersync_enabled false when feature is disabled', async () => {
+      featureFlags.isFeatureEnabled.returns(false);
+
+      req = {};
+      await controller.status(req, res);
+
+      expect(res.json.calledOnce).to.be.true;
+      expect(res.json.firstCall.args[0]).to.deep.equal({ powersync_enabled: false });
+    });
+  });
 });

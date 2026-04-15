@@ -162,6 +162,9 @@ module.exports = {
     const userCtx = await auth.getUserCtx(req);
     const userSettings = await auth.getUserSettings(userCtx);
     if (!featureFlags.isFeatureEnabled('powersync', userSettings)) {
+      // IMPORTANT: PowerSync SDK retries on 4xx/5xx errors, which will block the upload queue.
+      // The client-side uploadData() implementation MUST catch 403 specifically and handle it
+      // by falling back to CouchDB replication instead of rethrowing. See Agent 5's connector.
       return serverUtils.error(
         { code: 403, message: 'PowerSync is not enabled for this user.' },
         req, res
@@ -192,6 +195,22 @@ module.exports = {
     }
 
     return res.json({ results });
+  }),
+
+  /**
+   * GET /api/v1/powersync/status
+   *
+   * Returns whether PowerSync is enabled for the authenticated user.
+   * The client should call this BEFORE instantiating PowerSync to avoid
+   * creating an upload queue that will be blocked by 403 errors.
+   *
+   * Response: { powersync_enabled: boolean }
+   */
+  status: serverUtils.doOrError(async (req, res) => {
+    const userCtx = await auth.getUserCtx(req);
+    const userSettings = await auth.getUserSettings(userCtx);
+    const enabled = featureFlags.isFeatureEnabled('powersync', userSettings);
+    return res.json({ powersync_enabled: enabled });
   }),
 
   // Exported for testing
