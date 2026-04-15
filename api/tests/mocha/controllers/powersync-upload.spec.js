@@ -2,6 +2,7 @@ const sinon = require('sinon');
 const auth = require('../../../src/auth');
 const dataContext = require('../../../src/services/data-context');
 const serverUtils = require('../../../src/server-utils');
+const featureFlags = require('../../../src/services/feature-flags');
 const { Report, Person, Place, Qualifier } = require('@medic/cht-datasource');
 const { expect } = require('chai');
 
@@ -40,6 +41,13 @@ describe('PowerSync Upload Controller', () => {
   beforeEach(() => {
     serverUtilsError = sinon.stub(serverUtils, 'error');
     assertPermissions = sinon.stub(auth, 'assertPermissions').resolves();
+    sinon.stub(auth, 'getUserCtx').resolves({ name: 'test-user', roles: ['chw'] });
+    sinon.stub(auth, 'getUserSettings').resolves({
+      name: 'test-user',
+      roles: ['chw'],
+      facility_id: ['facility-1'],
+    });
+    sinon.stub(featureFlags, 'isFeatureEnabled').returns(true);
     res = { json: sinon.stub() };
   });
 
@@ -58,6 +66,21 @@ describe('PowerSync Upload Controller', () => {
         req,
         { isOnline: false, hasAny: ['can_create_records', 'can_edit'] }
       )).to.be.true;
+    });
+
+    it('returns 403 when PowerSync feature flag is disabled for user', async () => {
+      featureFlags.isFeatureEnabled.returns(false);
+      req = { body: { crud: [{ op: 'PUT', table: 'reports', id: 'r1', opData: {} }] } };
+
+      await controller.upload(req, res);
+
+      expect(featureFlags.isFeatureEnabled.calledOnce).to.be.true;
+      expect(featureFlags.isFeatureEnabled.firstCall.args[0]).to.equal('powersync');
+      expect(featureFlags.isFeatureEnabled.firstCall.args[1]).to.deep.include({ name: 'test-user' });
+      expect(serverUtilsError.calledOnce).to.be.true;
+      expect(serverUtilsError.firstCall.args[0].code).to.equal(403);
+      expect(serverUtilsError.firstCall.args[0].message).to.equal('PowerSync is not enabled for this user.');
+      expect(res.json.called).to.be.false;
     });
 
     it('returns error when body has no crud array', async () => {

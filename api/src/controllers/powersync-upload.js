@@ -18,6 +18,7 @@ const serverUtils = require('../server-utils');
 const ctx = require('../services/data-context');
 const { Report, Person, Place, Qualifier } = require('@medic/cht-datasource');
 const logger = require('@medic/logger');
+const featureFlags = require('../services/feature-flags');
 
 const createReport = ctx.bind(Report.v1.create);
 const createPerson = ctx.bind(Person.v1.create);
@@ -157,6 +158,15 @@ module.exports = {
    */
   upload: serverUtils.doOrError(async (req, res) => {
     await auth.assertPermissions(req, { isOnline: false, hasAny: ['can_create_records', 'can_edit'] });
+
+    const userCtx = await auth.getUserCtx(req);
+    const userSettings = await auth.getUserSettings(userCtx);
+    if (!featureFlags.isFeatureEnabled('powersync', userSettings)) {
+      return serverUtils.error(
+        { code: 403, message: 'PowerSync is not enabled for this user.' },
+        req, res
+      );
+    }
 
     const { crud } = req.body;
 
