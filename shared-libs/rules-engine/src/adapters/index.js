@@ -19,11 +19,11 @@ const { createChtBackendConnector } = require('./powersync-connector');
  */
 const create = (type, db) => {
   switch (type) {
-  case 'powersync':
-    return powersyncProvider(db);
-  case 'pouchdb':
-  default:
-    return pouchdbProvider(db);
+    case 'powersync':
+      return powersyncProvider(db);
+    case 'pouchdb':
+    default:
+      return pouchdbProvider(db);
   }
 };
 

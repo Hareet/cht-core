@@ -19,7 +19,6 @@
  */
 
 const chai = require('chai');
-const moment = require('moment');
 const sinon = require('sinon');
 
 const rulesEmitter = require('../src/rules-emitter');
@@ -137,11 +136,11 @@ const createMockPowerSyncDb = ({ contentionDelayMs = 0 } = {}) => {
     }
     const isNull = trimmed.match(/^(\w+)\s+IS\s+NULL$/i);
     if (isNull) {
-      return row[isNull[1]] == null;
+      return row[isNull[1]] === null || row[isNull[1]] === undefined;
     }
     const isNotNull = trimmed.match(/^(\w+)\s+IS\s+NOT\s+NULL$/i);
     if (isNotNull) {
-      return row[isNotNull[1]] != null;
+      return row[isNotNull[1]] !== null && row[isNotNull[1]] !== undefined;
     }
     const notIn = trimmed.match(/^(\w+)\s+NOT\s+IN\s+\(([^)]+)\)/i);
     if (notIn) {
@@ -173,7 +172,7 @@ const createMockPowerSyncDb = ({ contentionDelayMs = 0 } = {}) => {
     const neqLit = trimmed.match(/^(\w+)\s*!=\s*'([^']*)'/);
     if (neqLit) {
       const val = row[neqLit[1]];
-      if (val == null) {
+      if (val === null || val === undefined) {
         return false;
       }
       return val !== neqLit[2];
@@ -401,7 +400,7 @@ describe('PowerSync adapter performance', function () {
       );
 
       // Log performance metrics for CI visibility
-      // eslint-disable-next-line no-console
+       
       console.log(`    [perf] Full refresh: ${elapsed.toFixed(0)}ms, ` +
         `${writtenTasks.length} tasks, ${writtenTargets.length} targets, ` +
         `heap delta: ${heapDeltaMb.toFixed(1)}MB`);
@@ -431,7 +430,7 @@ describe('PowerSync adapter performance', function () {
         `Targeted refresh took ${elapsed.toFixed(0)}ms, exceeds ${THRESHOLDS.targetedRefreshMs}ms threshold`
       );
 
-      // eslint-disable-next-line no-console
+       
       console.log(`    [perf] Targeted refresh (1 contact): ${elapsed.toFixed(0)}ms`);
     });
   });
@@ -460,7 +459,7 @@ describe('PowerSync adapter performance', function () {
         `Peak memory delta ${peakDeltaMb.toFixed(1)}MB exceeds ${THRESHOLDS.peakMemoryMb}MB budget`
       );
 
-      // eslint-disable-next-line no-console
+       
       console.log(`    [perf] Peak memory delta: ${peakDeltaMb.toFixed(1)}MB ` +
         `(heap: ${(heapAfter / (1024 * 1024)).toFixed(0)}MB)`);
     });
@@ -490,7 +489,7 @@ describe('PowerSync adapter performance', function () {
       expect(growthRatio).to.be.below(2.0,
         `Heap grew ${growthRatio.toFixed(2)}x across 3 cycles (potential leak)`);
 
-      // eslint-disable-next-line no-console
+       
       console.log(`    [perf] Heap across 3 cycles: ` +
         heapSamples.map(h => `${(h / (1024 * 1024)).toFixed(0)}MB`).join(' → ') +
         ` (${growthRatio.toFixed(2)}x growth)`);
@@ -566,7 +565,7 @@ describe('PowerSync adapter performance', function () {
         ? contentionElapsed / baselineElapsed
         : 1.0;
 
-      // eslint-disable-next-line no-console
+       
       console.log(`    [perf] Contention test: baseline=${baselineElapsed.toFixed(0)}ms, ` +
         `contention=${contentionElapsed.toFixed(0)}ms, overhead=${overhead.toFixed(2)}x, ` +
         `queries=${queryCount}`);
@@ -593,7 +592,7 @@ describe('PowerSync adapter performance', function () {
       // Verify tasks were generated successfully despite large dataset
       expect(mockDb._tables.tasks.length).to.be.greaterThan(0);
 
-      // eslint-disable-next-line no-console
+       
       console.log(`    [perf] 100 contacts + 200 reports: ` +
         `${mockDb._tables.tasks.length} tasks generated`);
     });
@@ -636,7 +635,7 @@ describe('PowerSync adapter performance', function () {
         `Task count scaling: expected ~${expectedRatio}x, got ${actualRatio.toFixed(2)}x`
       );
 
-      // eslint-disable-next-line no-console
+       
       console.log(`    [perf] Scaling: 5 contacts → ${smallTaskCount} tasks, ` +
         `25 contacts → ${largeTaskCount} tasks (${actualRatio.toFixed(2)}x)`);
     });

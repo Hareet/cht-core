@@ -55,50 +55,50 @@ const processOperation = async (apiUrl, getAuthToken, op) => {
   const doc = op.opData?.doc ? JSON.parse(op.opData.doc) : { _id: op.id };
 
   switch (op.op) {
-  case 'PUT': {
+    case 'PUT': {
     // New document — POST to CHT API bulk docs endpoint
-    const response = await fetch(`${apiUrl}/api/v1/records`, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify({ docs: [doc] }),
-    });
-    if (!response.ok && response.status >= 500) {
-      throw new Error(`Server error uploading ${op.table}/${op.id}: ${response.status}`);
+      const response = await fetch(`${apiUrl}/api/v1/records`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ docs: [doc] }),
+      });
+      if (!response.ok && response.status >= 500) {
+        throw new Error(`Server error uploading ${op.table}/${op.id}: ${response.status}`);
+      }
+      // 4xx errors are surfaced but don't block the queue
+      if (!response.ok) {
+        console.error(`Upload rejected for ${op.table}/${op.id}: ${response.status}`);
+      }
+      break;
     }
-    // 4xx errors are surfaced but don't block the queue
-    if (!response.ok) {
-      console.error(`Upload rejected for ${op.table}/${op.id}: ${response.status}`);
-    }
-    break;
-  }
 
-  case 'PATCH': {
+    case 'PATCH': {
     // Updated document — PUT to CHT API
-    const response = await fetch(`${apiUrl}/medic/${encodeURIComponent(op.id)}`, {
-      method: 'PUT',
-      headers,
-      body: JSON.stringify(doc),
-    });
-    if (!response.ok && response.status >= 500) {
-      throw new Error(`Server error updating ${op.table}/${op.id}: ${response.status}`);
+      const response = await fetch(`${apiUrl}/medic/${encodeURIComponent(op.id)}`, {
+        method: 'PUT',
+        headers,
+        body: JSON.stringify(doc),
+      });
+      if (!response.ok && response.status >= 500) {
+        throw new Error(`Server error updating ${op.table}/${op.id}: ${response.status}`);
+      }
+      if (!response.ok) {
+        console.error(`Update rejected for ${op.table}/${op.id}: ${response.status}`);
+      }
+      break;
     }
-    if (!response.ok) {
-      console.error(`Update rejected for ${op.table}/${op.id}: ${response.status}`);
-    }
-    break;
-  }
 
-  case 'DELETE': {
+    case 'DELETE': {
     // Task/target deletion — rare, but handle it
-    const response = await fetch(`${apiUrl}/medic/${encodeURIComponent(op.id)}`, {
-      method: 'DELETE',
-      headers,
-    });
-    if (!response.ok && response.status >= 500) {
-      throw new Error(`Server error deleting ${op.table}/${op.id}: ${response.status}`);
+      const response = await fetch(`${apiUrl}/medic/${encodeURIComponent(op.id)}`, {
+        method: 'DELETE',
+        headers,
+      });
+      if (!response.ok && response.status >= 500) {
+        throw new Error(`Server error deleting ${op.table}/${op.id}: ${response.status}`);
+      }
+      break;
     }
-    break;
-  }
   }
 };
 
@@ -122,7 +122,7 @@ const createChtBackendConnector = ({ apiUrl, getAuthToken, powersyncUrl = 'http:
       return {
         endpoint: powersyncUrl,
         token,
-        expiresAt: new Date(Date.now() + 3600_000), // 1 hour hint
+        expiresAt: new Date(Date.now() + 3600000), // 1 hour hint
       };
     },
 

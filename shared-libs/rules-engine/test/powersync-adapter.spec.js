@@ -1,10 +1,8 @@
 const chai = require('chai');
 const chaiAsPromised = require('chai-as-promised');
 const sinon = require('sinon');
-const moment = require('moment');
 
 const powersyncProvider = require('../src/adapters/powersync-adapter');
-const { chtDocs } = require('./mocks');
 const { expect } = chai;
 chai.use(chaiAsPromised);
 
@@ -158,37 +156,31 @@ const createMockDb = () => {
     rules_state_store: [],
   };
 
-  const matchesCondition = (row, sql, params) => {
-    // Simple SQL parser for our test queries - handles IN, =, NOT IN, AND, OR
-    // This is intentionally minimal, covering only the patterns used by the adapter
-    return true; // We'll use a more targeted approach below
-  };
-
   const db = {
     _tables: tables,
 
-    getAll: sinon.stub().callsFake(async (sql, params = []) => {
+    getAll: sinon.stub().callsFake((sql, params = []) => {
       const tableName = extractTableName(sql);
       const table = tables[tableName] || [];
       const filtered = filterRows(table, sql, params);
-      return filtered.map(row => ({ ...row, doc: JSON.stringify(row._doc || row) }));
+      return Promise.resolve(filtered.map(row => ({ ...row, doc: JSON.stringify(row._doc || row) })));
     }),
 
-    getOptional: sinon.stub().callsFake(async (sql, params = []) => {
+    getOptional: sinon.stub().callsFake((sql, params = []) => {
       const tableName = extractTableName(sql);
       const table = tables[tableName] || [];
       const filtered = filterRows(table, sql, params);
       if (filtered.length === 0) {
-        return null;
+        return Promise.resolve(null);
       }
       const row = filtered[0];
       if (tableName === 'rules_state_store') {
-        return row;
+        return Promise.resolve(row);
       }
-      return { ...row, doc: JSON.stringify(row._doc || row) };
+      return Promise.resolve({ ...row, doc: JSON.stringify(row._doc || row) });
     }),
 
-    execute: sinon.stub().callsFake(async (sql, params = []) => {
+    execute: sinon.stub().callsFake((sql, params = []) => {
       const tableName = extractTableName(sql);
       if (sql.includes('INSERT OR REPLACE') || sql.includes('INSERT INTO')) {
         const existing = tables[tableName].findIndex(r => r.id === params[0]);
@@ -218,12 +210,12 @@ const createMockDb = () => {
           row.updated_date = params[2];
         }
       }
+      return Promise.resolve();
     }),
 
     writeTransaction: sinon.stub().callsFake(async (callback) => {
-      // The transaction object exposes execute just like db
       const tx = {
-        execute: async (sql, params = []) => db.execute(sql, params),
+        execute: (sql, params = []) => db.execute(sql, params),
       };
       await callback(tx);
     }),
@@ -255,20 +247,15 @@ const extractTableName = (sql) => {
  * Simple row filtering based on SQL WHERE clause patterns used in the adapter.
  */
 const filterRows = (rows, sql, params) => {
-  // Extract WHERE clause
   const whereMatch = sql.match(/WHERE\s+(.*?)(?:ORDER|GROUP|LIMIT|$)/is);
   if (!whereMatch) {
     return rows;
   }
 
   const where = whereMatch[1].trim();
-  let paramIdx = 0;
 
   return rows.filter(row => {
-    // Reset param index for each row evaluation
-    let localParamIdx = paramIdx;
-    const result = evaluateWhere(row, where, params, { idx: 0 });
-    return result;
+    return evaluateWhere(row, where, params, { idx: 0 });
   });
 };
 
@@ -333,13 +320,13 @@ const evaluateWhere = (row, where, params, state) => {
   // Handle IS NULL
   const isNullMatch = trimmed.match(/^(\w+)\s+IS\s+NULL$/i);
   if (isNullMatch) {
-    return row[isNullMatch[1]] == null;
+    return row[isNullMatch[1]] === null || row[isNullMatch[1]] === undefined;
   }
 
   // Handle IS NOT NULL
   const isNotNullMatch = trimmed.match(/^(\w+)\s+IS\s+NOT\s+NULL/i);
   if (isNotNullMatch) {
-    return row[isNotNullMatch[1]] != null;
+    return row[isNotNullMatch[1]] !== null && row[isNotNullMatch[1]] !== undefined;
   }
 
   // Handle = ?
@@ -354,7 +341,7 @@ const evaluateWhere = (row, where, params, state) => {
   const neqLitMatch = trimmed.match(/^(\w+)\s*!=\s*'([^']*)'/);
   if (neqLitMatch) {
     const val = row[neqLitMatch[1]];
-    if (val == null) {
+    if (val === null || val === undefined) {
       return false; // SQL: NULL != anything → NULL → falsy
     }
     return val !== neqLitMatch[2];
@@ -1083,7 +1070,10 @@ describe('powersync-adapter', () => {
         requester: 'patient',
         user: 'u1',
         authoredOn: 200,
-        emission: { _id: 'em2', title: 'task.follow_up', dueDate: '2026-05-01', startDate: '2026-04-28', endDate: '2026-05-05' },
+        emission: {
+          _id: 'em2', title: 'task.follow_up',
+          dueDate: '2026-05-01', startDate: '2026-04-28', endDate: '2026-05-05',
+        },
         stateHistory: [{ state: 'Draft', timestamp: 200 }],
       };
 
