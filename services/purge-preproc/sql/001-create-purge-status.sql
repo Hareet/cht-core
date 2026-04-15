@@ -16,6 +16,9 @@ CREATE TABLE IF NOT EXISTS purge_status (
   purged      BOOLEAN     NOT NULL DEFAULT false,
   evaluated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   seq         TEXT,
+  aggressive  BOOLEAN     NOT NULL DEFAULT false,  -- true when triggered by storage budget request
+  requested_by TEXT,                                -- user_id who triggered aggressive purge
+  reason      TEXT,                                 -- 'storage_budget', 'scheduled', 'retention'
   PRIMARY KEY (doc_id, role_hash)
 );
 
