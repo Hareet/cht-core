@@ -602,10 +602,15 @@ LANGUAGE sql STABLE AS $$
     -- Legacy place types → return self
     WHEN c.doc ->> 'type' IN ('clinic', 'health_center', 'district_hospital') THEN
       c._id
-    -- Modern CHT (type='contact'): check contact_type
-    -- contact_type='person' (or unset) → person → return parent
+    -- Modern CHT (type='contact'): check person_contact_types from app_settings.
+    -- Matches any contact_type flagged person=true in settings, or NULL
+    -- contact_type (legacy person default).
     WHEN c.doc ->> 'type' = 'contact'
-         AND COALESCE(c.doc ->> 'contact_type', 'person') = 'person' THEN
+         AND (
+           EXISTS (SELECT 1 FROM v1.person_contact_types
+                   WHERE contact_type_id = c.doc ->> 'contact_type')
+           OR c.doc ->> 'contact_type' IS NULL
+         ) THEN
       COALESCE(c.doc -> 'parent' ->> '_id', c.doc ->> 'parent')
     -- Anything else (place contact_type) → return self
     ELSE c._id
@@ -663,6 +668,7 @@ BEGIN
   -- Batch-populate resolved_subject_place_id from resolved_subject_id.
   -- For each report, looks up the subject and determines the containing place:
   --   person subject → parent._id (clinic), place subject → self.
+  -- Uses person_contact_types view for generic person detection.
   UPDATE v1.couchdb c
   SET resolved_subject_place_id = CASE
     WHEN subj.doc ->> 'type' = 'person' THEN
@@ -670,7 +676,11 @@ BEGIN
     WHEN subj.doc ->> 'type' IN ('clinic', 'health_center', 'district_hospital') THEN
       subj._id
     WHEN subj.doc ->> 'type' = 'contact'
-         AND COALESCE(subj.doc ->> 'contact_type', 'person') = 'person' THEN
+         AND (
+           EXISTS (SELECT 1 FROM v1.person_contact_types
+                   WHERE contact_type_id = subj.doc ->> 'contact_type')
+           OR subj.doc ->> 'contact_type' IS NULL
+         ) THEN
       COALESCE(subj.doc -> 'parent' ->> '_id', subj.doc ->> 'parent')
     ELSE subj._id
   END
