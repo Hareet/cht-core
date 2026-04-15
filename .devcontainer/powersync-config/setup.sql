@@ -166,6 +166,25 @@ CREATE STATISTICS IF NOT EXISTS stat_couchdb_doc_type ON (doc ->> 'type') FROM v
 CREATE STATISTICS IF NOT EXISTS stat_couchdb_doc_form ON (doc ->> 'form') FROM v1.couchdb;
 
 -- ============================================================
+-- 2e. Person Contact Types (derived from app_settings)
+-- Reads the contact_types config from the settings doc to determine
+-- which contact_types are persons vs. places. This is the single
+-- source of truth for person detection — works for ANY CHT project
+-- hierarchy, whether legacy (type='person') or configurable
+-- (type='contact' + contact_type from app_settings).
+--
+-- Used by: refresh_user_facilities(), resolve_subject_place(),
+--          auto_update_contact_parent_place(), batch operations.
+-- ============================================================
+CREATE OR REPLACE VIEW v1.person_contact_types AS
+SELECT ct.value ->> 'id' AS contact_type_id
+FROM v1.couchdb c,
+     jsonb_array_elements(c.doc -> 'settings' -> 'contact_types') ct
+WHERE c._id = 'settings'
+  AND NOT COALESCE(c._deleted, false)
+  AND (ct.value ->> 'person')::boolean = true;
+
+-- ============================================================
 -- 2d. Needs-signoff Visibility (pre-computed)
 -- Maps each needs_signoff report to the users who should see it
 -- (based on the submitter's ancestor chain matching the user's
@@ -335,6 +354,7 @@ DECLARE
   v_facility_id TEXT;
   v_contact_id TEXT;
   v_depth INT;
+  v_person_types TEXT[];
 BEGIN
   -- Get user's facility, contact, and depth config
   SELECT facility_id, contact_id, replication_depth
@@ -345,6 +365,12 @@ BEGIN
   IF v_facility_id IS NULL THEN
     RETURN;
   END IF;
+
+  -- Load person contact_type IDs from app_settings (generic for any CHT hierarchy).
+  -- Empty array if no contact_types config exists (legacy projects).
+  SELECT COALESCE(array_agg(contact_type_id), ARRAY[]::TEXT[])
+  INTO v_person_types
+  FROM v1.person_contact_types;
 
   -- Clear existing entries
   DELETE FROM v1.user_accessible_facilities WHERE user_id = p_user_id;
@@ -373,7 +399,17 @@ BEGIN
     )
     WHERE d.depth < v_depth
       AND NOT COALESCE(c._deleted, false)
-      AND c.doc ->> 'type' IN ('contact', 'person', 'clinic', 'health_center', 'district_hospital')
+      -- Include legacy place types and modern place contact_types.
+      -- Exclude: legacy type='person', modern person contact_types (from
+      -- app_settings), and NULL contact_type (legacy person default).
+      AND (
+        c.doc ->> 'type' IN ('clinic', 'health_center', 'district_hospital')
+        OR (
+          c.doc ->> 'type' = 'contact'
+          AND c.doc ->> 'contact_type' IS NOT NULL
+          AND NOT (c.doc ->> 'contact_type' = ANY(v_person_types))
+        )
+      )
   )
   SELECT p_user_id, _id, depth FROM descendants;
 
