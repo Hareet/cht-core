@@ -1,0 +1,10 @@
+{"thread":5,"iteration":1,"duration":2457,"found":true,"engine":"powersync","user":"chw_user"}
+{"thread":8,"iteration":1,"duration":247,"found":true,"engine":"powersync","user":"chw_user"}
+{"thread":2,"iteration":1,"duration":295,"found":true,"engine":"powersync","user":"chw_user"}
+{"thread":0,"iteration":1,"duration":513,"found":true,"engine":"powersync","user":"ac1"}
+{"thread":7,"iteration":1,"duration":885,"found":true,"engine":"powersync","user":"ac2"}
+{"thread":9,"iteration":1,"duration":589,"found":true,"engine":"powersync","user":"ac1"}
+{"thread":1,"iteration":1,"duration":785,"found":true,"engine":"powersync","user":"ac2"}
+{"thread":4,"iteration":1,"duration":896,"found":true,"engine":"powersync","user":"ac2"}
+{"thread":3,"iteration":1,"duration":938,"found":true,"engine":"powersync","user":"ac1"}
+{"thread":6,"iteration":1,"duration":588,"found":true,"engine":"powersync","user":"ac1"}

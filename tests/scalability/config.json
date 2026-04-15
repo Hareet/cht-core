@@ -1,7 +1,18 @@
 {
   "url": "http://localhost:5988",
+  "couch_url_note": "Set COUCH_URL env var, e.g. http://admin:pass@couchdb:5984/medic",
+  "powersync_url": "http://localhost:8080",
+  "powersync_key_path": "../../.devcontainer/powersync-config/dev-private-key.pem",
   "users": [
     { "name": "ac1", "pass": "Secret_1" },
-    { "name": "ac2", "pass": "Secret_1" }
+    { "name": "ac2", "pass": "Secret_1" },
+    { "name": "chw_user", "pass": "Secret_1" }
+  ],
+  "powersync_users": [
+    { "name": "ac1" },
+    { "name": "chw_user" },
+    { "name": "ac2" },
+    { "name": "supervisor_user" },
+    { "name": "county_admin" }
   ]
 }

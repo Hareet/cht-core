@@ -1,6 +1,8 @@
-# CHT PostgreSQL Migration — Agent Instructions
+# CHT PostgreSQL Migration — Agent Instructions (Iteration 2)
 
 You are an AI agent working on the CHT (Community Health Toolkit) CouchDB-to-PostgreSQL migration. You are one of up to 7 parallel agents, each working in an isolated git worktree on a specific subsystem.
+
+**Iteration 2 focus: Device-Ready Implementation.** Server-side PowerSync integration is substantially complete from Iteration 1. Iteration 2 hardens everything for the actual MoH Côte d'Ivoire device fleet — 2,611 users, 56% Go edition (<16GB, Android 10, WebView 122 pinned), 99.1% OPFS-capable. Go edition is the constraining design target.
 
 ## Your Identity
 
@@ -28,9 +30,28 @@ Read these files for full background (in order of priority):
 1. `/workspace/cht-core/CLAUDE.md` — Architecture overview, decision log, PowerSync gaps, timeline (root — auto-discovered by Claude Code)
 2. `/workspace/cht-core/context/DECISIONS_AND_CONSTRAINTS.md` — Hard constraints and rationale
 3. `/workspace/cht-core/context/IMPLEMENTATION_GUIDE.md` — PostgreSQL schemas, Sync Streams YAML, purge preprocessing
-4. `/workspace/cht-core/context/RESEARCH_DISCOVERY_LOG.md` — Investigation path and rejected approaches
-5. `/workspace/cht-core/context/POWERSYNC_ANALYSIS.md` — PowerSync vs Custom REST Sync comparison
-6. `/workspace/cht-core/context/CHT_ARCHITECTURE_ROADMAP.md` — Official 2026-2027 migration roadmap
+4. `/workspace/cht-core/context/powersync-hardware-analysis.md` — **Iteration 2 key doc**: Device fleet analysis, OPFS compatibility, storage tiers, implementation paths
+5. `/workspace/cht-core/context/RESEARCH_DISCOVERY_LOG.md` — Investigation path and rejected approaches
+6. `/workspace/cht-core/context/POWERSYNC_ANALYSIS.md` — PowerSync vs Custom REST Sync comparison
+7. `/workspace/cht-core/context/CHT_ARCHITECTURE_ROADMAP.md` — Official 2026-2027 migration roadmap
+
+## Device Fleet Quick Reference (Iteration 2)
+
+These numbers are from real telemetry (`devices.json`, 6,662 entries, 2,611 unique users). Use them for all device-related decisions:
+
+| Metric | Value | Impact |
+|--------|-------|--------|
+| Go edition (<16GB) | 56.3% of users | Constraining device class — 200MB DB budget |
+| Budget (16-32GB) | 19.0% | 500MB DB budget |
+| Standard (32-128GB) | 14.1% | 1GB DB budget |
+| High (128GB+) | 6.4% | No constraint |
+| OPFS (WebView 109+) | 99.1% | Path A (wa-sqlite + OPFS) viable for almost all |
+| No OPFS | 22 users (0.8%) | Mostly desktop browsers — IndexedDB fallback |
+| <1GB free storage | 66 entries | Across ALL tiers — storage monitoring is critical |
+| Dominant WebView | 122 (70.1%) | Pinned on Go edition, never updates |
+| Dominant Android | 10 (68.4%) | Go edition with aggressive process killing |
+
+**Design for Go edition first. If it works on 11GB/2GB-RAM/WV122, it works everywhere.**
 
 ## Architecture Summary
 

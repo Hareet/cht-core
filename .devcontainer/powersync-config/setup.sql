@@ -62,6 +62,96 @@ CREATE INDEX IF NOT EXISTS idx_urf_facility
   ON v1.user_report_facilities(facility_id);
 
 -- ============================================================
+-- 2c. Report Subjects (pre-resolved)
+-- Maps each report to its single resolved subject UUID.
+-- Eliminates the need for 9 OR arms and shortcodes in the
+-- Sync Stream query. Also populates resolved_subject_id on couchdb.
+-- Populated by refresh_report_subjects() and auto-maintained
+-- by a BEFORE trigger on v1.couchdb.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS v1.report_subjects (
+  report_id  TEXT PRIMARY KEY,
+  subject_id TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_report_subjects_subject
+  ON v1.report_subjects(subject_id);
+
+-- ============================================================
+-- 2c-bis. Resolved Subject ID (denormalized on couchdb)
+-- Stores the resolved subject UUID directly on the couchdb row.
+-- Eliminates the INNER JOIN report_subjects in Sync Streams,
+-- removing ~640 extra bucket keys from the JOIN dimension.
+-- Maintained by the BEFORE trigger (auto_resolve_report_subject).
+-- ============================================================
+ALTER TABLE v1.couchdb ADD COLUMN IF NOT EXISTS resolved_subject_id TEXT;
+
+CREATE INDEX IF NOT EXISTS idx_couchdb_resolved_subject
+  ON v1.couchdb(resolved_subject_id)
+  WHERE resolved_subject_id IS NOT NULL;
+
+-- ============================================================
+-- 2c-ter. Resolved Subject Place ID (denormalized on couchdb)
+-- Stores the place (clinic/HC/etc.) containing the report's subject.
+-- For person subjects: the person's parent._id (their clinic).
+-- For place subjects: the subject_id itself.
+-- Eliminates the need for person IDs in user_accessible_facilities,
+-- enabling O(places) instead of O(persons) bucket counts in Sync Streams.
+-- Maintained by the BEFORE trigger (auto_resolve_report_subject).
+-- ============================================================
+ALTER TABLE v1.couchdb ADD COLUMN IF NOT EXISTS resolved_subject_place_id TEXT;
+
+CREATE INDEX IF NOT EXISTS idx_couchdb_resolved_subject_place
+  ON v1.couchdb(resolved_subject_place_id)
+  WHERE resolved_subject_place_id IS NOT NULL;
+
+-- ============================================================
+-- 2c-quat. Contact Parent Place (person → containing place lookup)
+-- Maps each person contact to their parent place (clinic/HC/etc.).
+-- Used by Sync Stream JOINs so that person contacts and SMS messages
+-- can match against accessible_facilities (which contains only places,
+-- not person IDs) without needing person IDs in the CTE.
+-- Only contains person-type contacts, not places.
+-- Maintained by trigger on v1.couchdb.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS v1.contact_parent_place (
+  contact_id TEXT PRIMARY KEY,
+  place_id   TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_cpp_place
+  ON v1.contact_parent_place(place_id);
+
+-- Indexes for shortcode → UUID resolution during subject resolution.
+-- Reports reference subjects by shortcode (e.g., patient_id="13602").
+-- These indexes make the lookup fast during refresh_report_subjects().
+CREATE INDEX IF NOT EXISTS idx_couchdb_patient_id
+  ON v1.couchdb ((doc ->> 'patient_id'))
+  WHERE doc ->> 'patient_id' IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_couchdb_place_id
+  ON v1.couchdb ((doc ->> 'place_id'))
+  WHERE doc ->> 'place_id' IS NOT NULL;
+
+-- ============================================================
+-- 2d. Needs-signoff Visibility (pre-computed)
+-- Maps each needs_signoff report to the users who should see it
+-- (based on the submitter's ancestor chain matching the user's
+-- accessible_facilities). Eliminates the 5-arm OR ancestor walk
+-- in the Sync Stream query, reducing to 1 bucket per user.
+-- Populated by refresh_needs_signoff_visibility() and auto-maintained
+-- by a trigger on v1.couchdb for needs_signoff reports.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS v1.report_needs_signoff_visible (
+  report_id       TEXT NOT NULL,
+  visible_to_user TEXT NOT NULL,
+  PRIMARY KEY (report_id, visible_to_user)
+);
+
+CREATE INDEX IF NOT EXISTS idx_rnsv_user
+  ON v1.report_needs_signoff_visible(visible_to_user);
+
+-- ============================================================
 -- 3. Purge Status
 -- Tracks which documents should be excluded from sync per role.
 -- Populated by the purge preprocessing service (Agent 4).
@@ -201,6 +291,13 @@ BEGIN
   )
   SELECT p_user_id, _id, depth FROM descendants;
 
+  -- Step 1.5: REMOVED — person expansion now handled at query time.
+  -- Previously this step added all direct children (persons) of accessible
+  -- places to the CTE, creating ~8,000 entries per user at production scale.
+  -- Now, person contacts are matched via INNER JOIN contact_parent_place in
+  -- the Sync Stream queries, and reports match via resolved_subject_place_id.
+  -- This reduces CTE entries from O(persons) to O(places): ~55 vs ~8,055.
+
   -- Step 2: Walk hierarchy UPWARD from user's facility (ancestors)
   -- Adds parent places so user can see their HC, county, etc.
   -- Ancestors get depth 0 (same as facility) since they're structural.
@@ -287,35 +384,11 @@ BEGIN
       OR (SELECT report_depth FROM v1.user_settings WHERE user_id = p_user_id) < 0
     );
 
-  -- Step 5b: Add shortcodes (patient_id, place_id) directly to report_facilities.
-  -- CHT reports reference subjects by shortcode (e.g., patient_id="13602").
-  -- The shortcode inherits the depth of the contact it belongs to, so
-  -- report_depth filtering is applied here too.
-  INSERT INTO v1.user_report_facilities (user_id, facility_id)
-  SELECT p_user_id, c.doc ->> 'patient_id'
-  FROM v1.couchdb c
-  JOIN v1.user_accessible_facilities uaf
-    ON c._id = uaf.facility_id AND uaf.user_id = p_user_id
-  WHERE c.doc ->> 'patient_id' IS NOT NULL
-    AND NOT COALESCE(c._deleted, false)
-    AND (
-      uaf.depth <= (SELECT report_depth FROM v1.user_settings WHERE user_id = p_user_id)
-      OR (SELECT report_depth FROM v1.user_settings WHERE user_id = p_user_id) < 0
-    )
-  ON CONFLICT (user_id, facility_id) DO NOTHING;
-
-  INSERT INTO v1.user_report_facilities (user_id, facility_id)
-  SELECT p_user_id, c.doc ->> 'place_id'
-  FROM v1.couchdb c
-  JOIN v1.user_accessible_facilities uaf
-    ON c._id = uaf.facility_id AND uaf.user_id = p_user_id
-  WHERE c.doc ->> 'place_id' IS NOT NULL
-    AND NOT COALESCE(c._deleted, false)
-    AND (
-      uaf.depth <= (SELECT report_depth FROM v1.user_settings WHERE user_id = p_user_id)
-      OR (SELECT report_depth FROM v1.user_settings WHERE user_id = p_user_id) < 0
-    )
-  ON CONFLICT (user_id, facility_id) DO NOTHING;
+  -- Step 5b: REMOVED — shortcodes no longer needed in user_report_facilities.
+  -- Subject resolution is now handled by resolved_subject_id on the couchdb
+  -- row (denormalized from report_subjects). The all_data Sync Stream query
+  -- uses reports.resolved_subject_id IN accessible_facilities (no JOIN).
+  -- user_report_facilities is retained but no longer referenced in Sync Streams.
 END;
 $$;
 
@@ -336,7 +409,363 @@ END;
 $$;
 
 -- ============================================================
--- 7. Publication for PowerSync logical replication
+-- 7. Report Subject Resolution
+-- Resolves a report's subject to a single UUID by following
+-- CHT's getSubject() priority chain:
+--   patient_id → fields.patient_id → place_id → fields.place_id
+--   → patient_uuid → fields.patient_uuid → place_uuid
+--   → fields.place_uuid → contact._id
+-- Shortcodes (patient_id, place_id) are resolved by looking up
+-- the contact whose shortcode matches.
+-- ============================================================
+CREATE OR REPLACE FUNCTION v1.resolve_report_subject(p_doc JSONB)
+RETURNS TEXT
+LANGUAGE sql STABLE AS $$
+  SELECT COALESCE(
+    -- 1. patient_id shortcode → contact UUID
+    (SELECT c._id FROM v1.couchdb c
+     WHERE c.doc ->> 'patient_id' = p_doc ->> 'patient_id'
+       AND p_doc ->> 'patient_id' IS NOT NULL AND p_doc ->> 'patient_id' != ''
+       AND NOT COALESCE(c._deleted, false)
+       AND c.doc ->> 'type' IN ('contact', 'person', 'clinic', 'health_center', 'district_hospital')
+     LIMIT 1),
+    -- 2. fields.patient_id shortcode → contact UUID
+    (SELECT c._id FROM v1.couchdb c
+     WHERE c.doc ->> 'patient_id' = p_doc -> 'fields' ->> 'patient_id'
+       AND p_doc -> 'fields' ->> 'patient_id' IS NOT NULL
+       AND p_doc -> 'fields' ->> 'patient_id' != ''
+       AND NOT COALESCE(c._deleted, false)
+       AND c.doc ->> 'type' IN ('contact', 'person', 'clinic', 'health_center', 'district_hospital')
+     LIMIT 1),
+    -- 3. place_id shortcode → place UUID
+    (SELECT c._id FROM v1.couchdb c
+     WHERE c.doc ->> 'place_id' = p_doc ->> 'place_id'
+       AND p_doc ->> 'place_id' IS NOT NULL AND p_doc ->> 'place_id' != ''
+       AND NOT COALESCE(c._deleted, false)
+       AND c.doc ->> 'type' IN ('contact', 'person', 'clinic', 'health_center', 'district_hospital')
+     LIMIT 1),
+    -- 4. fields.place_id shortcode → place UUID
+    (SELECT c._id FROM v1.couchdb c
+     WHERE c.doc ->> 'place_id' = p_doc -> 'fields' ->> 'place_id'
+       AND p_doc -> 'fields' ->> 'place_id' IS NOT NULL
+       AND p_doc -> 'fields' ->> 'place_id' != ''
+       AND NOT COALESCE(c._deleted, false)
+       AND c.doc ->> 'type' IN ('contact', 'person', 'clinic', 'health_center', 'district_hospital')
+     LIMIT 1),
+    -- 5-9: UUID fields (no resolution needed, use directly)
+    NULLIF(p_doc ->> 'patient_uuid', ''),
+    NULLIF(p_doc -> 'fields' ->> 'patient_uuid', ''),
+    NULLIF(p_doc ->> 'place_uuid', ''),
+    NULLIF(p_doc -> 'fields' ->> 'place_uuid', ''),
+    NULLIF(p_doc -> 'contact' ->> '_id', '')
+  );
+$$;
+
+-- ============================================================
+-- 7b. Resolve Subject Place
+-- Given a resolved subject_id (from resolve_report_subject),
+-- returns the containing PLACE:
+--   - If subject is a person → parent._id (the clinic/area)
+--   - If subject is a place → subject itself
+-- This enables Sync Stream queries to match reports against
+-- accessible_facilities using only place IDs (not person IDs).
+-- ============================================================
+CREATE OR REPLACE FUNCTION v1.resolve_subject_place(p_subject_id TEXT)
+RETURNS TEXT
+LANGUAGE sql STABLE AS $$
+  SELECT CASE
+    -- Legacy person type → return parent place
+    WHEN c.doc ->> 'type' = 'person' THEN
+      COALESCE(c.doc -> 'parent' ->> '_id', c.doc ->> 'parent')
+    -- Legacy place types → return self
+    WHEN c.doc ->> 'type' IN ('clinic', 'health_center', 'district_hospital') THEN
+      c._id
+    -- Modern CHT (type='contact'): check contact_type
+    -- contact_type='person' (or unset) → person → return parent
+    WHEN c.doc ->> 'type' = 'contact'
+         AND COALESCE(c.doc ->> 'contact_type', 'person') = 'person' THEN
+      COALESCE(c.doc -> 'parent' ->> '_id', c.doc ->> 'parent')
+    -- Anything else (place contact_type) → return self
+    ELSE c._id
+  END
+  FROM v1.couchdb c
+  WHERE c._id = p_subject_id
+    AND NOT COALESCE(c._deleted, false)
+  LIMIT 1;
+$$;
+
+-- Batch-refresh all report subjects. Call after data loads or
+-- when contacts change (shortcode→UUID mapping may change).
+-- Also syncs resolved_subject_id on the couchdb rows to match.
+CREATE OR REPLACE FUNCTION v1.refresh_report_subjects()
+RETURNS void
+LANGUAGE plpgsql AS $$
+BEGIN
+  TRUNCATE v1.report_subjects;
+
+  INSERT INTO v1.report_subjects (report_id, subject_id)
+  SELECT report_id, subject_id
+  FROM (
+    SELECT r._id AS report_id,
+           v1.resolve_report_subject(r.doc) AS subject_id
+    FROM v1.couchdb r
+    WHERE r.doc ->> 'type' = 'data_record'
+      AND r.doc ->> 'form' IS NOT NULL
+      AND NOT COALESCE(r._deleted, false)
+  ) resolved
+  WHERE subject_id IS NOT NULL;
+
+  -- Sync resolved_subject_id on couchdb rows to match report_subjects.
+  -- This keeps the denormalized column consistent after batch re-resolves
+  -- (e.g., when a contact's shortcode changes and the UUID mapping shifts).
+  -- Uses a direct UPDATE (not the BEFORE trigger path) since we already
+  -- have the resolved values in report_subjects.
+  UPDATE v1.couchdb c
+  SET resolved_subject_id = rs.subject_id
+  FROM v1.report_subjects rs
+  WHERE rs.report_id = c._id
+    AND c.resolved_subject_id IS DISTINCT FROM rs.subject_id;
+
+  -- Clear resolved_subject_id for reports that no longer resolve
+  -- (removed from report_subjects because subject_id became NULL).
+  UPDATE v1.couchdb c
+  SET resolved_subject_id = NULL
+  WHERE c.doc ->> 'type' = 'data_record'
+    AND c.doc ->> 'form' IS NOT NULL
+    AND NOT COALESCE(c._deleted, false)
+    AND c.resolved_subject_id IS NOT NULL
+    AND NOT EXISTS (
+      SELECT 1 FROM v1.report_subjects rs WHERE rs.report_id = c._id
+    );
+
+  -- Batch-populate resolved_subject_place_id from resolved_subject_id.
+  -- For each report, looks up the subject and determines the containing place:
+  --   person subject → parent._id (clinic), place subject → self.
+  UPDATE v1.couchdb c
+  SET resolved_subject_place_id = CASE
+    WHEN subj.doc ->> 'type' = 'person' THEN
+      COALESCE(subj.doc -> 'parent' ->> '_id', subj.doc ->> 'parent')
+    WHEN subj.doc ->> 'type' IN ('clinic', 'health_center', 'district_hospital') THEN
+      subj._id
+    WHEN subj.doc ->> 'type' = 'contact'
+         AND COALESCE(subj.doc ->> 'contact_type', 'person') = 'person' THEN
+      COALESCE(subj.doc -> 'parent' ->> '_id', subj.doc ->> 'parent')
+    ELSE subj._id
+  END
+  FROM v1.couchdb subj
+  WHERE subj._id = c.resolved_subject_id
+    AND NOT COALESCE(subj._deleted, false)
+    AND c.doc ->> 'type' = 'data_record'
+    AND c.doc ->> 'form' IS NOT NULL
+    AND NOT COALESCE(c._deleted, false)
+    AND c.resolved_subject_id IS NOT NULL;
+
+  -- Clear resolved_subject_place_id for reports without subjects
+  UPDATE v1.couchdb c
+  SET resolved_subject_place_id = NULL
+  WHERE c.doc ->> 'type' = 'data_record'
+    AND c.doc ->> 'form' IS NOT NULL
+    AND NOT COALESCE(c._deleted, false)
+    AND c.resolved_subject_id IS NULL
+    AND c.resolved_subject_place_id IS NOT NULL;
+END;
+$$;
+
+-- Auto-resolve trigger: keeps report_subjects in sync with couchdb.
+-- Fires only for data_records (reports) to minimize overhead.
+CREATE OR REPLACE FUNCTION v1.auto_resolve_report_subject()
+RETURNS trigger
+LANGUAGE plpgsql AS $$
+DECLARE
+  v_subject_id TEXT;
+  v_subject_place_id TEXT;
+BEGIN
+  IF NEW.doc ->> 'form' IS NOT NULL AND NOT COALESCE(NEW._deleted, false) THEN
+    v_subject_id := v1.resolve_report_subject(NEW.doc);
+    -- Denormalize onto the couchdb row (BEFORE trigger can modify NEW directly)
+    NEW.resolved_subject_id := v_subject_id;
+    IF v_subject_id IS NOT NULL THEN
+      -- Resolve the containing place (person→parent, place→self)
+      v_subject_place_id := v1.resolve_subject_place(v_subject_id);
+      NEW.resolved_subject_place_id := v_subject_place_id;
+      INSERT INTO v1.report_subjects (report_id, subject_id)
+      VALUES (NEW._id, v_subject_id)
+      ON CONFLICT (report_id) DO UPDATE SET subject_id = EXCLUDED.subject_id;
+    ELSE
+      NEW.resolved_subject_place_id := NULL;
+      DELETE FROM v1.report_subjects WHERE report_id = NEW._id;
+    END IF;
+  ELSIF COALESCE(NEW._deleted, false) THEN
+    NEW.resolved_subject_id := NULL;
+    NEW.resolved_subject_place_id := NULL;
+    DELETE FROM v1.report_subjects WHERE report_id = NEW._id;
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+-- BEFORE trigger: sets resolved_subject_id in-place (no recursive UPDATE needed).
+-- Also maintains report_subjects table for backward compatibility.
+DROP TRIGGER IF EXISTS trg_auto_resolve_report_subject ON v1.couchdb;
+CREATE TRIGGER trg_auto_resolve_report_subject
+  BEFORE INSERT OR UPDATE ON v1.couchdb
+  FOR EACH ROW
+  WHEN (NEW.doc ->> 'type' = 'data_record')
+  EXECUTE FUNCTION v1.auto_resolve_report_subject();
+
+-- ============================================================
+-- 7c. Contact Parent Place Trigger
+-- Maintains contact_parent_place for person-type contacts.
+-- When a person is inserted/updated, stores their parent place.
+-- Only persons are tracked (not place contacts like clinics).
+-- ============================================================
+CREATE OR REPLACE FUNCTION v1.auto_update_contact_parent_place()
+RETURNS trigger
+LANGUAGE plpgsql AS $$
+DECLARE
+  v_place_id TEXT;
+  v_is_person BOOLEAN;
+BEGIN
+  -- Determine if this contact is a person
+  v_is_person := (
+    NEW.doc ->> 'type' = 'person'
+    OR (
+      NEW.doc ->> 'type' = 'contact'
+      AND COALESCE(NEW.doc ->> 'contact_type', 'person') = 'person'
+    )
+  );
+
+  IF NOT COALESCE(NEW._deleted, false) AND v_is_person THEN
+    v_place_id := COALESCE(NEW.doc -> 'parent' ->> '_id', NEW.doc ->> 'parent');
+    IF v_place_id IS NOT NULL THEN
+      INSERT INTO v1.contact_parent_place (contact_id, place_id)
+      VALUES (NEW._id, v_place_id)
+      ON CONFLICT (contact_id) DO UPDATE SET place_id = EXCLUDED.place_id;
+    ELSE
+      DELETE FROM v1.contact_parent_place WHERE contact_id = NEW._id;
+    END IF;
+  ELSE
+    -- Deleted or not a person — remove from lookup
+    DELETE FROM v1.contact_parent_place WHERE contact_id = NEW._id;
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS trg_auto_update_contact_parent_place ON v1.couchdb;
+CREATE TRIGGER trg_auto_update_contact_parent_place
+  AFTER INSERT OR UPDATE ON v1.couchdb
+  FOR EACH ROW
+  WHEN (NEW.doc ->> 'type' IN ('contact', 'person', 'clinic', 'health_center', 'district_hospital'))
+  EXECUTE FUNCTION v1.auto_update_contact_parent_place();
+
+-- ============================================================
+-- 8. Needs-signoff Visibility
+-- Pre-computes which users can see each needs_signoff report.
+-- For each such report, walks the submitter's ancestor chain
+-- (up to 5 levels via recursive CTE), then finds all users
+-- whose accessible_facilities include any of those ancestors.
+-- ============================================================
+CREATE OR REPLACE FUNCTION v1.refresh_needs_signoff_visibility()
+RETURNS void
+LANGUAGE plpgsql AS $$
+BEGIN
+  TRUNCATE v1.report_needs_signoff_visible;
+
+  INSERT INTO v1.report_needs_signoff_visible (report_id, visible_to_user)
+  SELECT DISTINCT r._id, uaf.user_id
+  FROM v1.couchdb r
+  CROSS JOIN LATERAL (
+    -- Walk submitter's ancestor chain (recursive, up to 5 levels)
+    WITH RECURSIVE chain AS (
+      SELECT r.doc -> 'contact' ->> '_id' AS ancestor_id, 0 AS lvl
+      UNION ALL
+      SELECT
+        CASE
+          WHEN jsonb_typeof(c.doc -> 'parent') = 'object' THEN c.doc -> 'parent' ->> '_id'
+          WHEN jsonb_typeof(c.doc -> 'parent') = 'string' THEN c.doc ->> 'parent'
+        END,
+        chain.lvl + 1
+      FROM chain
+      JOIN v1.couchdb c ON c._id = chain.ancestor_id
+      WHERE chain.lvl < 5
+        AND chain.ancestor_id IS NOT NULL
+        AND NOT COALESCE(c._deleted, false)
+    )
+    SELECT ancestor_id FROM chain WHERE ancestor_id IS NOT NULL
+  ) ancestors
+  JOIN v1.user_accessible_facilities uaf ON uaf.facility_id = ancestors.ancestor_id
+  WHERE NOT COALESCE(r._deleted, false)
+    AND r.doc ->> 'type' = 'data_record'
+    AND r.doc ->> 'form' IS NOT NULL
+    AND r.doc -> 'fields' ->> 'needs_signoff' = 'true'
+    AND r.doc -> 'contact' ->> '_id' IS NOT NULL;
+END;
+$$;
+
+-- Single-report refresh: used by the auto-trigger when a needs_signoff
+-- report is inserted or updated.
+CREATE OR REPLACE FUNCTION v1.refresh_single_needs_signoff(p_report_id TEXT, p_contact_id TEXT)
+RETURNS void
+LANGUAGE plpgsql AS $$
+BEGIN
+  DELETE FROM v1.report_needs_signoff_visible WHERE report_id = p_report_id;
+
+  IF p_contact_id IS NULL THEN
+    RETURN;
+  END IF;
+
+  INSERT INTO v1.report_needs_signoff_visible (report_id, visible_to_user)
+  SELECT DISTINCT p_report_id, uaf.user_id
+  FROM (
+    WITH RECURSIVE chain AS (
+      SELECT p_contact_id AS ancestor_id, 0 AS lvl
+      UNION ALL
+      SELECT
+        CASE
+          WHEN jsonb_typeof(c.doc -> 'parent') = 'object' THEN c.doc -> 'parent' ->> '_id'
+          WHEN jsonb_typeof(c.doc -> 'parent') = 'string' THEN c.doc ->> 'parent'
+        END,
+        chain.lvl + 1
+      FROM chain
+      JOIN v1.couchdb c ON c._id = chain.ancestor_id
+      WHERE chain.lvl < 5
+        AND chain.ancestor_id IS NOT NULL
+        AND NOT COALESCE(c._deleted, false)
+    )
+    SELECT ancestor_id FROM chain WHERE ancestor_id IS NOT NULL
+  ) ancestors
+  JOIN v1.user_accessible_facilities uaf ON uaf.facility_id = ancestors.ancestor_id;
+END;
+$$;
+
+-- Auto-trigger: keeps report_needs_signoff_visible in sync with couchdb.
+-- Fires only for data_records (same WHEN clause as report_subjects trigger).
+CREATE OR REPLACE FUNCTION v1.auto_refresh_needs_signoff()
+RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+  IF NEW.doc -> 'fields' ->> 'needs_signoff' = 'true'
+     AND NEW.doc ->> 'form' IS NOT NULL
+     AND NOT COALESCE(NEW._deleted, false) THEN
+    PERFORM v1.refresh_single_needs_signoff(NEW._id, NEW.doc -> 'contact' ->> '_id');
+  ELSE
+    -- Not a needs_signoff report (or deleted) — remove any existing visibility rows
+    DELETE FROM v1.report_needs_signoff_visible WHERE report_id = NEW._id;
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS trg_auto_refresh_needs_signoff ON v1.couchdb;
+CREATE TRIGGER trg_auto_refresh_needs_signoff
+  AFTER INSERT OR UPDATE ON v1.couchdb
+  FOR EACH ROW
+  WHEN (NEW.doc ->> 'type' = 'data_record')
+  EXECUTE FUNCTION v1.auto_refresh_needs_signoff();
+
+-- ============================================================
+-- 9. Publication for PowerSync logical replication
 -- PowerSync reads changes via the PostgreSQL WAL.
 -- All tables referenced in Sync Streams must be published.
 -- ============================================================
@@ -346,6 +775,9 @@ CREATE PUBLICATION powersync FOR TABLE
   v1.user_settings,
   v1.user_accessible_facilities,
   v1.user_report_facilities,
+  v1.report_subjects,
+  v1.report_needs_signoff_visible,
+  v1.contact_parent_place,
   v1.purge_status;
 
 -- ============================================================
@@ -377,6 +809,29 @@ VALUES
 ON CONFLICT (user_id) DO NOTHING;
 
 -- Compute accessible facilities for seed users
+-- (Step 1.5 removed — CTE now contains only places, not persons)
 SELECT v1.refresh_all_user_facilities();
+
+-- Batch-populate contact_parent_place (person → parent place lookup)
+-- Used by Sync Stream JOINs for person contacts and SMS matching.
+TRUNCATE v1.contact_parent_place;
+INSERT INTO v1.contact_parent_place (contact_id, place_id)
+SELECT c._id, COALESCE(c.doc -> 'parent' ->> '_id', c.doc ->> 'parent')
+FROM v1.couchdb c
+WHERE NOT COALESCE(c._deleted, false)
+  AND (
+    c.doc ->> 'type' = 'person'
+    OR (c.doc ->> 'type' = 'contact'
+        AND COALESCE(c.doc ->> 'contact_type', 'person') = 'person')
+  )
+  AND COALESCE(c.doc -> 'parent' ->> '_id', c.doc ->> 'parent') IS NOT NULL
+ON CONFLICT (contact_id) DO NOTHING;
+
+-- Pre-resolve report subjects (shortcode → UUID mapping)
+-- Also populates resolved_subject_id and resolved_subject_place_id
+SELECT v1.refresh_report_subjects();
+
+-- Pre-compute needs_signoff visibility (ancestor chain → user mapping)
+SELECT v1.refresh_needs_signoff_visibility();
 
 COMMIT;
