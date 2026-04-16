@@ -106,6 +106,54 @@ CREATE INDEX IF NOT EXISTS idx_couchdb_resolved_subject_place
   WHERE resolved_subject_place_id IS NOT NULL;
 
 -- ============================================================
+-- 2c-ter2. Denormalized columns for JOIN-free Sync Streams
+-- PowerSync OOMs when JOINing large auxiliary tables (purge_status
+-- at 4.7M rows, contact_parent_place at 337K, report_visible_places
+-- at 505K). These columns denormalize all JOIN data onto couchdb
+-- so Sync Streams use simple WHERE filters — zero JOINs.
+-- ============================================================
+
+-- purged: replaces INNER JOIN purge_status. True when ALL roles
+-- have purged this doc. Per-role purge handled client-side.
+-- For CIV config (no purge.js): always false.
+ALTER TABLE v1.couchdb ADD COLUMN IF NOT EXISTS purged BOOLEAN DEFAULT false;
+
+-- parent_place_id: for contacts (persons + leaf places), the nearest
+-- structural ancestor place. Replaces INNER JOIN contact_parent_place
+-- in contacts query. NULL for structural places (they match via _id).
+ALTER TABLE v1.couchdb ADD COLUMN IF NOT EXISTS parent_place_id TEXT;
+
+CREATE INDEX IF NOT EXISTS idx_couchdb_parent_place
+  ON v1.couchdb(parent_place_id)
+  WHERE parent_place_id IS NOT NULL;
+
+-- submitter_place_id: for reports, the submitter's structural place.
+-- Together with resolved_subject_place_id, replaces INNER JOIN
+-- report_visible_places. Enables "own reports" visibility without
+-- a separate query or JOIN table.
+ALTER TABLE v1.couchdb ADD COLUMN IF NOT EXISTS submitter_place_id TEXT;
+
+CREATE INDEX IF NOT EXISTS idx_couchdb_submitter_place
+  ON v1.couchdb(submitter_place_id)
+  WHERE submitter_place_id IS NOT NULL;
+
+-- owner_place_id: for targets, the owner contact's structural place.
+-- Replaces INNER JOIN contact_parent_place in targets query.
+ALTER TABLE v1.couchdb ADD COLUMN IF NOT EXISTS owner_place_id TEXT;
+
+CREATE INDEX IF NOT EXISTS idx_couchdb_owner_place
+  ON v1.couchdb(owner_place_id)
+  WHERE owner_place_id IS NOT NULL;
+
+-- contact_place_id: for SMS messages, the contact person's structural
+-- place. Replaces INNER JOIN contact_parent_place in SMS query.
+ALTER TABLE v1.couchdb ADD COLUMN IF NOT EXISTS contact_place_id TEXT;
+
+CREATE INDEX IF NOT EXISTS idx_couchdb_contact_place
+  ON v1.couchdb(contact_place_id)
+  WHERE contact_place_id IS NOT NULL;
+
+-- ============================================================
 -- 2c-quat. Contact Parent Place (contact → structural ancestor lookup)
 -- Maps persons AND leaf places to their nearest structural ancestor
 -- place (the place in accessible_facilities). Used by Sync Stream
@@ -422,10 +470,12 @@ BEGIN
   WHERE doc_id = NEW.doc_id
     AND purged = true;
 
-  -- Only soft-delete when ALL active roles have purged this doc
+  -- When ALL active roles have purged this doc: mark purged and soft-delete.
+  -- purged=true is used by Sync Streams (WHERE purged != true).
+  -- _deleted=true is the hard floor (excludes from all streams including contacts).
   IF v_purged_roles >= v_active_roles THEN
     UPDATE v1.couchdb
-    SET _deleted = true
+    SET _deleted = true, purged = true
     WHERE _id = NEW.doc_id
       AND NOT COALESCE(_deleted, false);
   END IF;
@@ -910,8 +960,10 @@ BEGIN
 END;
 $$;
 
--- Auto-resolve trigger: keeps report_subjects in sync with couchdb.
--- Fires only for data_records (reports) to minimize overhead.
+-- Auto-resolve trigger: keeps report_subjects and denormalized columns in sync.
+-- Fires for ALL data_records: reports (form IS NOT NULL) and SMS (form IS NULL).
+-- Sets: resolved_subject_id, resolved_subject_place_id, submitter_place_id (reports)
+--       contact_place_id (SMS)
 CREATE OR REPLACE FUNCTION v1.auto_resolve_report_subject()
 RETURNS trigger
 LANGUAGE plpgsql AS $$
@@ -921,11 +973,10 @@ DECLARE
   v_submitter_place_id TEXT;
 BEGIN
   IF NEW.doc ->> 'form' IS NOT NULL AND NOT COALESCE(NEW._deleted, false) THEN
+    -- === REPORT handling ===
     v_subject_id := v1.resolve_report_subject(NEW.doc);
-    -- Denormalize onto the couchdb row (BEFORE trigger can modify NEW directly)
     NEW.resolved_subject_id := v_subject_id;
     IF v_subject_id IS NOT NULL THEN
-      -- Resolve the containing place (person→parent, place→self)
       v_subject_place_id := v1.resolve_subject_place(v_subject_id);
       NEW.resolved_subject_place_id := v_subject_place_id;
       INSERT INTO v1.report_subjects (report_id, subject_id)
@@ -936,26 +987,37 @@ BEGIN
       DELETE FROM v1.report_subjects WHERE report_id = NEW._id;
     END IF;
 
-    -- Maintain report_visible_places: subject place + submitter place (deduplicated)
+    -- Submitter's structural place (denormalized for JOIN-free Sync Streams)
+    SELECT cpp.place_id INTO v_submitter_place_id
+    FROM v1.contact_parent_place cpp
+    WHERE cpp.contact_id = NEW.doc -> 'contact' ->> '_id';
+    NEW.submitter_place_id := v_submitter_place_id;
+
+    -- Also maintain report_visible_places (kept for backward compat)
     DELETE FROM v1.report_visible_places WHERE report_id = NEW._id;
     IF v_subject_place_id IS NOT NULL THEN
       INSERT INTO v1.report_visible_places (report_id, place_id)
       VALUES (NEW._id, v_subject_place_id)
       ON CONFLICT DO NOTHING;
     END IF;
-    -- Submitter's structural place (from contact_parent_place lookup)
-    SELECT cpp.place_id INTO v_submitter_place_id
-    FROM v1.contact_parent_place cpp
-    WHERE cpp.contact_id = NEW.doc -> 'contact' ->> '_id';
     IF v_submitter_place_id IS NOT NULL THEN
       INSERT INTO v1.report_visible_places (report_id, place_id)
       VALUES (NEW._id, v_submitter_place_id)
-      ON CONFLICT DO NOTHING;  -- dedup: same place for same-facility reports
+      ON CONFLICT DO NOTHING;
     END IF;
+
+  ELSIF NEW.doc ->> 'form' IS NULL AND NOT COALESCE(NEW._deleted, false) THEN
+    -- === SMS handling ===
+    -- Look up the contact person's structural place
+    SELECT cpp.place_id INTO NEW.contact_place_id
+    FROM v1.contact_parent_place cpp
+    WHERE cpp.contact_id = NEW.doc -> 'contact' ->> '_id';
 
   ELSIF COALESCE(NEW._deleted, false) THEN
     NEW.resolved_subject_id := NULL;
     NEW.resolved_subject_place_id := NULL;
+    NEW.submitter_place_id := NULL;
+    NEW.contact_place_id := NULL;
     DELETE FROM v1.report_subjects WHERE report_id = NEW._id;
     DELETE FROM v1.report_visible_places WHERE report_id = NEW._id;
   END IF;
@@ -974,9 +1036,11 @@ CREATE TRIGGER trg_auto_resolve_report_subject
 
 -- ============================================================
 -- 7c. Contact Parent Place Trigger
--- Maintains contact_parent_place for person-type contacts.
--- When a person is inserted/updated, stores their parent place.
--- Only persons are tracked (not place contacts like clinics).
+-- Maintains contact_parent_place table AND parent_place_id column.
+-- BEFORE trigger so it can set NEW.parent_place_id directly.
+-- For persons and leaf places: walks up to structural ancestor.
+-- For structural places: parent_place_id stays NULL (they match
+-- via _id IN accessible_facilities directly).
 -- ============================================================
 CREATE OR REPLACE FUNCTION v1.auto_update_contact_parent_place()
 RETURNS trigger
@@ -986,9 +1050,6 @@ DECLARE
   v_is_person BOOLEAN;
   v_is_leaf_place BOOLEAN;
 BEGIN
-  -- Determine if this contact is a person.
-  -- Uses person_contact_types view (from app_settings) for generic detection
-  -- that works for any CHT project hierarchy.
   v_is_person := (
     NEW.doc ->> 'type' = 'person'
     OR (
@@ -1001,9 +1062,6 @@ BEGIN
     )
   );
 
-  -- Determine if this is a leaf place (below facility level, e.g., family, household).
-  -- Leaf places are tracked in contact_parent_place so they can match via
-  -- Sync Stream JOINs against accessible_facilities (which only has structural places).
   v_is_leaf_place := (
     NOT v_is_person
     AND NEW.doc ->> 'type' = 'contact'
@@ -1014,16 +1072,20 @@ BEGIN
   IF NOT COALESCE(NEW._deleted, false) AND (v_is_person OR v_is_leaf_place) THEN
     v_place_id := COALESCE(NEW.doc -> 'parent' ->> '_id', NEW.doc ->> 'parent');
     IF v_place_id IS NOT NULL THEN
-      -- Walk up past any leaf places to the nearest structural ancestor
       v_place_id := v1.find_structural_ancestor(v_place_id);
+      -- Denormalize onto the row (BEFORE trigger sets NEW directly)
+      NEW.parent_place_id := v_place_id;
+      -- Also maintain the lookup table (used by other triggers for cross-row lookups)
       INSERT INTO v1.contact_parent_place (contact_id, place_id)
       VALUES (NEW._id, v_place_id)
       ON CONFLICT (contact_id) DO UPDATE SET place_id = EXCLUDED.place_id;
     ELSE
+      NEW.parent_place_id := NULL;
       DELETE FROM v1.contact_parent_place WHERE contact_id = NEW._id;
     END IF;
   ELSE
-    -- Deleted or structural place — remove from lookup
+    -- Structural place or deleted — clear parent_place_id
+    NEW.parent_place_id := NULL;
     DELETE FROM v1.contact_parent_place WHERE contact_id = NEW._id;
   END IF;
   RETURN NEW;
@@ -1032,7 +1094,7 @@ $$;
 
 DROP TRIGGER IF EXISTS trg_auto_update_contact_parent_place ON v1.couchdb;
 CREATE TRIGGER trg_auto_update_contact_parent_place
-  AFTER INSERT OR UPDATE ON v1.couchdb
+  BEFORE INSERT OR UPDATE ON v1.couchdb
   FOR EACH ROW
   WHEN (NEW.doc ->> 'type' IN ('contact', 'person', 'clinic', 'health_center', 'district_hospital'))
   EXECUTE FUNCTION v1.auto_update_contact_parent_place();
@@ -1143,21 +1205,46 @@ CREATE TRIGGER trg_auto_refresh_needs_signoff
   EXECUTE FUNCTION v1.auto_refresh_needs_signoff();
 
 -- ============================================================
+-- 8b. Target Owner Place Trigger
+-- BEFORE trigger for targets: looks up owner's structural place
+-- from contact_parent_place and sets owner_place_id. This replaces
+-- the INNER JOIN contact_parent_place in the Sync Stream targets query.
+-- ============================================================
+CREATE OR REPLACE FUNCTION v1.auto_update_target_owner_place()
+RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+  IF NOT COALESCE(NEW._deleted, false) AND NEW.doc ->> 'owner' IS NOT NULL THEN
+    SELECT cpp.place_id INTO NEW.owner_place_id
+    FROM v1.contact_parent_place cpp
+    WHERE cpp.contact_id = NEW.doc ->> 'owner';
+  ELSE
+    NEW.owner_place_id := NULL;
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS trg_auto_update_target_owner_place ON v1.couchdb;
+CREATE TRIGGER trg_auto_update_target_owner_place
+  BEFORE INSERT OR UPDATE ON v1.couchdb
+  FOR EACH ROW
+  WHEN (NEW.doc ->> 'type' = 'target')
+  EXECUTE FUNCTION v1.auto_update_target_owner_place();
+
+-- ============================================================
 -- 9. Publication for PowerSync logical replication
 -- PowerSync reads changes via the PostgreSQL WAL.
--- All tables referenced in Sync Streams must be published.
+-- Only tables directly referenced in Sync Streams are published.
+-- Auxiliary tables (purge_status, contact_parent_place,
+-- report_visible_places) are NO LONGER published — their data is
+-- denormalized onto v1.couchdb columns to avoid JOIN-caused OOM.
 -- ============================================================
 DROP PUBLICATION IF EXISTS powersync;
 CREATE PUBLICATION powersync FOR TABLE
   v1.couchdb,
   v1.user_settings,
-  v1.user_accessible_facilities,
-  v1.user_report_facilities,
-  v1.report_subjects,
-  v1.report_needs_signoff_visible,
-  v1.contact_parent_place,
-  v1.report_visible_places,
-  v1.purge_status;
+  v1.user_accessible_facilities;
 
 -- ============================================================
 -- 8. Seed test data: user_settings for development
@@ -1255,9 +1342,8 @@ SELECT v1.refresh_needs_signoff_visibility();
 
 -- Bulk-populate purge_status for all existing purgeable documents.
 -- Creates (doc_id, role_hash, purged=false) for every data_record, task,
--- and target doc × every active role_hash. This ensures the Sync Streams
--- INNER JOIN includes existing docs that haven't been evaluated by the
--- purge preprocessor yet.
+-- and target doc × every active role_hash. Retained for the purge
+-- preprocessing service; no longer used in Sync Streams directly.
 INSERT INTO v1.purge_status (doc_id, role_hash, purged, evaluated_at, reason)
 SELECT c._id, us.role_hash, false, NOW(), 'bulk_init'
 FROM v1.couchdb c
@@ -1265,5 +1351,56 @@ CROSS JOIN (SELECT DISTINCT role_hash FROM v1.user_settings WHERE role_hash IS N
 WHERE NOT COALESCE(c._deleted, false)
   AND c.doc ->> 'type' IN ('data_record', 'task', 'target')
 ON CONFLICT (doc_id, role_hash) DO NOTHING;
+
+-- ============================================================
+-- Batch-populate denormalized columns for JOIN-free Sync Streams
+-- These columns replace INNER JOINs that caused PowerSync OOM.
+-- Triggers are disabled during batch to avoid per-row overhead
+-- (find_structural_ancestor / resolve_report_subject calls).
+-- ============================================================
+
+ALTER TABLE v1.couchdb DISABLE TRIGGER trg_auto_update_contact_parent_place;
+ALTER TABLE v1.couchdb DISABLE TRIGGER trg_auto_resolve_report_subject;
+ALTER TABLE v1.couchdb DISABLE TRIGGER trg_auto_update_target_owner_place;
+
+-- parent_place_id: denormalize contact_parent_place onto contact rows
+UPDATE v1.couchdb c
+SET parent_place_id = cpp.place_id
+FROM v1.contact_parent_place cpp
+WHERE cpp.contact_id = c._id
+  AND c.parent_place_id IS DISTINCT FROM cpp.place_id;
+
+-- submitter_place_id: denormalize submitter's structural place onto reports
+UPDATE v1.couchdb c
+SET submitter_place_id = cpp.place_id
+FROM v1.contact_parent_place cpp
+WHERE cpp.contact_id = c.doc -> 'contact' ->> '_id'
+  AND c.doc ->> 'type' = 'data_record'
+  AND c.doc ->> 'form' IS NOT NULL
+  AND NOT COALESCE(c._deleted, false)
+  AND c.submitter_place_id IS DISTINCT FROM cpp.place_id;
+
+-- owner_place_id: denormalize target owner's structural place
+UPDATE v1.couchdb c
+SET owner_place_id = cpp.place_id
+FROM v1.contact_parent_place cpp
+WHERE cpp.contact_id = c.doc ->> 'owner'
+  AND c.doc ->> 'type' = 'target'
+  AND NOT COALESCE(c._deleted, false)
+  AND c.owner_place_id IS DISTINCT FROM cpp.place_id;
+
+-- contact_place_id: denormalize SMS contact's structural place
+UPDATE v1.couchdb c
+SET contact_place_id = cpp.place_id
+FROM v1.contact_parent_place cpp
+WHERE cpp.contact_id = c.doc -> 'contact' ->> '_id'
+  AND c.doc ->> 'type' = 'data_record'
+  AND (c.doc ->> 'form') IS NULL
+  AND NOT COALESCE(c._deleted, false)
+  AND c.contact_place_id IS DISTINCT FROM cpp.place_id;
+
+ALTER TABLE v1.couchdb ENABLE TRIGGER trg_auto_update_contact_parent_place;
+ALTER TABLE v1.couchdb ENABLE TRIGGER trg_auto_resolve_report_subject;
+ALTER TABLE v1.couchdb ENABLE TRIGGER trg_auto_update_target_owner_place;
 
 COMMIT;
