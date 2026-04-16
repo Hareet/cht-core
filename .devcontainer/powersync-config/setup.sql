@@ -124,6 +124,28 @@ CREATE TABLE IF NOT EXISTS v1.contact_parent_place (
 CREATE INDEX IF NOT EXISTS idx_cpp_place
   ON v1.contact_parent_place(place_id);
 
+-- ============================================================
+-- 2c-quin. Report Visible Places (report → place visibility lookup)
+-- Maps each report to the structural places that grant visibility.
+-- Each report has 1-2 entries:
+--   1. Subject's structural place (from resolved_subject_place_id)
+--   2. Submitter's structural place (from contact_parent_place)
+-- For same-facility reports (99%+ of cases), both are identical →
+-- 1 row (deduplicated by PK). This eliminates data amplification:
+-- each report matches exactly 1 bucket in the Sync Stream CTE.
+-- For rare cross-facility reports, 2 rows → the report appears
+-- in both facility buckets (correct behavior, minimal overhead).
+-- Maintained by auto_resolve_report_subject trigger + batch refresh.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS v1.report_visible_places (
+  report_id TEXT NOT NULL,
+  place_id  TEXT NOT NULL,
+  PRIMARY KEY (report_id, place_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_rvp_place
+  ON v1.report_visible_places(place_id);
+
 -- Indexes for shortcode → UUID resolution during subject resolution.
 -- Reports reference subjects by shortcode (e.g., patient_id="13602").
 -- These indexes make the lookup fast during refresh_report_subjects().
@@ -858,6 +880,31 @@ BEGIN
     AND c.resolved_subject_id IS NULL
     AND c.resolved_subject_place_id IS NOT NULL;
 
+  -- Batch-populate report_visible_places from resolved_subject_place_id
+  -- and submitter's structural place (from contact_parent_place).
+  -- Same-facility reports get 1 row (PK dedup). Cross-facility get 2.
+  TRUNCATE v1.report_visible_places;
+
+  -- Insert subject places
+  INSERT INTO v1.report_visible_places (report_id, place_id)
+  SELECT c._id, c.resolved_subject_place_id
+  FROM v1.couchdb c
+  WHERE c.doc ->> 'type' = 'data_record'
+    AND c.doc ->> 'form' IS NOT NULL
+    AND NOT COALESCE(c._deleted, false)
+    AND c.resolved_subject_place_id IS NOT NULL;
+
+  -- Insert submitter places (ON CONFLICT dedup for same-facility reports)
+  INSERT INTO v1.report_visible_places (report_id, place_id)
+  SELECT c._id, cpp.place_id
+  FROM v1.couchdb c
+  INNER JOIN v1.contact_parent_place cpp
+    ON cpp.contact_id = c.doc -> 'contact' ->> '_id'
+  WHERE c.doc ->> 'type' = 'data_record'
+    AND c.doc ->> 'form' IS NOT NULL
+    AND NOT COALESCE(c._deleted, false)
+  ON CONFLICT (report_id, place_id) DO NOTHING;
+
   -- Re-enable the auto-resolve trigger for incremental updates
   ALTER TABLE v1.couchdb ENABLE TRIGGER trg_auto_resolve_report_subject;
 END;
@@ -871,6 +918,7 @@ LANGUAGE plpgsql AS $$
 DECLARE
   v_subject_id TEXT;
   v_subject_place_id TEXT;
+  v_submitter_place_id TEXT;
 BEGIN
   IF NEW.doc ->> 'form' IS NOT NULL AND NOT COALESCE(NEW._deleted, false) THEN
     v_subject_id := v1.resolve_report_subject(NEW.doc);
@@ -887,10 +935,29 @@ BEGIN
       NEW.resolved_subject_place_id := NULL;
       DELETE FROM v1.report_subjects WHERE report_id = NEW._id;
     END IF;
+
+    -- Maintain report_visible_places: subject place + submitter place (deduplicated)
+    DELETE FROM v1.report_visible_places WHERE report_id = NEW._id;
+    IF v_subject_place_id IS NOT NULL THEN
+      INSERT INTO v1.report_visible_places (report_id, place_id)
+      VALUES (NEW._id, v_subject_place_id)
+      ON CONFLICT DO NOTHING;
+    END IF;
+    -- Submitter's structural place (from contact_parent_place lookup)
+    SELECT cpp.place_id INTO v_submitter_place_id
+    FROM v1.contact_parent_place cpp
+    WHERE cpp.contact_id = NEW.doc -> 'contact' ->> '_id';
+    IF v_submitter_place_id IS NOT NULL THEN
+      INSERT INTO v1.report_visible_places (report_id, place_id)
+      VALUES (NEW._id, v_submitter_place_id)
+      ON CONFLICT DO NOTHING;  -- dedup: same place for same-facility reports
+    END IF;
+
   ELSIF COALESCE(NEW._deleted, false) THEN
     NEW.resolved_subject_id := NULL;
     NEW.resolved_subject_place_id := NULL;
     DELETE FROM v1.report_subjects WHERE report_id = NEW._id;
+    DELETE FROM v1.report_visible_places WHERE report_id = NEW._id;
   END IF;
   RETURN NEW;
 END;
@@ -1089,6 +1156,7 @@ CREATE PUBLICATION powersync FOR TABLE
   v1.report_subjects,
   v1.report_needs_signoff_visible,
   v1.contact_parent_place,
+  v1.report_visible_places,
   v1.purge_status;
 
 -- ============================================================
