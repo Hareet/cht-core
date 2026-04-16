@@ -146,7 +146,19 @@
 
       utils.setOptions(POUCHDB_OPTIONS);
 
-      if (isInitialReplicationNeeded) {
+      // Check if PowerSync is enabled — if so, skip PouchDB initial replication
+      let powerSyncEnabled = false;
+      try {
+        const psStatus = await utils.fetchJSON('/api/v1/powersync/status');
+        powerSyncEnabled = !!psStatus.powersync_enabled;
+      } catch (e) {
+        // API not available or endpoint missing — default to PouchDB
+      }
+
+      if (powerSyncEnabled) {
+        console.info('PowerSync is enabled — skipping PouchDB initial replication');
+        setUiStatus('STARTING_APP');
+      } else if (isInitialReplicationNeeded) {
         await doInitialReplication(remoteDb, localDb, userCtx);
       }
 

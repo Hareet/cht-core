@@ -15,6 +15,7 @@ import { MigrationsService } from '@mm-services/migrations.service';
 import { ReplicationService } from '@mm-services/replication.service';
 import { PerformanceService } from '@mm-services/performance.service';
 import { DOC_IDS, DOC_TYPES } from '@medic/constants';
+import { SettingsService } from '@mm-services/settings.service';
 
 const READ_ONLY_TYPES = ['form', DOC_TYPES.TRANSLATIONS];
 const READ_ONLY_IDS = [
@@ -88,6 +89,7 @@ export class DBSyncService {
     private translateService:TranslateService,
     private migrationsService:MigrationsService,
     private replicationService:ReplicationService,
+    private settingsService:SettingsService,
   ) {
     this.globalActions = new GlobalActions(this.store);
   }
@@ -103,9 +105,27 @@ export class DBSyncService {
   };
 
   private readonly observable = new Subject<SyncState>();
+  private powerSyncEnabled = false;
 
   isEnabled() {
-    return !this.sessionService.isOnlineOnly();
+    return !this.sessionService.isOnlineOnly() && !this.powerSyncEnabled;
+  }
+
+  /**
+   * Call during app init to check if PowerSync is enabled.
+   * If so, PouchDB replication is disabled.
+   */
+  async checkPowerSyncFlag() {
+    try {
+      const settings = await this.settingsService.get();
+      this.powerSyncEnabled = !!settings?.powersync?.enabled;
+      if (this.powerSyncEnabled) {
+        console.info('PouchDB sync DISABLED — PowerSync is enabled in app_settings');
+      }
+    } catch (e) {
+      // Settings not available yet, default to PouchDB
+      this.powerSyncEnabled = false;
+    }
   }
 
   private replicateToRetry({ batchSize=BATCH_SIZE }={}) {

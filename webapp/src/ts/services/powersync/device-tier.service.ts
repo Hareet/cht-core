@@ -40,7 +40,7 @@ const TIER_THRESHOLDS = {
 };
 
 const TIER_CONFIGS: Record<DeviceTierName, TierConfig> = {
-  go:       { cacheSizeKb: 10240,  dbSizeBudgetMB: 200 },   // 10MB cache, 200MB budget
+  go:       { cacheSizeKb: 5120,   dbSizeBudgetMB: 200 },   // 5MB cache, 200MB budget
   budget:   { cacheSizeKb: 25600,  dbSizeBudgetMB: 500 },   // 25MB cache, 500MB budget
   standard: { cacheSizeKb: 51200,  dbSizeBudgetMB: 1024 },  // 50MB cache, 1GB budget
   high:     { cacheSizeKb: 51200,  dbSizeBudgetMB: 2048 },  // 50MB cache, 2GB budget
@@ -70,7 +70,11 @@ export class DeviceTierService {
     const storageFreeGB = storageEstimate.free / GB;
     const webviewMajor = this.getWebViewMajorVersion();
 
-    const tier = this.classifyTier(storageEstimate.total);
+    // Allow benchmark scripts to force a tier via window.__CHT_FORCE_DEVICE_TIER
+    const forcedTier = (window as any).__CHT_FORCE_DEVICE_TIER as DeviceTierName | undefined;
+    const tier = forcedTier && ['go', 'budget', 'standard', 'high'].includes(forcedTier)
+      ? forcedTier
+      : this.classifyTier(storageEstimate.total);
 
     this.detected = {
       tier,

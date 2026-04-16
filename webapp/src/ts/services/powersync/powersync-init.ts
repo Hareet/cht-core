@@ -73,8 +73,11 @@ async function isPowerSyncEnabled(getSettings?: () => Promise<Record<string, any
     const settings = await getSettings();
     return !!settings?.powersync?.enabled;
   } catch (err) {
-    console.warn('PowerSync: Failed to read app_settings, assuming disabled', err);
-    return false;
+    // Settings not readable (PouchDB may be empty because bootstrapper skipped
+    // initial replication when PowerSync is enabled). If the bootstrapper already
+    // confirmed PowerSync is enabled via /api/v1/powersync/status, assume enabled.
+    console.warn('PowerSync: Failed to read app_settings, assuming enabled (bootstrapper already confirmed)', err);
+    return true;
   }
 }
 
