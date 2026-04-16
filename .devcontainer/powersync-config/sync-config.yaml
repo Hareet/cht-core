@@ -45,8 +45,9 @@
 #   6,040 → 4,686  (needs_signoff pre-computation)
 #   4,686 → 2,665  (stream merge + resolved_subject_id denormalization)
 #   2,665 → ~60    (person-bucket elimination via place-level matching)
+#     ~60 → ~15    (leaf-place elimination: family/household excluded from CTE)
 #
-# For a CHW with 50 clinics: ~60 buckets (down from ~16,115 at prod scale).
+# For a CHW: ~15 buckets (structural places + ancestors + fixed buckets).
 #
 # Table aliases in FROM clauses determine client-side table names
 # (PowerSync edition 3 row_type). Different queries in one stream
@@ -70,10 +71,12 @@ streams:
   # ALL DATA — contacts, SMS, targets, reports (unified stream)
   # ================================================================
   # All queries share one accessible_facilities CTE → N shared buckets.
-  # accessible_facilities now contains ONLY place IDs (~52 for a typical
-  # CHW), not person IDs (~8,055). Person contacts and SMS match via
-  # INNER JOIN contact_parent_place. Reports match via resolved_subject_place_id
-  # (the place containing the report's subject: parent for persons, self for places).
+  # accessible_facilities contains ONLY structural place IDs (~7 for a
+  # typical CHW: facility + ancestors). Leaf places (family, household)
+  # and persons are excluded. Person contacts, leaf place contacts, and
+  # SMS match via INNER JOIN contact_parent_place (which maps to the
+  # nearest structural ancestor). Reports match via resolved_subject_place_id
+  # (walks up past leaf places to the structural ancestor).
   #
   # Trade-off: reports use accessible_facilities (replication_depth) instead
   # of report_facilities (report_depth). Users with report_depth < depth may
@@ -117,11 +120,11 @@ streams:
         WHERE contacts._deleted != true
           AND contacts.doc ->> 'type' IN '["contact", "person", "clinic", "health_center", "district_hospital"]'
           AND contacts._id IN accessible_facilities
-      # -- Person contacts (children of accessible places, via lookup) --
-      # Matches persons whose parent place is in accessible_facilities.
-      # Uses contact_parent_place (persons only) so sibling places under
-      # ancestor facilities are NOT over-synced. This replaces the
-      # removed Step 1.5 person expansion in refresh_user_facilities().
+      # -- Person + leaf place contacts (via structural ancestor lookup) --
+      # Matches persons and leaf places (family, household) whose nearest
+      # structural ancestor is in accessible_facilities. Uses
+      # contact_parent_place which maps both persons and leaf places to
+      # their structural ancestor (walks up past leaf place types).
       - |
         SELECT
           contacts._id AS id,
