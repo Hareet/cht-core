@@ -117,9 +117,10 @@ export class PowerSyncService implements OnDestroy {
     // Request persistent storage to prevent OPFS/IndexedDB eviction
     this.requestPersistentStorage();
 
-    // Select VFS: OPFS for performance, IndexedDB fallback for non-OPFS devices
+    // Select VFS: AccessHandlePoolVFS for single-tab (best perf, lowest memory),
+    // OPFSCoopSyncVFS if multi-tab needed, IDBBatchAtomicVFS as fallback
     const vfs = deviceTier.opfsAvailable
-      ? WASQLiteVFS.OPFSCoopSyncVFS
+      ? WASQLiteVFS.AccessHandlePoolVFS
       : WASQLiteVFS.IDBBatchAtomicVFS;
 
     console.info(
@@ -143,6 +144,12 @@ export class PowerSyncService implements OnDestroy {
         },
       });
     });
+
+    // Expose DB globally for benchmarking (dev mode only)
+    (window as any).__ps_db = this.db;
+
+    // Reduce SQLite cache for Go edition memory constraint (negative = KiB)
+    await this.db!.execute(`PRAGMA cache_size = -${tierConfig.cacheSizeKb}`);
 
     // Derive the PowerSync service URL
     const powerSyncUrl = config?.powerSyncUrl || this.derivePowerSyncUrl();

@@ -56,6 +56,9 @@ import { SidebarMenuComponent } from '@mm-components/sidebar-menu/sidebar-menu.c
 import { SnackbarComponent } from '@mm-components/snackbar/snackbar.component';
 import { TasksNotificationService } from '@mm-services/task-notifications.service';
 import { DOC_IDS, DOC_TYPES } from '@medic/constants';
+import { PowerSyncService } from '@mm-services/powersync/powersync.service';
+import { initializePowerSync } from '@mm-services/powersync/powersync-init';
+import { SettingsService } from '@mm-services/settings.service';
 
 const SYNC_STATUS = {
   inProgress: {
@@ -159,6 +162,8 @@ export class AppComponent implements OnInit, AfterViewInit {
     private userSettingsService: UserSettingsService,
     private formService: FormService,
     private readonly taskNotificationService: TasksNotificationService,
+    private powerSyncService: PowerSyncService,
+    private settingsService: SettingsService,
   ) {
     this.globalActions = new GlobalActions(store);
     this.analyticsActions = new AnalyticsActions(store);
@@ -324,11 +329,26 @@ export class AppComponent implements OnInit, AfterViewInit {
         this.router.navigate(['/error', '503' ]);
       });
 
+    // Initialize PowerSync independently of the main setup chain.
+    // The setup chain may fail (e.g., initUser needs PouchDB data that doesn't exist
+    // when PowerSync is active). PowerSync must init regardless.
+    initializePowerSync(this.powerSyncService, this.sessionService, {
+      powerSyncUrl: (window as any).__CHT_POWERSYNC_URL || 'http://powersync:8080',
+      devMode: true,
+      getSettings: () => this.settingsService.get(),
+    });
+
+    // Check PowerSync flag, THEN start DB sync watcher.
+    // Must resolve before watchDBSyncStatus or PouchDB replication starts
+    // even when PowerSync is enabled.
+    this.dbSyncService.checkPowerSyncFlag().then(() => {
+      this.watchDBSyncStatus();
+    });
+
     this.watchBrandingChanges();
     this.watchDDocChanges();
     this.watchUserContextChanges();
     this.watchTranslationsChanges();
-    this.watchDBSyncStatus();
     this.watchDatabaseConnection();
     this.setAppTitle();
     this.setupAndroidVersion();
