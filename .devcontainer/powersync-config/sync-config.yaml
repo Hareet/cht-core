@@ -46,8 +46,10 @@
 #   4,686 → 2,665  (stream merge + resolved_subject_id denormalization)
 #   2,665 → ~60    (person-bucket elimination via place-level matching)
 #     ~60 → ~15    (leaf-place elimination: family/household excluded from CTE)
+#     ~15 → ~11    (dedup: remove person IDs, own-reports, needs_signoff queries)
 #
-# For a CHW: ~15 buckets (structural places + ancestors + fixed buckets).
+# For a CHW: ~11 buckets (7 structural places shared + 4 fixed-bucket streams).
+# 168K ops → ~20K ops target (8.4x dedup → ~1x amplification).
 #
 # Table aliases in FROM clauses determine client-side table names
 # (PowerSync edition 3 row_type). Different queries in one stream
@@ -89,7 +91,7 @@ streams:
   #   targets      → client "targets" table
   #   reports      → client "reports" table
   #
-  # Buckets: N (shared CTE) + 1 (own) + 1 (needs_signoff) = N + 2
+  # Buckets: N (shared CTE) = ~7 for a CHW (facility + 6 ancestors)
   all_data:
     auto_subscribe: true
     priority: 1
@@ -99,10 +101,10 @@ streams:
         FROM "v1"."user_accessible_facilities"
         WHERE user_id = auth.user_id()
     queries:
-      # -- Place contacts (matched by _id in CTE) --
-      # Matches clinics, HCs, districts, and any contacts whose _id is
-      # directly in accessible_facilities (including primary contacts
-      # and the user's own contact from Steps 3-4).
+      # -- Structural place contacts (matched by _id in CTE) --
+      # Matches structural places (clinics, HCs, districts, etc.) whose
+      # _id is directly in accessible_facilities. CTE contains ONLY
+      # structural place IDs — no person IDs (primary contacts removed).
       - |
         SELECT
           contacts._id AS id,
@@ -163,9 +165,12 @@ streams:
           AND sms_messages.doc ->> 'type' = 'data_record'
           AND ifnull(sms_messages.doc ->> 'form', '') = ''
           AND cpp.place_id IN accessible_facilities
-      # -- Targets --
-      # target.owner = contact UUID. Syncs to any user who can see
-      # the owner contact (supervisors see subordinate targets).
+      # -- Targets (via owner's structural ancestor) --
+      # target.owner = contact UUID (a person). Since accessible_facilities
+      # contains only structural place IDs (not persons), we JOIN
+      # contact_parent_place to match the owner's structural ancestor.
+      # Supervisors see subordinate targets because their subordinates'
+      # contact persons map to structural places in the supervisor's CTE.
       # PURGE: INNER JOIN purge_status excludes purged targets per role.
       - |
         SELECT
@@ -175,18 +180,20 @@ streams:
           CAST(targets.doc -> 'targets' AS TEXT) AS targets_data,
           CAST(targets.doc AS TEXT) AS doc
         FROM "v1"."couchdb" targets
+        INNER JOIN "v1"."contact_parent_place" cpp_t
+          ON cpp_t.contact_id = targets.doc ->> 'owner'
         INNER JOIN "v1"."purge_status" ps_t
           ON ps_t.doc_id = targets._id
           AND ps_t.role_hash = auth.parameter('role_hash')
           AND ps_t.purged = false
         WHERE targets._deleted != true
           AND targets.doc ->> 'type' = 'target'
-          AND targets.doc ->> 'owner' IN accessible_facilities
-      # -- Subject-matched reports (via subject's containing place) --
-      # Uses resolved_subject_place_id: for person subjects this is the
-      # parent clinic, for place subjects this is the place itself.
-      # Matches against accessible_facilities which now contains only
-      # places (~52 entries), not person IDs (~8,055).
+          AND cpp_t.place_id IN accessible_facilities
+      # -- Subject-matched reports (via subject's structural place) --
+      # THE primary report query — all reports match here.
+      # Uses resolved_subject_place_id: walks up from subject to the
+      # nearest structural place (facility + ancestors, ~7 entries).
+      # Private reports: OR clause allows submitter to see their own.
       # Maintained by BEFORE trigger in setup.sql.
       # PURGE: INNER JOIN purge_status excludes purged reports per role.
       - |
@@ -213,62 +220,26 @@ streams:
             ifnull(reports.doc -> 'fields' ->> 'private', 'false') != 'true'
             OR reports.doc -> 'contact' ->> '_id' = auth.parameter('contact_id')
           )
-      # -- User's own reports --
-      # Own reports always sync regardless of report_depth or privacy.
-      # Submitter = user's contact_id → 1 bucket.
-      # PURGE: INNER JOIN purge_status excludes purged reports per role.
-      - |
-        SELECT
-          reports._id AS id,
-          reports.doc ->> 'form' AS form,
-          reports.doc ->> 'patient_id' AS patient_id,
-          reports.doc -> 'contact' ->> '_id' AS submitter_id,
-          reports.doc ->> 'reported_date' AS reported_date,
-          reports.doc -> 'fields' ->> 'private' AS is_private,
-          reports.doc -> 'fields' ->> 'needs_signoff' AS needs_signoff,
-          CAST(reports.doc -> 'fields' AS TEXT) AS fields,
-          CAST(reports.doc AS TEXT) AS doc
-        FROM "v1"."couchdb" reports
-        INNER JOIN "v1"."purge_status" ps_r
-          ON ps_r.doc_id = reports._id
-          AND ps_r.role_hash = auth.parameter('role_hash')
-          AND ps_r.purged = false
-        WHERE reports._deleted != true
-          AND reports.doc ->> 'type' = 'data_record'
-          AND reports.doc ->> 'form' IS NOT NULL
-          AND reports.doc -> 'contact' ->> '_id' = auth.parameter('contact_id')
-      # -- Needs-signoff via pre-computed visibility (1 bucket) --
-      # report_needs_signoff_visible maps (report_id, visible_to_user)
-      # pre-computed by walking submitter ancestor chains in PostgreSQL.
-      # The JOIN filter visible_to_user = auth.user_id() → 1 bucket.
-      # PURGE: INNER JOIN purge_status excludes purged reports per role.
-      - |
-        SELECT
-          reports._id AS id,
-          reports.doc ->> 'form' AS form,
-          reports.doc ->> 'patient_id' AS patient_id,
-          reports.doc -> 'contact' ->> '_id' AS submitter_id,
-          reports.doc ->> 'reported_date' AS reported_date,
-          reports.doc -> 'fields' ->> 'private' AS is_private,
-          reports.doc -> 'fields' ->> 'needs_signoff' AS needs_signoff,
-          CAST(reports.doc -> 'fields' AS TEXT) AS fields,
-          CAST(reports.doc AS TEXT) AS doc
-        FROM "v1"."couchdb" reports
-        INNER JOIN "v1"."report_needs_signoff_visible" rnsv
-          ON rnsv.report_id = reports._id
-          AND rnsv.visible_to_user = auth.user_id()
-        INNER JOIN "v1"."purge_status" ps_r
-          ON ps_r.doc_id = reports._id
-          AND ps_r.role_hash = auth.parameter('role_hash')
-          AND ps_r.purged = false
-        WHERE reports._deleted != true
-          AND reports.doc ->> 'type' = 'data_record'
-          AND reports.doc ->> 'form' IS NOT NULL
-          AND reports.doc -> 'fields' ->> 'needs_signoff' = 'true'
-          AND (
-            ifnull(reports.doc -> 'fields' ->> 'private', 'false') != 'true'
-            OR reports.doc -> 'contact' ->> '_id' = auth.parameter('contact_id')
-          )
+      # -- User's own reports: REMOVED --
+      # Previously matched all reports where submitter = contact_id.
+      # Removed because CHWs submit reports about patients in their own
+      # facility, so these already match via resolved_subject_place_id.
+      # This eliminates 68K+ duplicate bucket ops for a typical CHW.
+      # Edge case: reports about patients in OTHER facilities won't sync
+      # to the submitter — acceptable for prototype, rare in practice.
+      # Private reports from the user still sync via the subject-matched
+      # query's privacy OR clause (contact._id = auth.parameter).
+      # -- Needs-signoff: REMOVED --
+      # Previously re-synced needs_signoff reports via pre-computed ancestor
+      # visibility (report_needs_signoff_visible table). Removed because
+      # these reports already match via the subject-matched query:
+      # - For CHWs: own reports match via resolved_subject_place_id
+      # - For supervisors: subordinate reports match via resolved_subject_place_id
+      #   because the subject's place is in the supervisor's accessible_facilities
+      # This eliminates ~50K duplicate bucket ops.
+      # Edge case: needs_signoff from a CHW at facility A about a patient at
+      # facility B would NOT show to A's supervisor via subject matching alone.
+      # The pre-computed table is retained for future re-enablement if needed.
 
   # ================================================================
   # UNASSIGNED REPORTS

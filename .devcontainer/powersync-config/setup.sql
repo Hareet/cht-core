@@ -450,12 +450,10 @@ CREATE TRIGGER trg_auto_create_purge_status
 -- 5. Function: Refresh accessible facilities for one user
 -- Uses recursive CTE to walk the contact hierarchy downward
 -- from the user's facility_id to replication_depth levels.
--- Then adds:
---   a) Ancestors: places UP from the user's facility (parent chain)
---   b) Primary contacts: the contact person of every accessible place
---   c) User's own contact_id from user_settings
--- This implements CHT's replicate_primary_contacts behavior
--- (see api/src/services/authorization.js addPrimaryContactsSubjects).
+-- Then adds ancestors UP from the user's facility (parent chain).
+-- ONLY structural place IDs are stored (no person IDs).
+-- Person contacts match via contact_parent_place JOINs in Sync Streams.
+-- Targets match via contact_parent_place JOIN on owner field.
 -- ============================================================
 CREATE OR REPLACE FUNCTION v1.refresh_user_facilities(p_user_id TEXT)
 RETURNS void
@@ -572,35 +570,17 @@ BEGIN
   WHERE _id IS NOT NULL
   ON CONFLICT (user_id, facility_id) DO NOTHING;
 
-  -- Step 3: Add primary contacts of all accessible places
-  -- Each place's doc.contact._id is its primary contact person.
-  -- CHT's addPrimaryContactsSubjects adds these to subjectIds.
-  -- The primary contact inherits the depth of its parent place.
-  INSERT INTO v1.user_accessible_facilities (user_id, facility_id, depth)
-  SELECT DISTINCT p_user_id,
-    CASE
-      WHEN jsonb_typeof(c.doc -> 'contact') = 'object' THEN c.doc -> 'contact' ->> '_id'
-      WHEN jsonb_typeof(c.doc -> 'contact') = 'string' THEN c.doc ->> 'contact'
-    END,
-    uaf.depth  -- inherit depth from the place (for report_depth filtering)
-  FROM v1.couchdb c
-  JOIN v1.user_accessible_facilities uaf ON c._id = uaf.facility_id AND uaf.user_id = p_user_id
-  WHERE c.doc -> 'contact' IS NOT NULL
-    AND NOT COALESCE(c._deleted, false)
-    AND c.doc ->> 'type' IN ('contact', 'clinic', 'health_center', 'district_hospital')
-    AND CASE
-      WHEN jsonb_typeof(c.doc -> 'contact') = 'object' THEN c.doc -> 'contact' ->> '_id'
-      WHEN jsonb_typeof(c.doc -> 'contact') = 'string' THEN c.doc ->> 'contact'
-    END IS NOT NULL
-  ON CONFLICT (user_id, facility_id) DO NOTHING;
+  -- Step 3: REMOVED — primary contacts no longer added to accessible_facilities.
+  -- Person IDs in the CTE create duplicate PowerSync bucket partitions (each
+  -- person ID generates its own bucket across all queries using the CTE).
+  -- Primary contacts already sync via contact_parent_place (query 1 in Sync Streams).
+  -- Targets now match via contact_parent_place JOIN instead of owner IN CTE.
+  -- This reduces accessible_facilities from ~14 to ~7 entries for a typical CHW.
 
-  -- Step 4: Always include the user's own contact person
-  -- (from user_settings.contact_id)
-  IF v_contact_id IS NOT NULL THEN
-    INSERT INTO v1.user_accessible_facilities (user_id, facility_id, depth)
-    VALUES (p_user_id, v_contact_id, 0)
-    ON CONFLICT (user_id, facility_id) DO NOTHING;
-  END IF;
+  -- Step 4: REMOVED — user's own contact_id no longer added to accessible_facilities.
+  -- Same reason as Step 3: person IDs create duplicate buckets. The user's
+  -- own contact syncs via contact_parent_place. The user's own reports sync
+  -- via resolved_subject_place_id (subject is in the user's facility).
 
   -- Step 5: Populate user_report_facilities (report_depth-filtered subset)
   -- PowerSync only allows = comparisons with auth parameters, so we
