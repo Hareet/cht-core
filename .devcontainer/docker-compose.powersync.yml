@@ -23,12 +23,19 @@ services:
     ports:
       - "8080:8080"
     volumes:
-      # Mounts from Agent-3's worktree where the real config is developed.
-      # Switch to ./powersync-config/powersync.yaml after merging Agent-3.
-      - ${CHT_CORE_PATH:-./../}/.agents/worktrees/agent-3/.devcontainer/powersync-config/powersync.yaml:/app/powersync.yaml:ro
+      # Main repo config: sync_config uses path: reference to sync-config.yaml
+      # All JOINs eliminated — uses denormalized columns on v1.couchdb
+      - ${CHT_CORE_PATH:-./../}/.devcontainer/powersync-config/powersync.yaml:/app/powersync.yaml:ro
+      - ${CHT_CORE_PATH:-./../}/.devcontainer/powersync-config/sync-config.yaml:/app/sync-config.yaml:ro
+    deploy:
+      resources:
+        limits:
+          memory: 8G
     environment:
       - PS_DATABASE_URI=postgresql://${POSTGRES_USER:-cht}:${POSTGRES_PASSWORD}@postgres:5432/cht
+      - PS_STORAGE_URI=postgresql://${POSTGRES_USER:-cht}:${POSTGRES_PASSWORD}@postgres:5432/cht
       - PS_ADMIN_TOKEN=${POWERSYNC_ADMIN_TOKEN:?POWERSYNC_ADMIN_TOKEN must be set}
+      - NODE_OPTIONS=--max-old-space-size=6144
     logging:
       driver: "local"
       options:

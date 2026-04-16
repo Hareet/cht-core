@@ -57,6 +57,8 @@ services:
         -c wal_level=logical
         -c max_replication_slots=4
         -c max_wal_senders=4
+        -c max_wal_size=4GB
+        -c checkpoint_completion_target=0.9
 
   couch2pg:
     build:

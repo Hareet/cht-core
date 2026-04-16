@@ -99,6 +99,7 @@ async function handleLoginFlow(page, username, password) {
     + 'Mobile Safari/537.36'
   );
   await page.setViewport({ width: 720, height: 1600, deviceScaleFactor: 2, isMobile: true });
+  await page.setBypassCSP(true);
 
   const client = await page.target().createCDPSession();
   const skipNetwork = process.env.SKIP_NETWORK_THROTTLE === '1';

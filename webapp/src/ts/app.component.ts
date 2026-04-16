@@ -333,7 +333,9 @@ export class AppComponent implements OnInit, AfterViewInit {
     // The setup chain may fail (e.g., initUser needs PouchDB data that doesn't exist
     // when PowerSync is active). PowerSync must init regardless.
     initializePowerSync(this.powerSyncService, this.sessionService, {
-      powerSyncUrl: (window as any).__CHT_POWERSYNC_URL || 'http://powersync:8080',
+      // Use nginx proxy to avoid mixed content (wss:// via /powersync/ proxy)
+      // Falls back to direct URL for dev/override scenarios
+      powerSyncUrl: (window as any).__CHT_POWERSYNC_URL || (location.origin + '/powersync'),
       devMode: true,
       getSettings: () => this.settingsService.get(),
     });

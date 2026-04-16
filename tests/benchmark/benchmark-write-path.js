@@ -128,6 +128,7 @@ async function launchBrowser() {
   const page = await browser.newPage();
   await page.setUserAgent('Mozilla/5.0 (Linux; Android 10; TECNO BC2c) Chrome/122.0.6261.90 Mobile Safari/537.36');
   await page.setViewport({ width: 720, height: 1600, deviceScaleFactor: 2, isMobile: true });
+  await page.setBypassCSP(true);
 
   const client = await page.target().createCDPSession();
   if (!skipNetwork) {
@@ -280,7 +281,8 @@ async function benchPowerSyncWritePath() {
 
   // Set PowerSync URL + force tier
   await page.evaluateOnNewDocument((tier) => {
-    window.__CHT_POWERSYNC_URL = 'http://powersync:8080';
+    // Don't set __CHT_POWERSYNC_URL — let the app use location.origin + '/powersync'
+    // which goes through the nginx wss:// proxy, avoiding mixed content
     window.__CHT_FORCE_DEVICE_TIER = tier;
   }, DEVICE_TIER);
 

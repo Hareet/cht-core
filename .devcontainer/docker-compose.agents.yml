@@ -158,6 +158,26 @@ services:
       - shared-npm-cache:/home/agent/.npm
     working_dir: /workspace/cht-core/.agents/worktrees/agent-7
 
+  agent-config:
+    <<: *agent-base
+    container_name: cht-agent-config
+    hostname: agent-config
+    environment:
+      <<: *agent-env
+      AGENT_ID: "config"
+      AGENT_NAME: config-loader
+      # cht-conf needs these to upload to the local CHT instance
+      COUCH_URL: http://${COUCHDB_USER:-admin}:${COUCHDB_PASSWORD}@couchdb:5984/medic
+      CHT_URL: https://haproxy
+    volumes:
+      - ${CHT_CORE_PATH:-./../}:/workspace/cht-core:rw
+      - ${CHT_AI_TOOLS_PATH:-/home/h4reet/ai_medic/cht-ai-tools}:/workspace/cht-ai-tools:ro
+      - /home/h4reet/ai_medic/config-moh-civ:/workspace/config-moh-civ:rw
+      - claude-config:/home/agent/.claude
+      - config-node-modules:/workspace/config-moh-civ/node_modules
+      - shared-npm-cache:/home/agent/.npm
+    working_dir: /workspace/config-moh-civ
+
 volumes:
   shared-npm-cache:
   claude-config:
@@ -168,6 +188,7 @@ volumes:
   agent-5-node-modules:
   agent-6-node-modules:
   agent-7-node-modules:
+  config-node-modules:
 
 networks:
   cht-net:
