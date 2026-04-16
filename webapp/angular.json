@@ -26,7 +26,17 @@
             "assets": [
               "src/img",
               "src/fonts",
-              "src/audio"
+              "src/audio",
+              {
+                "glob": "*.umd.js",
+                "input": "node_modules/@powersync/web/dist/worker",
+                "output": "powersync/worker"
+              },
+              {
+                "glob": "*.wasm",
+                "input": "node_modules/@powersync/web/dist",
+                "output": "powersync"
+              }
             ],
             "styles": [
               "src/css/inbox.less"

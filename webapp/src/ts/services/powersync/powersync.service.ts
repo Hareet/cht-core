@@ -138,6 +138,10 @@ export class PowerSyncService implements OnDestroy {
           dbFilename: DB_FILENAME,
           vfs,
           cacheSizeKb: tierConfig.cacheSizeKb,
+          // Use pre-bundled UMD worker copied to build output by angular.json assets.
+          // Without this, the SDK uses `new URL('./WASQLiteDB.worker.js', import.meta.url)`
+          // which resolves to a file:// path in node_modules, blocked by origin security policy.
+          worker: '/powersync/worker/WASQLiteDB.umd.js',
         }),
         flags: {
           useWebWorker: true,
