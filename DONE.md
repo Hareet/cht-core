@@ -1,3 +1,155 @@
+# Agent 3 — Sync Streams: user_settings_doc 0/31 stall fixed (2026-04-17, later)
+
+## What landed
+`8fb1e8623 fix(sync-config): add type predicate to user_settings_doc stream`
+on branch `playtime-agent-3-sync-streams`.
+
+One-line change to `.devcontainer/powersync-config/sync-config.yaml`:
+
+```diff
+       FROM "v1"."couchdb" user_settings_doc
+       WHERE user_settings_doc._deleted != true
++        AND user_settings_doc.doc ->> 'type' = 'user-settings'
+         AND user_settings_doc._id = auth.user_id()
+```
+
+## Root cause
+PowerSync's query compiler turns `column = auth.user_id()` into a bucket
+partition key and removes it from the row filter. With no other predicate
+scoping the row set, every one of the ~820K rows in `v1.couchdb` (which
+holds ALL CHT docs, not just user-settings) became its own single-row
+bucket. Server-side bookkeeping on that many buckets stalled the
+priority-1 initial-sync checkpoint — surfacing as `user_settings_doc: 0/N
+never draining` and `hasSynced=false` even though `all_data` was complete.
+
+Compiled plan before the fix (from `powersync.sync_rules.sync_plan`,
+iteration 14):
+
+```json
+"dataSource[12]": {
+  "table": {"schema": "v1", "table": "couchdb"},
+  "filters": [{ "operator": "not", "operand": "_deleted = 1" }],
+  "partitionBy": [{ "expr": { "source": { "column": "_id" }}}]
+}
+```
+
+Only `_deleted != true` survived as a filter; the auth comparison was
+absorbed into `partitionBy`. Adding `doc ->> 'type' = 'user-settings'`
+restricts bucket-eligible rows to the 149 user-settings docs — one bucket
+per user, as intended.
+
+## Verification (after restart + fresh re-replication, iteration 15)
+
+`powersync.sync_rules` state:
+
+```
+id | state      | has_type_predicate
+14 | TERMINATED | f   ← previous buggy iteration
+15 | ACTIVE     | t   ← fix live
+```
+
+Server-side bucket counts, iteration 15:
+
+| Stream | Before | After | Notes |
+|---|---:|---:|---|
+| user_settings_doc | 820,107 | **149** | One per user-settings doc. 5,504× reduction. |
+| global_config | 1 (133 PUTs, 34 stale) | **1 (99 PUTs)** | Stale ops dropped by fresh replication. |
+| all_data | 348,237 | 342,601 | Keyed by accessible_facilities — unchanged design. |
+| unassigned_reports | 1 | 1 | unchanged. |
+
+Per-client view from the PowerSync Service log for `chw_test_1`:
+
+```
+New checkpoint: 18812964 | write: null | buckets: 11 | param_results: 7
+  "15#user_settings_doc|0[\"org.couchdb.user:chw_test_1\"]"   ← user's own doc
+  "15#tasks|0[\"org.couchdb.user:chw_test_1\"]"
+  "15#user_meta|0[\"org.couchdb.user:chw_test_1\"]"
+  "15#global_config|0[]"
+  "15#all_data|0[\"<facility-uuid>\"]"   × 7
+```
+
+11 buckets per client: exactly 7 accessible facilities + 4 fixed-bucket streams.
+
+Benchmark (`TEST=powersync BENCHMARK_TARGET=couchdb DEVICE_TIER=standard`
+`SKIP_NETWORK_THROTTLE=1`, chw_test_1):
+
+```
+PowerSync: Initialized successfully, syncing in background
+PowerSync initial sync complete (hasSynced=true): 228.2MB
+"connected": true, "hasSynced": true, "lastSyncedAt": "2026-04-17T17:15:37Z"
+All internalStreamSubscriptions: progress {total: 0, downloaded: 0}
+  (= steady-state "fully drained, nothing pending" after sync completes)
+
+Server-side sync stream close event:
+  operations_synced: 40630  (PUTs: 40630, REMOVEs: 0)
+  stream_ms:         43293
+  close_reason:      "client closing stream"   (benchmark finished, not a stall)
+
+Write path unchanged:
+  Test A local persist:  17ms avg (9-47ms)
+  Test B server upload:  2033ms
+  Test C batch (10):     101ms (10ms/doc)
+```
+
+All three success criteria from the handoff pass:
+
+- [x] `hasSynced: true` within 60s on standard/unthrottled
+- [x] `user_settings_doc` progress: N/N (1/1 for the user's own bucket — 149 buckets live, client accesses 1)
+- [x] `global_config` progresses to N/N (99/99, no shortfall)
+
+## Audit of remaining streams
+
+Verified no other stream has the same `_id = auth.user_id()` anti-pattern:
+
+| Stream | Bucket key | Type filter | Risk |
+|---|---|---|---|
+| `all_data` | CTE `accessible_facilities` | yes | none — CTE-scoped per user |
+| `unassigned_reports` | `can_view_unallocated` (auth param) | yes | none |
+| `tasks` | `doc ->> 'user'` | yes (`type = 'task'`) | none |
+| `global_config` | none (global) | yes (`type IN / _id IN`) | none |
+| `user_settings_doc` | `_id` | **now present — fix here** | resolved |
+| `user_meta` | `doc ->> 'user'` | yes (substring type check) | none |
+
+## Docs compliance check (before deploy)
+
+Cross-referenced via PowerSync MCP:
+
+- `/sync/supported-sql`: `AND` is "Fully supported. You can mix parameter
+  comparisons, subqueries, and row-value conditions in the same clause."
+  The example given is literally our shape: `WHERE owner_id = auth.user_id()
+  AND status = 'active'`.
+- `/debugging/troubleshooting#how-buckets-are-created-in-sync-streams`:
+  documents the "1 per user" bucket count for the `column = auth.user_id()`
+  pattern — assumes the filter column is user-scoped. In our case, `_id`
+  on `v1.couchdb` is NOT user-scoped without the type predicate.
+- `/debugging/troubleshooting#combined-filter-expressions`: static-value
+  row filters don't multiply buckets (only independent bucket-key
+  expressions do), so the added predicate reduces the contributing row set
+  without adding a bucket dimension.
+
+## Operator-side (not committed to agent-3 branch)
+
+- Tested via `/workspace/cht-core/.devcontainer/docker-compose.override.yml`
+  bind-mounting agent-3's `sync-config.yaml` into the PowerSync container,
+  so the fix could be validated without polluting main. After merging the
+  branch into `playtime`, remove the override:
+  `rm /workspace/cht-core/.devcontainer/docker-compose.override.yml` and
+  `docker compose -f docker-compose.powersync.yml up -d --force-recreate powersync`.
+- Deploying new sync rules triggers a full Postgres re-replication
+  (~1–3 min on this dataset). Old rules serve clients during processing;
+  cutover is atomic via `Activated new sync rules` in the service log.
+- `powersync.sync_rules` lives in the `cht` database (not
+  `powersync_storage` — that DB exists but is empty / unused). The
+  `PS_STORAGE_URI` points at `/cht`.
+
+## Out of scope (confirmed not touched)
+
+- The benchmark's graceful-bail behavior (kept as-is per handoff).
+- cht-datasource and api controllers (Agent 1's territory).
+- Client-UUID preservation / idHint (Agent 1's territory).
+
+---
+
 # Agent 1 — cht-datasource PowerSync→Postgres Wiring (iteration 2, 2026-04-17)
 
 ## Summary
