@@ -56,6 +56,20 @@ services:
       - PS_DATABASE_URI=postgresql://${POSTGRES_USER:-cht}:${POSTGRES_PASSWORD}@postgres:5432/cht
       - NODE_ENV=development
       - LOG_LEVEL=debug
+      # cht-datasource adapter selection. Default 'couchdb' preserves existing behaviour.
+      # Set CHT_DB_BACKEND=postgres in your shell/.env before `docker compose up -d api`
+      # to route cht-datasource reads/writes through the Postgres adapter (v1.couchdb).
+      - CHT_DB_BACKEND=${CHT_DB_BACKEND:-couchdb}
+      - POSTGRES_URL=postgresql://${POSTGRES_USER:-cht}:${POSTGRES_PASSWORD}@postgres:5432/cht
+    volumes:
+      # Dev overlays so local src + webapp-build edits survive `docker compose up -d api`.
+      # Populate /tmp/cht-webapp-build by rebuilding in cht-agent-7 and
+      # `docker cp cht-agent-7:/workspace/cht-core/api/build/static/webapp/. /tmp/cht-webapp-build/`.
+      # Override controllers/services by editing the playtime source and restarting the container.
+      # webapp dir must be writable: api writes deploy-info.json on startup.
+      - /tmp/cht-webapp-build:/service/api/build/static/webapp
+      - ${CHT_CORE_PATH:-/home/h4reet/ai_medic/cht-core}/api/src/controllers:/service/api/src/controllers:ro
+      - ${CHT_CORE_PATH:-/home/h4reet/ai_medic/cht-core}/api/src/services:/service/api/src/services:ro
     logging:
       driver: "local"
       options:

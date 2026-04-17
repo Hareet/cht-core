@@ -11,14 +11,31 @@
  * PouchDB: writes to IndexedDB via PouchDB.put(), uploads via _bulk_docs
  * PowerSync: writes to WASM SQLite via db.execute(), uploads via uploadData()
  *
- * Env vars:
+ * Env vars (benchmark process, set on cht-agent-7):
  *   DEVICE_TIER=go|budget|standard|high   (default: go)
  *   SKIP_NETWORK_THROTTLE=1               Skip 3G
  *   CHT_ROLE=chw_min_5km                  For PowerSync JWT
  *   TEST=pouchdb|powersync|both           Which engine (default: both)
+ *   BENCHMARK_TARGET=couchdb|postgres     Which backend to verify against in Test B
+ *                                         (default: couchdb). Must match the api's
+ *                                         active CHT_DB_BACKEND — mismatch gives false
+ *                                         negatives.
+ *   BENCH_CONTACT_ID=<uuid>               Override test user's contact UUID
+ *   BENCH_FORM=<form-id>                  Override the form id used in INSERTs
+ *
+ * Operator prerequisite (on cht-api container, set via docker-compose):
+ *   CHT_DB_BACKEND=couchdb  # default — cht-datasource writes to CouchDB via PouchDB
+ *   CHT_DB_BACKEND=postgres # routes writes through cht-datasource Postgres adapter
+ *                           # to v1.couchdb. Requires api restart after the env change.
+ *   POSTGRES_URL is populated from the compose file and used when backend=postgres.
+ *
+ * One-time install on cht-agent-7 (if BENCHMARK_TARGET=postgres):
+ *   docker exec cht-agent-7 bash -c 'cd /tmp && npm install pg@^8 --no-save'
  *
  * Usage:
  *   CHT_ROLE=chw_min_5km node benchmark-write-path.js chw_test_1 'Secret1!pass'
+ *   BENCHMARK_TARGET=postgres CHT_ROLE=chw_min_5km TEST=powersync \
+ *     node benchmark-write-path.js chw_test_1 'Secret1!pass'
  */
 
 const puppeteer = require('puppeteer');
@@ -32,11 +49,26 @@ const CHT_URL = process.env.CHT_URL || 'https://nginx';
 const DEVICE_TIER = process.env.DEVICE_TIER || 'go';
 const skipNetwork = process.env.SKIP_NETWORK_THROTTLE === '1';
 const TEST = process.env.TEST || 'both';
+// Which backend the api is configured to use. Must match cht-api's CHT_DB_BACKEND.
+const BENCHMARK_TARGET = (process.env.BENCHMARK_TARGET || 'couchdb').toLowerCase();
 // Real contact UUID and form name for cht-datasource validation on the PowerSync
 // upload path. `contact` must be a UUID that resolves to an existing contact doc;
 // `form` must be in the supported forms list (otherwise Report.v1.create rejects).
 const BENCH_CONTACT_ID = process.env.BENCH_CONTACT_ID || '4ebb22c9-0f8c-4775-87da-30454446745d';
 const BENCH_FORM = process.env.BENCH_FORM || 'anc_followup';
+
+// pg client is only needed when BENCHMARK_TARGET=postgres. Lazy-loaded so the
+// couchdb path doesn't require the package to be installed in /tmp/node_modules.
+const pgLib = (() => {
+  try { return require('pg'); } catch { return null; }
+})();
+if (BENCHMARK_TARGET === 'postgres' && !pgLib) {
+  console.error(
+    "BENCHMARK_TARGET=postgres but 'pg' is not installed in /tmp/node_modules.\n" +
+    "Run once: docker exec cht-agent-7 bash -c 'cd /tmp && npm install pg@^8 --no-save'"
+  );
+  process.exit(1);
+}
 
 const PROFILES = {
   go:       { cpu: 4, heapMB: 512, label: 'Go Edition (Helio A22, 2GB RAM)' },
@@ -64,6 +96,62 @@ function couchReq(method, path, body) {
     if (body) req.write(body);
     req.end();
   });
+}
+
+// One-shot query against v1.couchdb (the cht-sync JSONB snapshot that the
+// cht-datasource Postgres adapter writes to when CHT_DB_BACKEND=postgres).
+// Only used when BENCHMARK_TARGET=postgres.
+async function pgReq(sql, params = []) {
+  if (!pgLib) {
+    throw new Error('pg not installed in /tmp/node_modules');
+  }
+  const client = new pgLib.Client({
+    host: process.env.POSTGRES_HOST || 'postgres',
+    port: Number(process.env.POSTGRES_PORT || 5432),
+    database: process.env.POSTGRES_DB || 'cht',
+    user: process.env.POSTGRES_USER || 'cht',
+    password: process.env.POSTGRES_PASSWORD || 'pgpass',
+  });
+  await client.connect();
+  try {
+    const res = await client.query(sql, params);
+    return res.rows;
+  } finally {
+    await client.end();
+  }
+}
+
+// Poll for a report authored by this benchmark run. `serverMarker` is embedded
+// in the `fields` JSON text so detection is backend-agnostic: same selector on
+// CouchDB Mango and Postgres JSONB path expressions.
+async function pollForServerDoc(serverMarker) {
+  if (BENCHMARK_TARGET === 'postgres') {
+    // Read `_id` out of the JSONB doc. The couch2pg/cht-sync schema uses a
+    // primary key named `uuid` (not `doc_id`) — the cht-datasource Postgres
+    // adapter stores docs with the couch-style `_id` inside the JSONB, so
+    // extracting from JSONB is the stable cross-schema choice.
+    const rows = await pgReq(
+      `SELECT doc->>'_id' AS id FROM v1.couchdb
+       WHERE doc->>'type' = 'data_record'
+         AND doc->>'form' = $1
+         AND doc->'contact'->>'_id' = $2
+         AND doc->>'fields' LIKE $3
+       LIMIT 1`,
+      [BENCH_FORM, BENCH_CONTACT_ID, '%' + serverMarker + '%']
+    );
+    return rows.length > 0 ? rows[0].id : null;
+  }
+  const res = await couchReq('POST', '/medic/_find', JSON.stringify({
+    selector: {
+      type: 'data_record',
+      form: BENCH_FORM,
+      'contact._id': BENCH_CONTACT_ID,
+      fields: { '$regex': serverMarker },
+    },
+    fields: ['_id'],
+    limit: 1,
+  }));
+  return (res && Array.isArray(res.docs) && res.docs.length > 0) ? res.docs[0]._id : null;
 }
 
 async function handleLoginFlow(page, username, password) {
@@ -623,25 +711,54 @@ async function benchPowerSyncWritePath() {
     maxPersist = Math.max(...persistResults);
 
     // Test B: Wait for upload to server
-    console.log('\n  Test B: Upload to server (via uploadData callback)');
+    // Two metrics: (1) uploadData fired = HTTP POST completed, (2) doc visible in
+    // target backend. pollForServerDoc uses the same marker approach as the
+    // browser path, so results are comparable across runs.
+    console.log(`\n  Test B: Upload to server (target=${BENCHMARK_TARGET}, via uploadData callback)`);
     const uploadDocId = crypto.randomUUID();
+    const nodeServerMarker = 'ps-bench-node-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8);
     const tServerWrite = Date.now();
     await db.execute(
       'INSERT INTO reports (id, form, patient_id, reported_date, fields, contact_id) VALUES (?, ?, ?, ?, ?, ?)',
-      [uploadDocId, BENCH_FORM, '12345', new Date().toISOString(), '{"server_test":true}', BENCH_CONTACT_ID]
+      [uploadDocId, BENCH_FORM, '12345', new Date().toISOString(), JSON.stringify({ server_test: true, marker: nodeServerMarker }), BENCH_CONTACT_ID]
     );
-    console.log('    Wrote locally at T+0ms, waiting for uploadData to fire...');
+    console.log(`    Wrote locally at T+0ms, waiting for uploadData to fire + ${BENCHMARK_TARGET} persistence...`);
 
-    for (let sec = 0; sec < 30; sec++) {
+    // Hard 30s wall-clock deadline (matches browser Test B).
+    const NODE_TEST_B_TIMEOUT_MS = 30_000;
+    const nodeDeadlineB = tServerWrite + NODE_TEST_B_TIMEOUT_MS;
+    let nodeIter = 0;
+    let uploadFiredMs = -1;
+    while (Date.now() < nodeDeadlineB) {
       await new Promise(r => setTimeout(r, 1000));
-      if (uploadCalls > 0 && lastUploadMs > 0) {
-        serverDetectedMs = Date.now() - tServerWrite;
-        console.log('    ** Upload completed at T+' + serverDetectedMs + 'ms (upload call took ' + lastUploadMs + 'ms) **');
-        break;
+      if (Date.now() >= nodeDeadlineB) break;
+      if (uploadFiredMs < 0 && uploadCalls > 0 && lastUploadMs > 0) {
+        uploadFiredMs = Date.now() - tServerWrite;
+        console.log(`    ** uploadData fired at T+${uploadFiredMs}ms (HTTP call took ${lastUploadMs}ms) **`);
       }
+      if (uploadFiredMs < 0) {
+        nodeIter++;
+        continue;
+      }
+      try {
+        const foundId = await pollForServerDoc(nodeServerMarker);
+        if (foundId) {
+          serverDetectedMs = Date.now() - tServerWrite;
+          console.log(`    ** Doc visible in ${BENCHMARK_TARGET} at T+${serverDetectedMs}ms (_id=${foundId}) **`);
+          break;
+        }
+      } catch (e) {
+        if (nodeIter === 0) console.log('    detection error:', e.message);
+      }
+      if (nodeIter > 5 && nodeIter % 5 === 0) {
+        console.log(`    T+${Date.now() - tServerWrite}ms: upload fired but doc not yet in ${BENCHMARK_TARGET}...`);
+      }
+      nodeIter++;
     }
-    if (serverDetectedMs < 0) {
-      console.log('    Upload did not fire within 30s');
+    if (uploadFiredMs < 0) {
+      console.log(`    uploadData never fired within ${NODE_TEST_B_TIMEOUT_MS / 1000}s`);
+    } else if (serverDetectedMs < 0) {
+      console.log(`    Upload fired but doc NOT visible in ${BENCHMARK_TARGET} within ${NODE_TEST_B_TIMEOUT_MS / 1000}s`);
     }
 
     // Test C: Batch write
@@ -668,10 +785,10 @@ async function benchPowerSyncWritePath() {
     maxPersist = Math.max(...persistResults);
 
     // --- Test B: Write then detect upload on server ---
-    // Detection note: cht-datasource's Report.v1.create mints a new CouchDB `_id`;
-    // the PowerSync client UUID is NOT preserved as `_id`. We poll via Mango _find
-    // by contact + reported_date window + a unique marker embedded in `fields`.
-    console.log('\n  Test B: Write → server upload (via PowerSync uploadData)');
+    // Detection: poll by unique marker embedded in `fields`. Backend-agnostic —
+    // CouchDB Mango regex OR Postgres JSONB LIKE via pollForServerDoc(). Works
+    // whether or not the server preserved the client UUID as `_id`.
+    console.log(`\n  Test B: Write → server upload (target=${BENCHMARK_TARGET}, via PowerSync uploadData)`);
     const serverMarker = 'ps-bench-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8);
     const tWrite = Date.now();
     await page.evaluate(async (form, contactId, marker) => {
@@ -687,34 +804,34 @@ async function benchPowerSyncWritePath() {
         ]
       );
     }, BENCH_FORM, BENCH_CONTACT_ID, serverMarker);
-    console.log('    Wrote to WASM SQLite at T+0ms, polling server via _find (marker=' + serverMarker + ')...');
+    console.log(`    Wrote to WASM SQLite at T+0ms, polling ${BENCHMARK_TARGET} (marker=${serverMarker}, timeout 30s)...`);
 
-    for (let sec = 0; sec < 15; sec++) {
+    // Hard 30s wall-clock deadline. `_find` / PG queries take 1-2s each on the
+    // large dataset, so a fixed-iteration loop with sleep+poll can overrun.
+    const TEST_B_TIMEOUT_MS = 30_000;
+    const deadlineB = tWrite + TEST_B_TIMEOUT_MS;
+    let iter = 0;
+    while (Date.now() < deadlineB) {
       await new Promise(r => setTimeout(r, 2000));
+      if (Date.now() >= deadlineB) break;
       const elapsed = Date.now() - tWrite;
       try {
-        const res = await couchReq('POST', '/medic/_find', JSON.stringify({
-          selector: {
-            type: 'data_record',
-            form: BENCH_FORM,
-            'contact._id': BENCH_CONTACT_ID,
-            fields: { '$regex': serverMarker },
-          },
-          fields: ['_id'],
-          limit: 1,
-        }));
-        if (res && Array.isArray(res.docs) && res.docs.length > 0) {
+        const foundId = await pollForServerDoc(serverMarker);
+        if (foundId) {
           serverDetectedMs = elapsed;
-          console.log('    ** Doc found on server at T+' + elapsed + 'ms (server _id=' + res.docs[0]._id + ') **');
+          console.log(`    ** Doc found in ${BENCHMARK_TARGET} at T+${elapsed}ms (_id=${foundId}) **`);
           break;
         }
-      } catch {}
-      if (sec % 5 === 4) {
+      } catch (e) {
+        if (iter === 0) console.log('    detection error:', e.message);
+      }
+      if (iter > 0 && iter % 5 === 0) {
         console.log('    T+' + elapsed + 'ms: not on server yet...');
       }
+      iter++;
     }
     if (serverDetectedMs < 0) {
-      console.log('    Doc NOT found on server within 30s');
+      console.log(`    Doc NOT found in ${BENCHMARK_TARGET} within ${TEST_B_TIMEOUT_MS / 1000}s`);
     }
 
     // --- Test C: Batch write (10 docs) ---
@@ -746,6 +863,7 @@ async function benchPowerSyncWritePath() {
 
   const results = {
     engine: 'powersync',
+    backendTarget: BENCHMARK_TARGET,
     deviceTier: DEVICE_TIER,
     throttle: { cpu: profile.cpu + 'x', network: skipNetwork ? 'unthrottled' : '3G' },
     usedNodeFallback: usedFallback,
@@ -756,10 +874,10 @@ async function benchPowerSyncWritePath() {
   };
 
   console.log('\n  ========================================');
-  console.log('  PowerSync Write Path Results');
+  console.log(`  PowerSync Write Path Results (target=${BENCHMARK_TARGET})`);
   console.log('  ========================================');
   console.log('  Local persist (single):  ' + avgPersist + 'ms avg (' + minPersist + '-' + maxPersist + 'ms)');
-  console.log('  Server upload:           ' + (serverDetectedMs > 0 ? serverDetectedMs + 'ms' : 'NOT DETECTED'));
+  console.log(`  Server upload:           ${serverDetectedMs > 0 ? serverDetectedMs + 'ms' : 'NOT DETECTED'}`);
   console.log('  Batch write (10 docs):   ' + batchMs + 'ms (' + Math.round(batchMs / 10) + 'ms/doc)');
   if (usedFallback) console.log('  NOTE: Node.js native SQLite. WASM would be ~2-5x slower.');
   console.log('  ========================================');
@@ -775,6 +893,10 @@ async function benchPowerSyncWritePath() {
   console.log('  Write Path Benchmark: PouchDB vs PowerSync');
   console.log('  Device: ' + DEVICE_TIER + ' — ' + profile.label);
   console.log('  Network: ' + (skipNetwork ? 'Unthrottled' : '3G'));
+  console.log('  Backend target: ' + BENCHMARK_TARGET +
+    (BENCHMARK_TARGET === 'postgres'
+      ? ' (requires api CHT_DB_BACKEND=postgres)'
+      : ' (cht-datasource → CouchDB)'));
   console.log('============================================================');
 
   let pouchResults = null;
@@ -807,7 +929,14 @@ async function benchPowerSyncWritePath() {
     console.log('\n============================================================');
   }
 
-  const output = { benchmark: 'write-path', timestamp: new Date().toISOString(), pouchdb: pouchResults, powersync: psResults };
-  fs.writeFileSync('/tmp/benchmark-write-path-results.json', JSON.stringify(output, null, 2));
-  console.log('\nResults written to /tmp/benchmark-write-path-results.json');
+  const output = {
+    benchmark: 'write-path',
+    timestamp: new Date().toISOString(),
+    backendTarget: BENCHMARK_TARGET,
+    pouchdb: pouchResults,
+    powersync: psResults,
+  };
+  const outPath = `/tmp/benchmark-write-path-results-${BENCHMARK_TARGET}.json`;
+  fs.writeFileSync(outPath, JSON.stringify(output, null, 2));
+  console.log(`\nResults written to ${outPath}`);
 })().catch(e => { console.error('Failed:', e); process.exit(1); });

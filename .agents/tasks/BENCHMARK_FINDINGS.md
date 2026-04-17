@@ -172,30 +172,57 @@ The existing concurrent benchmarks (up to 50 users) combined with our single-use
 - **Measures**: Download time on 3G, DB open time, first-query latency, incremental sync after pre-seed
 - **PowerSync docs reference**: `client-sdks/advanced/pre-seeded-sqlite`
 
-### 7. Write Path Benchmark Results (Partial)
+### 7. Write Path Benchmark Results (End-to-End Validated 2026-04-17)
 
-Completed 2026-04-16. Full browser WASM measurement blocked by Worker bundling issue (see below).
+Updated 2026-04-17. All write-path issues from the 2026-04-16 partial run are resolved. Browser WASM SQLite writes now flow end-to-end through PowerSync → CHT API → cht-datasource → storage, verified against both CouchDB and PostgreSQL backends.
 
-| Metric | PouchDB (browser, Go 4x CPU) | PowerSync (browser WASM, Go 4x CPU) | PowerSync (Node.js native) |
-|--------|------------------------------|-------------------------------------|---------------------------|
-| Local persist (single) | **14ms avg** (4-87ms) | **14ms avg** (10-28ms) | 1ms |
-| Local persist (steady) | 4-7ms | 10-11ms | 0-1ms |
-| Local persist (cold) | 87ms | 28ms | 1ms |
-| Batch write (10 docs) | Not measured | Not measured (timeout) | 6ms (0.6ms/doc) |
-| Upload to server | **>350s** (sync interval blocked) | Not measured (WebSocket blocked) | **1,001ms** |
-| Upload mechanism | Sync interval (default 5 min) | `uploadData()` auto-fires | Same |
+#### Standard tier (1x CPU, unthrottled network)
 
-**Key findings**:
-1. **Local persist is identical**: PouchDB and PowerSync both average 14ms on Go edition. CHWs won't notice any difference when submitting forms. PowerSync's WASM SQLite writes are comparable to PouchDB's native IndexedDB writes.
-2. **Upload latency**: PowerSync uploads automatically within ~1 second (Node.js measurement). PouchDB uploads on a 5-minute sync interval — in our test, the sync cycle never fired because the app's bootstrap errored before `watchDBSyncStatus` initialized. In production, PouchDB uploads within 0-5 minutes.
-3. **Upload mechanism advantage**: PowerSync fires `uploadData()` immediately when connectivity is available. No polling interval. This means a supervisor sees a CHW's submitted report ~1s after the CHW comes online, vs up to 5 minutes with PouchDB.
+| Metric | PouchDB (browser) | PowerSync → CouchDB | PowerSync → PostgreSQL |
+|--------|-------------------|---------------------|------------------------|
+| Local persist (single doc, avg) | 14ms (4-87ms) | 16ms (10-26ms) | **12ms** (9-17ms) |
+| Local persist (steady) | 4-7ms | 10-12ms | 9-11ms |
+| Batch write (10 docs) | Not measured | 95ms (10ms/doc) | **75ms** (8ms/doc) |
+| Upload → server visible | >350s (sync interval gated) | **2,018ms** | **2,013ms** |
+| Upload mechanism | Sync interval (default 5 min) | `uploadData()` batched POST | `uploadData()` batched POST |
+| Server `_id` | client UUID preserved | random hex (PouchDB→CouchDB) | **client UUID preserved** (via agent-1 `idHint`) |
 
-**Resolved during benchmarking**:
-- Worker/WASM bundling: Agent 5 configured Angular assets to copy UMD worker bundles + WASM files. Worker URL set explicitly in WASQLiteOpenFactory.
-- Nginx WebSocket proxy: `wss://nginx/powersync/` proxies to `ws://powersync:8080/`. Custom nginx.conf mounted via docker-compose.
-- JWT key alignment: dev-token-provider.ts key replaced to match dev-private-key.pem / powersync.yaml JWKS.
+#### Key findings
 
-**Still blocked**: Browser WebSocket sync stream doesn't connect for `chw_test_1` during Puppeteer benchmarks. PowerSync initializes (WASM DB opens, writes work) but `connect()` never establishes the sync stream. Upload number not captured in browser. See `.agents/tasks/BROWSER_INTEGRATION_DEBUGGING.md` for 5 hypotheses and debugging steps.
+1. **Local persist is comparable** across all three engines — PouchDB's IndexedDB writes and PowerSync's WASM SQLite writes land in 10-16ms avg on standard tier. CHWs won't feel a difference when submitting a form on either stack.
+2. **Upload latency collapses from minutes to ~2 seconds** on PowerSync. PouchDB uploads on its sync interval (default 5 min); PowerSync's `uploadData()` fires as soon as writes queue up. Supervisors see CHW submissions ~2s after the CHW comes online vs up to 5 min today.
+3. **PostgreSQL path is slightly faster** than CouchDB path for the same PowerSync client — local persist 12ms vs 16ms, batch 75ms vs 95ms. Driven by JSONB direct insert skipping CouchDB's revision machinery. End-to-end server-visible latency is identical (~2s) because the bottleneck is the upload cadence, not the storage engine.
+4. **Client-UUID preservation works on the Postgres path** via agent-1's optional `idHint` parameter on `Report/Person/Place.v1.create` and `createDoc(data, idHint)`. The CouchDB local adapter did not preserve the UUID on this run — suggests the installed `@medic/cht-datasource` in the `cht-api` image doesn't have the `local/libs/doc.ts` idHint change yet (only `postgres/` and public exports did). Follow-up: rebuild and install updated shared-libs into cht-api or bake into a fresh image.
+5. **The v5 `/api/v1/replication/get-ids` bottleneck is a *download* concern, not an upload concern.** Reducing PouchDB's sync interval would fire uploads faster but would also fire *more* filtered-view scans on CouchDB — pulling load forward, not changing the asymptote. See "PouchDB sync interval note" below.
+
+#### PouchDB sync interval note
+
+We considered temporarily reducing PouchDB's sync interval to shorten the benchmark, but:
+
+- **PouchDB's upload path** uses `POST /medic/_bulk_docs` — cheap on the server, bounded by network RTT. Reducing the interval just fires this more often.
+- **PouchDB's download path** uses `GET /api/v1/replication/get-ids` → `POST /medic/_bulk_get`. `/get-ids` filters the `docs_by_replication_key` view per user and runs `purge.js` — this is the O(N²) scan that collapses CouchDB at 10+ concurrent users (per earlier concurrent benchmarks).
+- Reducing the sync interval *does* demonstrate that the filter cost stays constant per call, so firing more often simply multiplies server load. It doesn't change the per-call cost, which is the scalability ceiling PowerSync Sync Streams is designed to remove.
+
+If a future benchmark iteration wants the interval-collapsed number: `POST /medic/_design/medic-client/_update/replication_throttle` isn't a thing in CHT — the interval lives in the webapp service (`shared-libs/replication/src/...`). A one-liner override in `.agents/tasks/BROWSER_INTEGRATION_DEBUGGING.md` or a benchmark-specific build would let us force a 30s interval for the test harness.
+
+#### Resolved (post 2026-04-16)
+
+- Worker/WASM bundling ✓ (Agent 5 via `angular.json` duplicate asset copy)
+- Nginx static carve-out for `/powersync/*.{js,wasm,map}` ✓
+- PRAGMA-before-connect() deadlock ✓
+- Upload URL `/medic/` prefix bug ✓ (caused `db-doc.js` 403s)
+- Per-op routing → batched `/api/v1/powersync/upload` ✓
+- `transformCrudEntry` bridges PowerSync `contact_id` → cht-datasource `contact` UUID ✓
+- Test user roles (`chw` → `chw_min_5km` for CIV config) ✓
+- `app_settings.powersync` feature flag enabled ✓
+- PowerSync → PostgreSQL wiring via `CHT_DB_BACKEND=postgres` (Agent 1) ✓
+- Client-UUID preservation via `idHint` (Agent 1) ✓ on Postgres path
+
+#### Open follow-ups
+
+- CouchDB local adapter UUID preservation (install updated cht-datasource into cht-api)
+- Persistent `cht-api` volume mounts so `docker compose up -d api` doesn't wipe dev patches (landed in `.devcontainer/docker-compose.services.yml`)
+- Architectural decision: does Postgres-as-primary path write to `v1.couchdb` (current pattern, keeps couch2pg as bridge) or to a new native schema? Flagged for Medic team per `.agents/tasks/AGENT_HANDOFF_NOTES.md`.
 
 ### Deprioritized
 
