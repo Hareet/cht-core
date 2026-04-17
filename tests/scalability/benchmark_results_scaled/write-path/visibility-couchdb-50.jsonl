@@ -1,1 +1,1 @@
-{"mode":"couchdb_bulkget","total_ids":500,"visible_count":500,"first_ms":84,"all_ms":84,"error":null,"status":"ok"}
+{"mode":"couchdb_bulkget","visible_count":500,"first_ms":48,"all_ms":48,"error":null,"status":"ok","total_ids":500}

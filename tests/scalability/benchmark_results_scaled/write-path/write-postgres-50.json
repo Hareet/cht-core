@@ -2,6 +2,7 @@
   "scenario": "postgres",
   "concurrency": 50,
   "burst_size": 10,
+  "id_tag": "L50-po-310245",
   "workers": 50,
   "ok_workers": 50,
   "docs_written": 500,
@@ -9,27 +10,46 @@
   "wall_clock_s": 7,
   "throughput_docs_per_s": 71.43,
   "batch_ms": {
-    "p50": 6815,
-    "p95": 7150,
-    "p99": 7157,
-    "min": 6228,
-    "max": 7157
+    "p50": 6644,
+    "p95": 6917,
+    "p99": 6927,
+    "min": 6130,
+    "max": 6927
   },
   "per_doc_ms": {
-    "p50": 682,
-    "p95": 715,
-    "p99": 716
+    "p50": 664,
+    "p95": 692,
+    "p99": 693
   },
-  "visibility": {
+  "backend_probe": {
     "mode": "pg_query",
-    "total_ids": 500,
     "visible_count": 500,
-    "first_ms": 22,
-    "all_ms": 22,
+    "first_ms": 19,
+    "all_ms": 19,
     "error": null,
-    "status": "ok"
+    "status": "ok",
+    "total_ids": 500
   },
-  "visibility_probe_wall_s": 0,
+  "backend_probe_wall_s": 0,
+  "peer_probe": {
+    "mode": "peer_getids",
+    "visible_count": 0,
+    "first_ms": -1,
+    "all_ms": -1,
+    "error": null,
+    "status": "none_visible",
+    "observer": "magaliscaled-districthospitaldistricthospital0healthcenter39user2",
+    "expected_count": 500,
+    "total_seen_last": 23446,
+    "call_count": 56,
+    "call_ms": {
+      "p50": 3241,
+      "p95": 3455,
+      "p99": 3660,
+      "min": 3053,
+      "max": 3660
+    }
+  },
   "failures_per_worker": [
     0,
     0,

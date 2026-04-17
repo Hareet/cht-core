@@ -53,6 +53,8 @@ const API_URL     = process.env.API_URL || 'http://localhost:5988';
 const BURST_SIZE  = parseInt(process.env.BURST_SIZE || '10');
 const FORM_ID     = process.env.FORM_ID || 'anc_followup';
 const TIMEOUT_MS  = parseInt(process.env.TIMEOUT_MS || '60000');
+// Optional: see write-path-worker.js ID_TAG comment — same semantics.
+const ID_TAG      = process.env.ID_TAG || '';
 
 if (!USER_NAME || !USER_PASS || !CONTACT_ID) {
   console.error(`[write-powersync-worker ${THREAD_ID}] USER_NAME, USER_PASS, CONTACT_ID required`);
@@ -62,7 +64,8 @@ if (!USER_NAME || !USER_PASS || !CONTACT_ID) {
 const auth = 'Basic ' + Buffer.from(`${USER_NAME}:${USER_PASS}`).toString('base64');
 
 function makeCrudEntry(threadId, batchTs, i) {
-  const id = `bench-scalps-${threadId}-${batchTs}-${i}-${crypto.randomBytes(3).toString('hex')}`;
+  const tag = ID_TAG ? `${ID_TAG}-` : '';
+  const id = `bench-scalps-${tag}${threadId}-${batchTs}-${i}-${crypto.randomBytes(3).toString('hex')}`;
   return {
     op: 'PUT',
     table: 'reports',

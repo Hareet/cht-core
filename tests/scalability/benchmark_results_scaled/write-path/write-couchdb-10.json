@@ -2,34 +2,54 @@
   "scenario": "couchdb",
   "concurrency": 10,
   "burst_size": 10,
+  "id_tag": "L10-co-531949",
   "workers": 10,
   "ok_workers": 10,
   "docs_written": 100,
   "docs_expected": 100,
-  "wall_clock_s": 7,
-  "throughput_docs_per_s": 14.29,
+  "wall_clock_s": 10,
+  "throughput_docs_per_s": 10,
   "batch_ms": {
-    "p50": 7059,
-    "p95": 7080,
-    "p99": 7080,
-    "min": 6446,
-    "max": 7080
+    "p50": 7949,
+    "p95": 7957,
+    "p99": 7957,
+    "min": 7212,
+    "max": 7957
   },
   "per_doc_ms": {
-    "p50": 659,
-    "p95": 959,
-    "p99": 994
+    "p50": 770,
+    "p95": 1027,
+    "p99": 1140
   },
-  "visibility": {
+  "backend_probe": {
     "mode": "couchdb_bulkget",
-    "total_ids": 100,
     "visible_count": 100,
-    "first_ms": 95,
-    "all_ms": 95,
+    "first_ms": 38,
+    "all_ms": 38,
     "error": null,
-    "status": "ok"
+    "status": "ok",
+    "total_ids": 100
   },
-  "visibility_probe_wall_s": 0,
+  "backend_probe_wall_s": 0,
+  "peer_probe": {
+    "mode": "peer_getids",
+    "visible_count": 0,
+    "first_ms": -1,
+    "all_ms": -1,
+    "error": null,
+    "status": "none_visible",
+    "observer": "magaliscaled-districthospitaldistricthospital0healthcenter39user2",
+    "expected_count": 100,
+    "total_seen_last": 23446,
+    "call_count": 51,
+    "call_ms": {
+      "p50": 3363,
+      "p95": 3819,
+      "p99": 10083,
+      "min": 3135,
+      "max": 10083
+    }
+  },
   "failures_per_worker": [
     0,
     0,

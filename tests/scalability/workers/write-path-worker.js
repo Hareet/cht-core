@@ -45,6 +45,10 @@ const CONTACT_ID  = process.env.CONTACT_ID;
 const API_URL     = process.env.API_URL || 'http://localhost:5988';
 const BURST_SIZE  = parseInt(process.env.BURST_SIZE || '10');
 const TIMEOUT_MS  = parseInt(process.env.TIMEOUT_MS || '30000');
+// Optional: run/level unique substring embedded into every generated doc
+// ID. Lets the peer_getids visibility probe isolate this-run's writes from
+// ambient bench data left over from prior runs. Empty = legacy format.
+const ID_TAG      = process.env.ID_TAG || '';
 
 if (!USER_NAME || !USER_PASS || !CONTACT_ID) {
   console.error(`[write-path-worker ${THREAD_ID}] USER_NAME, USER_PASS, CONTACT_ID required`);
@@ -54,8 +58,9 @@ if (!USER_NAME || !USER_PASS || !CONTACT_ID) {
 const auth = 'Basic ' + Buffer.from(`${USER_NAME}:${USER_PASS}`).toString('base64');
 
 function makeDoc(threadId, batchTs, i) {
+  const tag = ID_TAG ? `${ID_TAG}-` : '';
   return {
-    _id: `bench-scale-${threadId}-${batchTs}-${i}-${crypto.randomBytes(3).toString('hex')}`,
+    _id: `bench-scale-${tag}${threadId}-${batchTs}-${i}-${crypto.randomBytes(3).toString('hex')}`,
     type: 'data_record',
     form: 'benchmark_scale_write',
     reported_date: Date.now(),
