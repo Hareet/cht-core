@@ -63,13 +63,21 @@ services:
       - POSTGRES_URL=postgresql://${POSTGRES_USER:-cht}:${POSTGRES_PASSWORD}@postgres:5432/cht
     volumes:
       # Dev overlays so local src + webapp-build edits survive `docker compose up -d api`.
-      # Populate /tmp/cht-webapp-build by rebuilding in cht-agent-7 and
-      # `docker cp cht-agent-7:/workspace/cht-core/api/build/static/webapp/. /tmp/cht-webapp-build/`.
-      # Override controllers/services by editing the playtime source and restarting the container.
+      # Webapp path is inside the repo (gitignored at .devcontainer/cht-webapp-build/)
+      # to avoid WSL wiping /tmp on reboot. Populate by rebuilding in cht-agent-7 and
+      # `docker cp cht-agent-7:/workspace/cht-core/api/build/static/webapp/. .devcontainer/cht-webapp-build/`.
       # webapp dir must be writable: api writes deploy-info.json on startup.
-      - /tmp/cht-webapp-build:/service/api/build/static/webapp
+      - ${CHT_CORE_PATH:-/home/h4reet/ai_medic/cht-core}/.devcontainer/cht-webapp-build:/service/api/build/static/webapp
       - ${CHT_CORE_PATH:-/home/h4reet/ai_medic/cht-core}/api/src/controllers:/service/api/src/controllers:ro
       - ${CHT_CORE_PATH:-/home/h4reet/ai_medic/cht-core}/api/src/services:/service/api/src/services:ro
+      # Mount the freshly-built cht-datasource dist so api sees agent-1's idHint
+      # on BOTH local and postgres adapters. Must `npm run build` cht-datasource
+      # first — dist/ is gitignored and the image ships a pre-agent-1 build.
+      # Target path preserves the image's monorepo layout: the image stages
+      # shared-libs at /service/shared-libs/ and Node resolves
+      # @medic/cht-datasource via workspace linkage, NOT via api/node_modules/.
+      # Confirmed with: docker exec cht-api node -e "require.resolve('@medic/cht-datasource')"
+      - ${CHT_CORE_PATH:-/home/h4reet/ai_medic/cht-core}/shared-libs/cht-datasource/dist:/service/shared-libs/cht-datasource/dist:ro
     logging:
       driver: "local"
       options:

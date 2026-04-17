@@ -27,6 +27,8 @@ dist
 /local-build/
 api/**/extracted-resources/**/*
 api/build/**/*
+.devcontainer/cht-webapp-build/
+tests/benchmark/results/*.json
 jsdocs
 shared-libs/**/docs
 config/*/.gdrive.*.json

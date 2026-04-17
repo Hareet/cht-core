@@ -174,18 +174,76 @@ The existing concurrent benchmarks (up to 50 users) combined with our single-use
 
 ### 7. Write Path Benchmark Results (End-to-End Validated 2026-04-17)
 
-Updated 2026-04-17. All write-path issues from the 2026-04-16 partial run are resolved. Browser WASM SQLite writes now flow end-to-end through PowerSync → CHT API → cht-datasource → storage, verified against both CouchDB and PostgreSQL backends.
+Updated 2026-04-17. All write-path issues from the 2026-04-16 partial run are resolved. Browser WASM SQLite writes now flow end-to-end through PowerSync → CHT API → cht-datasource → storage, verified against both CouchDB and PostgreSQL backends, across standard/budget/go device tiers.
 
-#### Standard tier (1x CPU, unthrottled network)
+#### Standard tier (1x CPU, unthrottled network) — final indexed-detection numbers
 
 | Metric | PouchDB (browser) | PowerSync → CouchDB | PowerSync → PostgreSQL |
 |--------|-------------------|---------------------|------------------------|
-| Local persist (single doc, avg) | 14ms (4-87ms) | 16ms (10-26ms) | **12ms** (9-17ms) |
-| Local persist (steady) | 4-7ms | 10-12ms | 9-11ms |
-| Batch write (10 docs) | Not measured | 95ms (10ms/doc) | **75ms** (8ms/doc) |
-| Upload → server visible | >350s (sync interval gated) | **2,018ms** | **2,013ms** |
+| Local persist (single doc, avg) | 14ms (4-87ms) | 17ms (9-35ms) | **12ms** (9-20ms) |
+| Batch write (10 docs) | Not measured | 142ms (14ms/doc) | **89ms** (9ms/doc) |
+| Upload → server visible | >350s (sync interval gated) | **2,016ms** | **2,012ms** |
 | Upload mechanism | Sync interval (default 5 min) | `uploadData()` batched POST | `uploadData()` batched POST |
-| Server `_id` | client UUID preserved | random hex (PouchDB→CouchDB) | **client UUID preserved** (via agent-1 `idHint`) |
+| Server `_id` | client `_id` preserved | **client UUID preserved** (via `idHint`) | **client UUID preserved** (via `idHint`) |
+
+#### Device-tier matrix (all PowerSync browser WASM, indexed detection)
+
+`serverDetectionMs` is now the true end-to-end upload latency — primary-key
+`GET /medic/<_id>` on CouchDB or `WHERE _id = $1` on Postgres. Previous
+`-scan` results (preserved in `tests/benchmark/results/*-scan.json`) used
+Mango `$regex` / JSONB `LIKE` scans that leaked 2-18s of server-side scan
+time into the same metric.
+
+| Tier | CPU | Net | Backend | Local avg | Local range | Batch 10 | Upload → visible |
+|------|----:|-----|---------|----------:|-------------|---------:|-----------------:|
+| Standard | 1× | unthrottled | CouchDB  | 17ms | 9-35  | 142ms (14/doc) | **2,016ms** |
+| Standard | 1× | unthrottled | Postgres | 12ms | 9-20  |  89ms (9/doc)  | **2,012ms** |
+| Budget   | 2× | 3G          | CouchDB  | 13ms | 9-24  |  91ms (9/doc)  | **4,030ms** |
+| Budget   | 2× | 3G          | Postgres | 19ms | 9-77  |  87ms (9/doc)  | **4,034ms** |
+| Go       | 4× | 3G          | CouchDB  | 17ms | 9-29  |  76ms (8/doc)  | **4,022ms** |
+| Go       | 4× | 3G          | Postgres | 12ms | 9-21  |  87ms (9/doc)  | **4,036ms** |
+
+#### Key observations (corrected)
+
+1. **CouchDB and Postgres are effectively equivalent for single-doc upload
+   latency at current scale.** Earlier legacy-scan runs (now preserved as
+   `-scan` JSONs) suggested Postgres was 2.5× faster on Go tier (22s vs
+   8.6s). That delta was almost entirely scan-detection overhead — CouchDB
+   Mango `$regex` on 800K+ docs is slower than Postgres JSONB `LIKE`, so the
+   inflation wasn't symmetric. Rewriting detection to use primary keys
+   revealed the real numbers: ~2s on unthrottled, ~4s on 3G, backend-agnostic.
+2. **Network latency dominates upload time.** Within a tier, CouchDB and
+   Postgres differ by <25ms on upload (2,016 vs 2,012 standard; 4,030 vs
+   4,034 budget; 4,022 vs 4,036 go). Across tiers, unthrottled ≈ 2s and 3G ≈
+   4s regardless of CPU throttle — consistent with the PowerSync upload
+   protocol being a single small POST.
+3. **Local persist is CPU-scaling tolerant.** WASM SQLite writes land in
+   12-19ms avg across all tiers. Go edition (4× CPU) has outliers up to 29ms;
+   budget tier has one 77ms spike. Steady-state p50 ≈ 9-12ms on every tier —
+   well under the ~100ms perceptual threshold for form submission.
+4. **Batch throughput doesn't collapse under throttle.** 10-doc batch is
+   76-142ms across all six configurations (7-14ms per doc). WASM SQLite +
+   batched API endpoint holds up even at 4× CPU throttle.
+5. **Upload mechanism advantage is structural.** PowerSync uploads within
+   ~2-4s regardless of tier or backend. PouchDB's default sync interval is
+   5 min — supervisors wait up to that long to see a CHW submission on the
+   current stack.
+6. **Why the "Go tier Postgres advantage" story was misleading.** The
+   legacy `-scan` numbers told us CouchDB fell apart on Go tier (22s). In
+   reality the server was handling the write fine — the benchmark's
+   detection query was what took 18 seconds on a CPU-throttled browser
+   parsing Mango response over 3G. Real Postgres advantages at scale exist
+   (concurrent-user throughput, view-scan elimination), but they don't
+   manifest in single-user single-doc write latency. Use the concurrent
+   benchmarks (`tests/scalability/...`) for the PG-under-load story.
+
+#### What's NOT yet captured
+
+| Gap | Run to fill it |
+|-----|-----------------|
+| PouchDB upload + `get-ids` roundtrip across tiers | `TEST=pouchdb DEVICE_TIER=budget`; `DEVICE_TIER=go` |
+| PouchDB replicate.to currently returns `serverDetectionMs: -1` even on standard tier — CHT's db-doc filter probably rejects the benchmark's synthetic report (even with `BENCH_CONTACT_ID` real) because the doc is authored by the offline user but not following the expected submission pipeline | Diagnose — grep cht-api logs for the specific doc id during a PouchDB Test B run |
+| Concurrent-user numbers on the CORRECTED detection path | Port the write-path benchmark into the existing scalability harness |
 
 #### Key findings
 

@@ -206,17 +206,28 @@ module.exports = {
   /**
    * GET /api/v1/powersync/status
    *
-   * Returns whether PowerSync is enabled for the authenticated user.
-   * The client should call this BEFORE instantiating PowerSync to avoid
-   * creating an upload queue that will be blocked by 403 errors.
+   * Returns whether PowerSync is enabled for the authenticated user, and
+   * which cht-datasource backend (`couchdb` | `postgres`) the api is
+   * currently configured to use. Benchmark harnesses and client code use
+   * `backend` as a pre-flight check so writes land where callers expect.
    *
-   * Response: { powersync_enabled: boolean }
+   * Auth failures on the permission lookup don't break the backend probe
+   * — we still return `backend` so a pre-flight can detect mismatches even
+   * when the caller isn't authed as a powersync-enabled user.
+   *
+   * Response: { powersync_enabled: boolean, backend: 'couchdb'|'postgres' }
    */
   status: serverUtils.doOrError(async (req, res) => {
-    const userCtx = await auth.getUserCtx(req);
-    const userSettings = await auth.getUserSettings(userCtx);
-    const enabled = featureFlags.isFeatureEnabled('powersync', userSettings);
-    return res.json({ powersync_enabled: enabled });
+    const backend = (process.env.CHT_DB_BACKEND || 'couchdb').toLowerCase();
+    let enabled = false;
+    try {
+      const userCtx = await auth.getUserCtx(req);
+      const userSettings = await auth.getUserSettings(userCtx);
+      enabled = featureFlags.isFeatureEnabled('powersync', userSettings);
+    } catch {
+      // Backend probe must still succeed even if auth/user-settings lookup fails
+    }
+    return res.json({ powersync_enabled: enabled, backend });
   }),
 
   // Exported for testing

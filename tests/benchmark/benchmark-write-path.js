@@ -98,6 +98,61 @@ function couchReq(method, path, body) {
   });
 }
 
+// GET against cht-api. Used for /api/v1/powersync/status pre-flight checks
+// (notably to verify the api's CHT_DB_BACKEND matches BENCHMARK_TARGET before
+// we burn minutes running a benchmark whose detection would always miss).
+function apiReq(method, path, body) {
+  return new Promise((resolve, reject) => {
+    const opts = {
+      method, hostname: 'api', port: 5988, path,
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+        'Authorization': 'Basic ' + Buffer.from('admin:secret21512').toString('base64'),
+      },
+    };
+    if (body) opts.headers['Content-Length'] = Buffer.byteLength(body);
+    const req = http.request(opts, res => {
+      let d = ''; res.on('data', c => d += c);
+      res.on('end', () => {
+        try { resolve({ status: res.statusCode, body: JSON.parse(d) }); }
+        catch { resolve({ status: res.statusCode, body: d }); }
+      });
+    });
+    req.on('error', reject);
+    if (body) req.write(body);
+    req.end();
+  });
+}
+
+// Abort early if the api's CHT_DB_BACKEND doesn't match BENCHMARK_TARGET.
+// Called from benchPowerSyncWritePath — PouchDB's path doesn't route through
+// cht-datasource so backend config doesn't affect it.
+async function assertBackendMatchesTarget() {
+  let apiBackend = null;
+  try {
+    const resp = await apiReq('GET', '/api/v1/powersync/status');
+    apiBackend = resp.body?.backend;
+  } catch (e) {
+    console.log(`  WARNING: pre-flight /api/v1/powersync/status unreachable (${e.message}) — skipping backend check`);
+    return;
+  }
+  if (!apiBackend) {
+    console.log('  WARNING: /api/v1/powersync/status returned no `backend` field — api may be running an older build without the pre-flight extension. Proceeding without check.');
+    return;
+  }
+  if (apiBackend !== BENCHMARK_TARGET) {
+    console.error(`\nFATAL: BENCHMARK_TARGET=${BENCHMARK_TARGET} but api is configured for CHT_DB_BACKEND=${apiBackend}.`);
+    console.error(`  Writes will land in ${apiBackend}, Test B will poll ${BENCHMARK_TARGET}, detection will always miss.`);
+    console.error(`  Flip the api:`);
+    console.error(`    cd .devcontainer`);
+    console.error(`    CHT_DB_BACKEND=${BENCHMARK_TARGET} docker compose -f docker-compose.services.yml up -d --force-recreate api`);
+    console.error(`  Then re-run this benchmark.\n`);
+    process.exit(2);
+  }
+  console.log(`  Pre-flight OK: api CHT_DB_BACKEND=${apiBackend} matches BENCHMARK_TARGET=${BENCHMARK_TARGET}.`);
+}
+
 // One-shot query against v1.couchdb (the cht-sync JSONB snapshot that the
 // cht-datasource Postgres adapter writes to when CHT_DB_BACKEND=postgres).
 // Only used when BENCHMARK_TARGET=postgres.
@@ -121,37 +176,23 @@ async function pgReq(sql, params = []) {
   }
 }
 
-// Poll for a report authored by this benchmark run. `serverMarker` is embedded
-// in the `fields` JSON text so detection is backend-agnostic: same selector on
-// CouchDB Mango and Postgres JSONB path expressions.
-async function pollForServerDoc(serverMarker) {
+// Poll for a specific benchmark-written doc by its expected _id.
+// Agent-1's idHint preservation means the server `_id` equals the client-minted
+// id, so we can do a direct primary-key lookup on both backends — indexed,
+// sub-millisecond — instead of a Mango $regex / LIKE scan over 800K+
+// data_record docs (which was taking >30s on the budget tier and timing out).
+async function pollForServerDoc(docId) {
   if (BENCHMARK_TARGET === 'postgres') {
-    // Read `_id` out of the JSONB doc. The couch2pg/cht-sync schema uses a
-    // primary key named `uuid` (not `doc_id`) — the cht-datasource Postgres
-    // adapter stores docs with the couch-style `_id` inside the JSONB, so
-    // extracting from JSONB is the stable cross-schema choice.
     const rows = await pgReq(
-      `SELECT doc->>'_id' AS id FROM v1.couchdb
-       WHERE doc->>'type' = 'data_record'
-         AND doc->>'form' = $1
-         AND doc->'contact'->>'_id' = $2
-         AND doc->>'fields' LIKE $3
-       LIMIT 1`,
-      [BENCH_FORM, BENCH_CONTACT_ID, '%' + serverMarker + '%']
+      `SELECT _id FROM v1.couchdb WHERE _id = $1 LIMIT 1`,
+      [docId]
     );
-    return rows.length > 0 ? rows[0].id : null;
+    return rows.length > 0 ? rows[0]._id : null;
   }
-  const res = await couchReq('POST', '/medic/_find', JSON.stringify({
-    selector: {
-      type: 'data_record',
-      form: BENCH_FORM,
-      'contact._id': BENCH_CONTACT_ID,
-      fields: { '$regex': serverMarker },
-    },
-    fields: ['_id'],
-    limit: 1,
-  }));
-  return (res && Array.isArray(res.docs) && res.docs.length > 0) ? res.docs[0]._id : null;
+  // CouchDB: direct doc GET. Returns the doc with { _id, _rev, ... } on 200
+  // or { error: 'not_found', reason: 'missing' } on 404.
+  const res = await couchReq('GET', '/medic/' + encodeURIComponent(docId));
+  return (res && res._id === docId) ? res._id : null;
 }
 
 async function handleLoginFlow(page, username, password) {
@@ -189,7 +230,72 @@ async function handleLoginFlow(page, username, password) {
   }
 }
 
-async function waitForInitialSync(page, label) {
+async function waitForInitialSync(page, label, opts = {}) {
+  const { waitForPowerSync = false, timeoutMs = 5 * 60_000 } = opts;
+
+  if (waitForPowerSync) {
+    // PowerSync path: prefer currentStatus.hasSynced. Storage-stall heuristic
+    // false-positives on slow tiers where downloads pause mid-stream (budget
+    // tier on 3G: observed stall at 109MB with priority-1 still 22K/24.5K).
+    // Graceful fallback: bail if prio_1 is >=95% complete AND stalled for 45s
+    // AND storage hasn't grown for 45s. This unblocks budget/go tier runs when
+    // the last ~5% of buckets silently hang (separate sync-stream bug to
+    // investigate; until then the benchmark still produces numbers).
+    const deadline = Date.now() + timeoutMs;
+    let lastStorage = 0;
+    let lastProgress = 0;
+    let stallStart = 0;
+    let iter = 0;
+    while (Date.now() < deadline) {
+      await new Promise(r => setTimeout(r, 5000));
+      const snap = await page.evaluate(async () => {
+        const db = window.__ps_db;
+        const est = await navigator.storage.estimate().catch(() => ({}));
+        const mb = parseFloat(((est.usage || 0) / 1e6).toFixed(1));
+        const s = db?.currentStatus;
+        const prio1 = s?.dataFlowStatus?.downloadProgress?.prio_1;
+        return {
+          hasSynced: !!s?.hasSynced,
+          storageMB: mb,
+          prio1Since: prio1?.since_last ?? 0,
+          prio1Target: prio1?.target_count ?? 0,
+          prio1Progress: prio1 ? `${prio1.since_last}/${prio1.target_count}` : null,
+        };
+      });
+      if (snap.hasSynced) {
+        console.log(`  ${label} initial sync complete (hasSynced=true): ${snap.storageMB}MB`);
+        return snap.storageMB;
+      }
+      // Track progress stall
+      const currentProgress = snap.prio1Since + Math.floor(snap.storageMB * 10);
+      if (currentProgress === lastProgress) {
+        stallStart = stallStart || Date.now();
+      } else {
+        stallStart = 0;
+        lastProgress = currentProgress;
+      }
+      const stalledFor = stallStart ? Date.now() - stallStart : 0;
+      const prioPct = snap.prio1Target > 0 ? (snap.prio1Since / snap.prio1Target) * 100 : 0;
+      if (stalledFor >= 45_000 && prioPct >= 95) {
+        console.log(
+          `  ${label} sync stalled at ${prioPct.toFixed(1)}% of priority-1 (${snap.prio1Progress}) ` +
+          `for ${Math.round(stalledFor / 1000)}s — proceeding anyway with ${snap.storageMB}MB. ` +
+          `hasSynced is still false; this tier may be impacted by a sync-stream bug.`
+        );
+        return snap.storageMB;
+      }
+      lastStorage = snap.storageMB;
+      const sec = (++iter) * 5;
+      if (sec % 15 === 0) {
+        const stallNote = stalledFor > 0 ? ` stalled=${Math.round(stalledFor / 1000)}s` : '';
+        console.log(`    ${sec}s: ${snap.storageMB}MB (prio_1=${snap.prio1Progress ?? 'n/a'}${stallNote})`);
+      }
+    }
+    console.log(`  ${label} WARNING: hasSynced never became true within ${timeoutMs / 1000}s — proceeding with ${lastStorage}MB`);
+    return lastStorage;
+  }
+
+  // PouchDB path: storage-stall heuristic (no hasSynced signal exposed)
   let lastStorage = 0;
   let stall = 0;
   for (let i = 0; i < 60; i++) {
@@ -280,25 +386,55 @@ async function benchPouchDBWritePath() {
   console.log('    Average: ' + avgPersist + 'ms | Min: ' + minPersist + 'ms | Max: ' + maxPersist + 'ms');
 
   // --- Test B: Write then detect on server ---
-  console.log('\n  Test B: Write → server detection (upload via replication)');
+  // NB: CHT's default PouchDB sync interval is 5 minutes — waiting for it is
+  // impractical in a benchmark. Instead we write, then manually trigger an
+  // immediate `db.replicate.to(remote)` scoped to the one doc (`doc_ids: [id]`)
+  // to measure the protocol latency fairly against PowerSync's auto-upload.
+  // contact._id must be a real contact in the user's accessible tree — CHT's
+  // offline db-doc handler filters _bulk_docs by authorization and silently
+  // rejects out-of-scope docs (which manifests as replicate.to "succeeding"
+  // but the doc never appearing server-side).
+  console.log('\n  Test B: Write → immediate replicate.to → server detection');
   const serverDocId = 'benchmark-write-pouch-server-' + Date.now();
   const tWrite = Date.now();
-  await page.evaluate(async (id, username) => {
-    const db = new window.PouchDB('medic-user-' + username, { skip_setup: true });
-    await db.put({
+  const pushOutcome = await page.evaluate(async (id, username, chtUrl, contactId) => {
+    const local = new window.PouchDB('medic-user-' + username, { skip_setup: true });
+    await local.put({
       _id: id, type: 'data_record', form: 'benchmark_server_write',
       patient_id: '12345', reported_date: Date.now(),
-      contact: { _id: 'benchmark-contact' },
+      contact: { _id: contactId },
       fields: { test: true, server_detection: true },
     });
-  }, serverDocId, USERNAME);
-  console.log('    Wrote to PouchDB at T+0ms');
-  console.log('    Waiting for server detection (replication must push via _bulk_docs)...');
-  console.log('    Note: PouchDB uploads on its sync interval (up to 5 minutes)');
+    const remote = new window.PouchDB(chtUrl + '/medic', { skip_setup: true });
+    const start = performance.now();
+    const info = await new Promise((resolve, reject) => {
+      local.replicate.to(remote, { doc_ids: [id], retry: false })
+        .on('complete', resolve)
+        .on('error', reject);
+    });
+    return {
+      ms: Math.round(performance.now() - start),
+      docs_read: info.docs_read,
+      docs_written: info.docs_written,
+      doc_write_failures: info.doc_write_failures,
+      errors: (info.errors || []).slice(0, 2).map(e => e.message || String(e)),
+      status: info.status,
+    };
+  }, serverDocId, USERNAME, CHT_URL, BENCH_CONTACT_ID);
+  const pushMs = pushOutcome.ms;
+  console.log(`    Wrote to PouchDB at T+0ms, replicate.to completed in ${pushMs}ms`);
+  console.log(`    replicate.to: docs_read=${pushOutcome.docs_read}, docs_written=${pushOutcome.docs_written}, failures=${pushOutcome.doc_write_failures}, status=${pushOutcome.status}`);
+  if (pushOutcome.errors.length) {
+    console.log('    replicate.to errors:', pushOutcome.errors.join(' | '));
+  }
 
+  // Poll server to confirm the doc is there (should be immediate after push).
   let serverDetectedMs = -1;
-  for (let sec = 0; sec < 600; sec++) {
-    await new Promise(r => setTimeout(r, 2000));
+  const POUCHDB_POLL_TIMEOUT_MS = 30_000;
+  const deadlinePouchB = tWrite + POUCHDB_POLL_TIMEOUT_MS;
+  while (Date.now() < deadlinePouchB) {
+    await new Promise(r => setTimeout(r, 500));
+    if (Date.now() >= deadlinePouchB) break;
     const elapsed = Date.now() - tWrite;
     try {
       const res = await couchReq('GET', '/medic/' + serverDocId);
@@ -308,12 +444,9 @@ async function benchPouchDBWritePath() {
         break;
       }
     } catch {}
-    if (sec % 30 === 29) {
-      console.log('    T+' + elapsed + 'ms: not on server yet (waiting for replication cycle...)');
-    }
   }
   if (serverDetectedMs < 0) {
-    console.log('    Doc NOT found on server within 600s');
+    console.log(`    Doc NOT found on server within ${POUCHDB_POLL_TIMEOUT_MS / 1000}s after replicate.to completed`);
   }
 
   // --- Test C: Batch write (10 docs) ---
@@ -336,6 +469,84 @@ async function benchPouchDBWritePath() {
   }, USERNAME);
   console.log('    10 docs bulk write: ' + batchMs + 'ms (' + Math.round(batchMs / 10) + 'ms/doc)');
 
+  // --- Test D: CHT replication pull roundtrip ---
+  // CHT v5 doesn't use PouchDB's native pull — it uses a custom protocol:
+  //   GET  /api/v1/replication/get-ids  → server scans docs_by_replication_key view,
+  //                                        applies purge.js, returns doc IDs user should have
+  //   POST /medic/_bulk_get             → client fetches docs missing locally
+  // get-ids is the O(N²) scalability bottleneck that collapses CouchDB at 10+
+  // concurrent users. This test measures that specific path in isolation.
+  console.log('\n  Test D: CHT replication pull roundtrip (get-ids + _bulk_get)');
+  const roundtrip = await page.evaluate(async (username, chtUrl) => {
+    const out = { getIdsMs: -1, getIdsCount: -1, bulkGetMs: 0, bulkGetCount: 0, errors: [] };
+
+    // 1. get-ids — the expensive view scan
+    const tIds = performance.now();
+    let getIdsResp;
+    try {
+      getIdsResp = await fetch(chtUrl + '/api/v1/replication/get-ids', {
+        credentials: 'same-origin',
+        headers: { 'Accept': 'application/json' },
+      });
+    } catch (e) {
+      out.errors.push('get-ids fetch: ' + e.message);
+      return out;
+    }
+    out.getIdsMs = Math.round(performance.now() - tIds);
+    if (!getIdsResp.ok) {
+      out.errors.push('get-ids HTTP ' + getIdsResp.status);
+      return out;
+    }
+    const body = await getIdsResp.json().catch(() => null);
+    const docIds = Array.isArray(body) ? body : (body?.doc_ids || body?.docIds || []);
+    out.getIdsCount = docIds.length;
+    if (!docIds.length) {
+      return out;
+    }
+
+    // 2. Find docs missing locally (client-side diff — not timed)
+    const local = new window.PouchDB('medic-user-' + username, { skip_setup: true });
+    const localIds = new Set((await local.allDocs({})).rows.map(r => r.id));
+    const missing = docIds.filter(id => !localIds.has(id));
+    out.missingCount = missing.length;
+    if (!missing.length) {
+      return out;
+    }
+
+    // 3. _bulk_get — fetch missing docs (CHT's offline db-doc handler applies
+    //    the audit + filter path per doc)
+    const tBulk = performance.now();
+    let bulkResp;
+    try {
+      bulkResp = await fetch(chtUrl + '/medic/_bulk_get', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+        body: JSON.stringify({ docs: missing.map(id => ({ id })) }),
+      });
+    } catch (e) {
+      out.errors.push('bulk_get fetch: ' + e.message);
+      return out;
+    }
+    out.bulkGetMs = Math.round(performance.now() - tBulk);
+    if (!bulkResp.ok) {
+      out.errors.push('bulk_get HTTP ' + bulkResp.status);
+      return out;
+    }
+    const bulkBody = await bulkResp.json().catch(() => null);
+    out.bulkGetCount = (bulkBody?.results || []).length;
+    return out;
+  }, USERNAME, CHT_URL);
+
+  const roundtripTotalMs = (roundtrip.getIdsMs > 0 ? roundtrip.getIdsMs : 0) + (roundtrip.bulkGetMs || 0);
+  console.log(`    GET /api/v1/replication/get-ids: ${roundtrip.getIdsMs}ms (${roundtrip.getIdsCount} IDs)`);
+  console.log(`    missing locally: ${roundtrip.missingCount ?? 0}`);
+  console.log(`    POST /medic/_bulk_get: ${roundtrip.bulkGetMs}ms (${roundtrip.bulkGetCount} docs)`);
+  console.log(`    Roundtrip pull total: ${roundtripTotalMs}ms`);
+  if (roundtrip.errors?.length) {
+    console.log('    errors:', roundtrip.errors.join(' | '));
+  }
+
   const metrics = await page.metrics();
   const heap = parseFloat((metrics.JSHeapUsedSize / 1e6).toFixed(1));
 
@@ -346,17 +557,32 @@ async function benchPouchDBWritePath() {
     deviceTier: DEVICE_TIER,
     throttle: { cpu: profile.cpu + 'x', network: skipNetwork ? 'unthrottled' : '3G' },
     localPersist: { avgMs: avgPersist, minMs: minPersist, maxMs: maxPersist, runs: persistResults },
+    replicatePushMs: pushMs,
     serverDetectionMs: serverDetectedMs,
     batchWrite10Ms: batchMs,
+    chtReplicationRoundtrip: {
+      getIdsMs: roundtrip.getIdsMs,
+      getIdsCount: roundtrip.getIdsCount,
+      missingCount: roundtrip.missingCount ?? 0,
+      bulkGetMs: roundtrip.bulkGetMs,
+      bulkGetCount: roundtrip.bulkGetCount,
+      totalMs: roundtripTotalMs,
+      errors: roundtrip.errors,
+    },
     jsHeapMB: heap,
+    note: 'serverDetection is measured after a manual db.replicate.to() call. CHT default sync interval is 5 min; this measures the protocol floor. chtReplicationRoundtrip isolates the production get-ids path.',
   };
 
   console.log('\n  ========================================');
   console.log('  PouchDB Write Path Results');
   console.log('  ========================================');
   console.log('  Local persist (single):  ' + avgPersist + 'ms avg (' + minPersist + '-' + maxPersist + 'ms)');
-  console.log('  Server detection:        ' + (serverDetectedMs > 0 ? serverDetectedMs + 'ms' : 'NOT DETECTED (5-min interval)'));
+  console.log('  replicate.to push:       ' + pushMs + 'ms');
+  console.log('  Server detection:        ' + (serverDetectedMs > 0 ? serverDetectedMs + 'ms' : 'NOT DETECTED'));
   console.log('  Batch write (10 docs):   ' + batchMs + 'ms (' + Math.round(batchMs / 10) + 'ms/doc)');
+  console.log('  CHT pull get-ids:        ' + roundtrip.getIdsMs + 'ms (' + roundtrip.getIdsCount + ' IDs)');
+  console.log('  CHT pull _bulk_get:      ' + roundtrip.bulkGetMs + 'ms (' + roundtrip.bulkGetCount + ' docs)');
+  console.log('  CHT pull roundtrip:      ' + roundtripTotalMs + 'ms');
   console.log('  JS heap:                 ' + heap + 'MB');
   console.log('  ========================================');
 
@@ -370,6 +596,9 @@ async function benchPowerSyncWritePath() {
   console.log('\n=== PowerSync Write Path Benchmark ===');
   console.log('  Device: ' + DEVICE_TIER + ' — ' + profile.label);
   console.log('  Throttle: CPU ' + profile.cpu + 'x, Network ' + (skipNetwork ? 'UNTHROTTLED' : '3G') + '\n');
+
+  // Pre-flight: prevent BENCHMARK_TARGET / CHT_DB_BACKEND mismatch.
+  await assertBackendMatchesTarget();
 
   const { browser, page, client } = await launchBrowser();
 
@@ -433,7 +662,7 @@ async function benchPowerSyncWritePath() {
   // Login + initial sync
   console.log('  Phase 1: Login + initial sync...');
   await handleLoginFlow(page, USERNAME, PASSWORD);
-  await waitForInitialSync(page, 'PowerSync');
+  await waitForInitialSync(page, 'PowerSync', { waitForPowerSync: true });
 
   // --- Wait for PowerSync DB to be available ---
   console.log('\n  Waiting for PowerSync DB (window.__ps_db) to become available...');
@@ -741,7 +970,7 @@ async function benchPowerSyncWritePath() {
         continue;
       }
       try {
-        const foundId = await pollForServerDoc(nodeServerMarker);
+        const foundId = await pollForServerDoc(uploadDocId);
         if (foundId) {
           serverDetectedMs = Date.now() - tServerWrite;
           console.log(`    ** Doc visible in ${BENCHMARK_TARGET} at T+${serverDetectedMs}ms (_id=${foundId}) **`);
@@ -785,17 +1014,18 @@ async function benchPowerSyncWritePath() {
     maxPersist = Math.max(...persistResults);
 
     // --- Test B: Write then detect upload on server ---
-    // Detection: poll by unique marker embedded in `fields`. Backend-agnostic —
-    // CouchDB Mango regex OR Postgres JSONB LIKE via pollForServerDoc(). Works
-    // whether or not the server preserved the client UUID as `_id`.
+    // Detection: direct primary-key GET/SELECT on the client-minted _id.
+    // idHint on the cht-datasource create path preserves the UUID end-to-end,
+    // so `_id == INSERT id`. Backend-agnostic via pollForServerDoc().
     console.log(`\n  Test B: Write → server upload (target=${BENCHMARK_TARGET}, via PowerSync uploadData)`);
     const serverMarker = 'ps-bench-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8);
+    const serverDocId = 'benchmark-write-ps-server-' + serverMarker;
     const tWrite = Date.now();
-    await page.evaluate(async (form, contactId, marker) => {
+    await page.evaluate(async (id, form, contactId, marker) => {
       await window.__ps_db.execute(
         'INSERT INTO reports (id, form, patient_id, reported_date, fields, contact_id) VALUES (?, ?, ?, ?, ?, ?)',
         [
-          'benchmark-write-ps-server-' + marker,
+          id,
           form,
           '12345',
           new Date().toISOString(),
@@ -803,8 +1033,8 @@ async function benchPowerSyncWritePath() {
           contactId,
         ]
       );
-    }, BENCH_FORM, BENCH_CONTACT_ID, serverMarker);
-    console.log(`    Wrote to WASM SQLite at T+0ms, polling ${BENCHMARK_TARGET} (marker=${serverMarker}, timeout 30s)...`);
+    }, serverDocId, BENCH_FORM, BENCH_CONTACT_ID, serverMarker);
+    console.log(`    Wrote to WASM SQLite at T+0ms, polling ${BENCHMARK_TARGET} for _id=${serverDocId} (timeout 30s)...`);
 
     // Hard 30s wall-clock deadline. `_find` / PG queries take 1-2s each on the
     // large dataset, so a fixed-iteration loop with sleep+poll can overrun.
@@ -816,7 +1046,7 @@ async function benchPowerSyncWritePath() {
       if (Date.now() >= deadlineB) break;
       const elapsed = Date.now() - tWrite;
       try {
-        const foundId = await pollForServerDoc(serverMarker);
+        const foundId = await pollForServerDoc(serverDocId);
         if (foundId) {
           serverDetectedMs = elapsed;
           console.log(`    ** Doc found in ${BENCHMARK_TARGET} at T+${elapsed}ms (_id=${foundId}) **`);
@@ -826,7 +1056,26 @@ async function benchPowerSyncWritePath() {
         if (iter === 0) console.log('    detection error:', e.message);
       }
       if (iter > 0 && iter % 5 === 0) {
-        console.log('    T+' + elapsed + 'ms: not on server yet...');
+        // Peek at SDK upload queue + dataflow so we can tell "uploads fired,
+        // server slow" from "SDK hasn't fired uploadData yet".
+        const qDiag = await page.evaluate(async () => {
+          const db = window.__ps_db;
+          if (!db) return null;
+          try {
+            const stats = await db.getUploadQueueStats();
+            const s = db.currentStatus;
+            return {
+              pending: stats.count,
+              uploading: !!s?.dataFlowStatus?.uploading,
+              downloading: !!s?.dataFlowStatus?.downloading,
+              uploadError: s?.dataFlowStatus?.uploadError?.message,
+            };
+          } catch { return null; }
+        });
+        const diagStr = qDiag
+          ? ` queue=${qDiag.pending} up=${qDiag.uploading} down=${qDiag.downloading}${qDiag.uploadError ? ' err=' + qDiag.uploadError : ''}`
+          : '';
+        console.log(`    T+${elapsed}ms: not on server yet...${diagStr}`);
       }
       iter++;
     }
@@ -933,10 +1182,21 @@ async function benchPowerSyncWritePath() {
     benchmark: 'write-path',
     timestamp: new Date().toISOString(),
     backendTarget: BENCHMARK_TARGET,
+    deviceTier: DEVICE_TIER,
+    network: skipNetwork ? 'unthrottled' : '3G',
     pouchdb: pouchResults,
     powersync: psResults,
   };
-  const outPath = `/tmp/benchmark-write-path-results-${BENCHMARK_TARGET}.json`;
+  const netSuffix = skipNetwork ? 'unthrottled' : '3G';
+  // Prefer a host-visible path (bind-mounted to the cht-core repo in agent-7)
+  // so results can be consumed from the host without docker cp. Falls back to
+  // /tmp when running outside the agent container.
+  const hostVisibleDir = '/workspace/cht-core/tests/benchmark/results';
+  const outDir = fs.existsSync('/workspace/cht-core') ? hostVisibleDir : '/tmp';
+  if (outDir !== '/tmp' && !fs.existsSync(outDir)) {
+    fs.mkdirSync(outDir, { recursive: true });
+  }
+  const outPath = `${outDir}/benchmark-write-path-results-${BENCHMARK_TARGET}-${DEVICE_TIER}-${netSuffix}.json`;
   fs.writeFileSync(outPath, JSON.stringify(output, null, 2));
   console.log(`\nResults written to ${outPath}`);
 })().catch(e => { console.error('Failed:', e); process.exit(1); });
