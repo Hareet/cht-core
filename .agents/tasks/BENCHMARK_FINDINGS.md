@@ -73,12 +73,12 @@
 
 ### 6. Server Load Projection
 
-| Metric | PouchDB/CouchDB | PowerSync/PostgreSQL |
-|--------|----------------|---------------------|
-| Cost per idle sync cycle | 2,993ms CouchDB CPU | 0ms |
-| Daily calls (2,611 users, 5-min interval) | ~750K get-ids calls | 0 polling calls |
-| Daily CouchDB CPU | **625 hours** | **0 hours** |
-| At national scale (5M docs) | ~18.5s per get-ids call | Still 0ms idle |
+| Metric | PouchDB/CouchDB | 
+|--------|----------------|
+| Cost per idle sync cycle | 2,993ms CouchDB CPU | 
+| Daily calls (2,611 users, 5-min interval) | ~750K get-ids calls |
+| Daily CouchDB CPU | **625 hours** |
+| At national scale (5M docs) | ~18.5s per get-ids call | 
 
 ---
 
@@ -229,7 +229,7 @@ We discovered during development that **no observer in scaled-data can see CHW b
 - **Supervisors** (9 in users.csv): see CHW contacts (100% coverage) but `report_depth: 0` hides their reports. Evidence in `check-supervisor-coverage.js` output.
 - **Non-writing CHWs**: scope is bounded to their own healthcenter's hierarchy. Cross-healthcenter reports are invisible.
 
-This is a deployment-config artifact, not a benchmark bug. It says CHT's offline authorization model relies on strict sub-tree scoping — "supervisor can see CHW's fresh submissions" isn't how this scaled-data works out of the box. Worth noting for the migration narrative: even without changing the auth model, the observer's latency-under-load improvement alone is a real user-experience win.
+ Worth noting for the migration narrative: even without changing the auth model, the observer's latency-under-load improvement alone is a real user-experience win.
 
 ### The third layer (implied)
 

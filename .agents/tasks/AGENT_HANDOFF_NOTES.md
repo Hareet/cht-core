@@ -43,6 +43,108 @@ This is higher than the ~60 target. The deep hierarchy (10 levels) creates more 
 
 The `auto_update_contact_parent_place` trigger checks `COALESCE(contact_type, 'person') = 'person'` which won't match CIV's `c92_household` type. The trigger was fixed, and the table was batch-populated for all CIV person types (335,922 rows).
 
+## For Agent 3 (Sync Streams) — `user_settings_doc` never drains (added 2026-04-17)
+
+### Observed symptom
+Initial PowerSync sync hangs just shy of complete on budget and go tiers.
+Benchmark runs show `hasSynced` never flipping to `true` within 5 minutes.
+Graceful-bail kicks in so the benchmark can still produce numbers, but this
+is blocking a clean run and likely blocking real device sync in the field.
+
+Sync status snapshot at 5-minute stall (reproducible on budget-3G and
+go-3G, `chw_test_1` / `chw_min_5km`):
+
+```
+"downloadProgress": {
+  "prio_1": { "since_last": 24500, "target_count": 24538 }   // 99.85% — stuck here
+}
+"internalStreamSubscriptions":
+  all_data              : 24337 / 24337   ✓ complete
+  unassigned_reports    :     0 /     0   ✓ empty (OK)
+  tasks                 :     0 /     0   ✓ empty (OK)
+  global_config         :   127 /   134   ← 7 short, not advancing
+  user_settings_doc     :     0 /    31   ← THE PROBLEM: 31 expected, 0 delivered
+  user_meta             :     0 /     0   ✓ empty (OK)
+```
+
+`all_data` is fine. The two stuck streams sum to 38 docs — which exactly
+matches the 38-doc gap (`24538 - 24500`) keeping `hasSynced` false.
+
+### Hypotheses in priority order
+
+1. **`user_settings_doc` query is over-scoped.** `target_count=31` is
+   suspicious for a stream that should return the *single* user's own
+   user-settings doc. 31 implies the parameter query is returning 31 user
+   ids or the bucket definition is too broad. Check
+   `.devcontainer/powersync-config/sync-config.yaml` → `user_settings_doc`
+   stream. If the query returns all users under some facility scope, tighten
+   it to `auth.user_id()`.
+
+2. **Permission layer blocking delivery.** If the query returns 31 IDs but
+   the authorization layer (CHT's offline filter equivalent on the PG side)
+   rejects 31 out of 31, the server will list them as `target_count` but
+   never actually send them. Run the bucket's WHERE clause as the
+   `chw_test_1` user against Postgres directly and confirm the row count.
+
+3. **`global_config` is 7 short** (127/134). Less severe but same class —
+   some docs in the global set aren't being delivered. Probably the same
+   underlying authorization/filter issue. Worth investigating together.
+
+### Steps to investigate
+1. Open `.devcontainer/powersync-config/sync-config.yaml`, locate the
+   `user_settings_doc` and `global_config` streams, note their parameter
+   queries and bucket WHERE clauses.
+2. Reproduce the miss against Postgres directly:
+   ```sql
+   -- adjust user_id / facility_id for chw_test_1 per the stream's param query
+   SELECT COUNT(*) FROM v1.couchdb
+   WHERE <stream WHERE clause>
+     -- if the stream uses a parameter query, substitute chw_test_1's values
+   ```
+   If count > 1 for `user_settings_doc`, the query is over-scoped. If count
+   matches target_count (31), the issue is delivery-side (permission filter
+   or bucket ordering / priority).
+3. Check `cht-powersync` container logs during a fresh benchmark run for
+   `user_settings_doc` bucket events — specifically whether the bucket
+   checkpoint advances. If the stream completes with `operations_synced`
+   accounting for 31 but the client still shows 0 downloaded, that's a
+   delivery path issue on the client side (deeper — escalate).
+4. If the stream config is wrong, tighten and re-seed: `docker compose
+   restart powersync`.
+
+### Reproducing
+```bash
+# Ensure api is on couchdb (pre-flight will block mismatch regardless).
+cd .devcontainer
+env -u CHT_DB_BACKEND docker compose -f docker-compose.services.yml \
+  up -d --force-recreate api
+cd ..
+# Start a fresh PowerSync browser session and watch the warmup output.
+# The status snapshot above is what the benchmark prints before bailing.
+docker exec cht-agent-7 bash -c \
+  'TEST=powersync BENCHMARK_TARGET=couchdb CHT_ROLE=chw_min_5km \
+   DEVICE_TIER=standard SKIP_NETWORK_THROTTLE=1 \
+   node /tmp/benchmark-write-path.js chw_test_1 Secret1!pass' \
+  2>&1 | grep -E 'prio_1=|user_settings_doc|global_config|WARNING|sync stalled'
+```
+
+### Success criteria
+- `hasSynced: true` within 60s on standard/unthrottled.
+- `user_settings_doc` progress shows `N / N` (whatever the correct N is for
+  chw_test_1 — likely 1 for their own doc, maybe higher if there are
+  shared settings docs).
+- `global_config` progresses to `N / N` without the 7-doc shortfall.
+
+### Files you'll likely touch
+- `.devcontainer/powersync-config/sync-config.yaml` — stream definitions
+- Possibly `.devcontainer/powersync-config/setup.sql` — if publication or
+  replication tables need the new scope
+
+### Out of scope
+- The benchmark's graceful bail — that's correct dev behavior and should
+  stay as an escape hatch even after this fix.
+- cht-datasource or api changes — not needed for sync-stream scope.
+
 ## For Agent 4 (Purge)
 
 **No purge.js exists** in the MoH-CIV config. The purge preprocessor will have no rules to evaluate. All documents will have `purge_status.purged = false` (bulk-initialized with 941,606 rows).
