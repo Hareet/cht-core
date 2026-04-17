@@ -1,0 +1,46 @@
+{
+  "scenario": "postgres",
+  "concurrency": 10,
+  "burst_size": 10,
+  "workers": 10,
+  "ok_workers": 10,
+  "docs_written": 100,
+  "docs_expected": 100,
+  "wall_clock_s": 1,
+  "throughput_docs_per_s": 100,
+  "batch_ms": {
+    "p50": 1520,
+    "p95": 1536,
+    "p99": 1536,
+    "min": 1498,
+    "max": 1536
+  },
+  "per_doc_ms": {
+    "p50": 152,
+    "p95": 154,
+    "p99": 154
+  },
+  "visibility": {
+    "mode": "pg_query",
+    "total_ids": 100,
+    "visible_count": 100,
+    "first_ms": 19,
+    "all_ms": 19,
+    "error": null,
+    "status": "ok"
+  },
+  "visibility_probe_wall_s": 0,
+  "failures_per_worker": [
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0
+  ],
+  "error_summary": []
+}

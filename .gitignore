@@ -54,6 +54,8 @@ tests/cht-couchdb-test.yml
 tests/cht-couchdb-cluster-test.yml
 couchdb/srv*
 tests/scalability/jmeter/
+tests/scalability/benchmark_results_scaled/write-path/logs/
+tests/scalability/benchmark_results_scaled/write-path/doc-ids-*.txt
 webapp/analyzer.report.html
 /webapp/.angular/
 /webapp/.nx/

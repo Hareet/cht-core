@@ -390,10 +390,15 @@ async function benchPouchDBWritePath() {
   // impractical in a benchmark. Instead we write, then manually trigger an
   // immediate `db.replicate.to(remote)` scoped to the one doc (`doc_ids: [id]`)
   // to measure the protocol latency fairly against PowerSync's auto-upload.
-  // contact._id must be a real contact in the user's accessible tree — CHT's
-  // offline db-doc handler filters _bulk_docs by authorization and silently
-  // rejects out-of-scope docs (which manifests as replicate.to "succeeding"
-  // but the doc never appearing server-side).
+  //
+  // The offline `_bulk_docs` filter resolves a report's subject via the
+  // docs_by_replication_key view, which uses this precedence:
+  //   doc.patient_id || doc.fields.patient_id || doc.place_id ||
+  //   doc.fields.place_id || doc.fields.patient_uuid || doc.contact._id
+  // A bogus patient_id (e.g. '12345') wins that chain and makes the subject
+  // unreachable in the user's tree → the filter silently returns
+  // {error: 'forbidden'} and the doc never reaches CouchDB. We omit patient_id
+  // here so the subject falls through to doc.contact._id, which IS accessible.
   console.log('\n  Test B: Write → immediate replicate.to → server detection');
   const serverDocId = 'benchmark-write-pouch-server-' + Date.now();
   const tWrite = Date.now();
@@ -401,7 +406,7 @@ async function benchPouchDBWritePath() {
     const local = new window.PouchDB('medic-user-' + username, { skip_setup: true });
     await local.put({
       _id: id, type: 'data_record', form: 'benchmark_server_write',
-      patient_id: '12345', reported_date: Date.now(),
+      reported_date: Date.now(),
       contact: { _id: contactId },
       fields: { test: true, server_detection: true },
     });

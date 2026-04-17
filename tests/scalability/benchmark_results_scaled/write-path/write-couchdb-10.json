@@ -1,0 +1,46 @@
+{
+  "scenario": "couchdb",
+  "concurrency": 10,
+  "burst_size": 10,
+  "workers": 10,
+  "ok_workers": 10,
+  "docs_written": 100,
+  "docs_expected": 100,
+  "wall_clock_s": 7,
+  "throughput_docs_per_s": 14.29,
+  "batch_ms": {
+    "p50": 7059,
+    "p95": 7080,
+    "p99": 7080,
+    "min": 6446,
+    "max": 7080
+  },
+  "per_doc_ms": {
+    "p50": 659,
+    "p95": 959,
+    "p99": 994
+  },
+  "visibility": {
+    "mode": "couchdb_bulkget",
+    "total_ids": 100,
+    "visible_count": 100,
+    "first_ms": 95,
+    "all_ms": 95,
+    "error": null,
+    "status": "ok"
+  },
+  "visibility_probe_wall_s": 0,
+  "failures_per_worker": [
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0
+  ],
+  "error_summary": []
+}
