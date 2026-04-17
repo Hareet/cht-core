@@ -119,10 +119,14 @@ export class PowerSyncService implements OnDestroy {
     this.requestPersistentStorage();
 
     // Select VFS: AccessHandlePoolVFS for single-tab (best perf, lowest memory),
-    // OPFSCoopSyncVFS if multi-tab needed, IDBBatchAtomicVFS as fallback
-    const vfs = deviceTier.opfsAvailable
-      ? WASQLiteVFS.AccessHandlePoolVFS
-      : WASQLiteVFS.IDBBatchAtomicVFS;
+    // OPFSCoopSyncVFS if multi-tab needed, IDBBatchAtomicVFS as fallback.
+    // Allow benchmark override via window.__CHT_FORCE_VFS for testing.
+    const forceVfs = (window as any).__CHT_FORCE_VFS;
+    const vfs = forceVfs === 'idb'
+      ? WASQLiteVFS.IDBBatchAtomicVFS
+      : deviceTier.opfsAvailable
+        ? WASQLiteVFS.AccessHandlePoolVFS
+        : WASQLiteVFS.IDBBatchAtomicVFS;
 
     console.info(
       `PowerSync: Device tier=${deviceTier.tier}, VFS=${vfs}, ` +
@@ -153,10 +157,7 @@ export class PowerSyncService implements OnDestroy {
     // Expose DB globally for benchmarking (dev mode only)
     (window as any).__ps_db = this.db;
 
-    // Reduce SQLite cache for Go edition memory constraint (negative = KiB)
-    await this.db!.execute(`PRAGMA cache_size = -${tierConfig.cacheSizeKb}`);
-
-    // Derive the PowerSync service URL
+    // Derive the PowerSync service URL — do this before the PRAGMA so connect() isn't blocked
     const powerSyncUrl = config?.powerSyncUrl || this.derivePowerSyncUrl();
 
     this.connector = new ChtPowerSyncConnector({
@@ -184,9 +185,18 @@ export class PowerSyncService implements OnDestroy {
       },
     });
 
-    // connect() is fire-and-forget; sync happens in the background
+    // connect() is fire-and-forget; sync happens in the background.
+    // IMPORTANT: connect() must run before any db.execute() calls.
+    // The WASM worker may not be ready until connect() initializes it,
+    // so any execute() before connect() can deadlock the worker channel.
     this.db!.connect(this.connector);
     this.initialized = true;
+
+    // Reduce SQLite cache for Go edition memory constraint (negative = KiB).
+    // Runs after connect() to avoid blocking on an uninitialized worker.
+    this.db!.execute(`PRAGMA cache_size = -${tierConfig.cacheSizeKb}`).catch((err: any) => {
+      console.warn('PowerSync: PRAGMA cache_size failed (non-fatal):', err?.message || err);
+    });
 
     // Start storage monitoring for resource-constrained devices
     this.storageHealthService.startMonitoring();

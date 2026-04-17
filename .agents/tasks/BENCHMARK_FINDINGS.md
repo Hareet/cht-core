@@ -176,22 +176,26 @@ The existing concurrent benchmarks (up to 50 users) combined with our single-use
 
 Completed 2026-04-16. Full browser WASM measurement blocked by Worker bundling issue (see below).
 
-| Metric | PouchDB (browser, Go 4x CPU) | PowerSync (Node.js fallback) | PowerSync (est. WASM) |
-|--------|------------------------------|-----------------------------|-----------------------|
-| Local persist (single) | **14ms avg** (4-87ms) | 1ms | ~2-10ms (est.) |
-| Local persist (batch 10) | Not measured | 6ms (0.6ms/doc) | ~10-30ms (est.) |
-| Upload to server | **>350s** (sync interval never fired) | **1,001ms** | **~1-2s** |
+| Metric | PouchDB (browser, Go 4x CPU) | PowerSync (browser WASM, Go 4x CPU) | PowerSync (Node.js native) |
+|--------|------------------------------|-------------------------------------|---------------------------|
+| Local persist (single) | **14ms avg** (4-87ms) | **14ms avg** (10-28ms) | 1ms |
+| Local persist (steady) | 4-7ms | 10-11ms | 0-1ms |
+| Local persist (cold) | 87ms | 28ms | 1ms |
+| Batch write (10 docs) | Not measured | Not measured (timeout) | 6ms (0.6ms/doc) |
+| Upload to server | **>350s** (sync interval blocked) | Not measured (WebSocket blocked) | **1,001ms** |
 | Upload mechanism | Sync interval (default 5 min) | `uploadData()` auto-fires | Same |
 
-**Key finding**: PowerSync uploads automatically within ~1 second of a local write. PouchDB uploads on a 5-minute sync interval — in our test, the sync cycle never fired because the app's bootstrap errored before `watchDBSyncStatus` initialized. In production, PouchDB would upload within 0-5 minutes depending on where in the cycle the write occurred.
+**Key findings**:
+1. **Local persist is identical**: PouchDB and PowerSync both average 14ms on Go edition. CHWs won't notice any difference when submitting forms. PowerSync's WASM SQLite writes are comparable to PouchDB's native IndexedDB writes.
+2. **Upload latency**: PowerSync uploads automatically within ~1 second (Node.js measurement). PouchDB uploads on a 5-minute sync interval — in our test, the sync cycle never fired because the app's bootstrap errored before `watchDBSyncStatus` initialized. In production, PouchDB uploads within 0-5 minutes.
+3. **Upload mechanism advantage**: PowerSync fires `uploadData()` immediately when connectivity is available. No polling interval. This means a supervisor sees a CHW's submitted report ~1s after the CHW comes online, vs up to 5 minutes with PouchDB.
 
-**Blocked by**: PowerSync Web SDK Worker files not bundled into Angular build output. The `WASQLiteDB.worker.js` is loaded from `node_modules/` at runtime which is blocked by the browser's origin security policy. Agent 5 needs to configure the Angular/webpack build to copy Worker + WASM files into the build output. This is the same issue that blocked the standalone browser benchmark earlier.
+**Resolved during benchmarking**:
+- Worker/WASM bundling: Agent 5 configured Angular assets to copy UMD worker bundles + WASM files. Worker URL set explicitly in WASQLiteOpenFactory.
+- Nginx WebSocket proxy: `wss://nginx/powersync/` proxies to `ws://powersync:8080/`. Custom nginx.conf mounted via docker-compose.
+- JWT key alignment: dev-token-provider.ts key replaced to match dev-private-key.pem / powersync.yaml JWKS.
 
-**What Agent 5 needs to fix**:
-1. Configure Angular CLI / webpack to bundle `@powersync/web` Worker files into the webapp build output
-2. Set the Worker URL in `WASQLiteOpenFactory` to point to the bundled location
-3. Ensure `.wasm` files are served with correct `Content-Type: application/wasm` and COOP/COEP headers
-4. After fix: re-run write path benchmark with `TEST=powersync` to get real WASM persist latency
+**Still blocked**: Browser WebSocket sync stream doesn't connect for `chw_test_1` during Puppeteer benchmarks. PowerSync initializes (WASM DB opens, writes work) but `connect()` never establishes the sync stream. Upload number not captured in browser. See `.agents/tasks/BROWSER_INTEGRATION_DEBUGGING.md` for 5 hypotheses and debugging steps.
 
 ### Deprioritized
 

@@ -35,6 +35,11 @@
               {
                 "glob": "*.wasm",
                 "input": "node_modules/@powersync/web/dist",
+                "output": "powersync/worker"
+              },
+              {
+                "glob": "*.wasm",
+                "input": "node_modules/@powersync/web/dist",
                 "output": "powersync"
               }
             ],

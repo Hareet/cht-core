@@ -58,7 +58,13 @@ const TABLE_CONFIG = {
 const MAX_BATCH_SIZE = 100;
 
 /**
- * Transforms a PowerSync CrudEntry into a CouchDB-style document for cht-datasource.
+ * Transforms a PowerSync CrudEntry into a cht-datasource input shape.
+ *
+ * Bridges the PowerSync client schema (which mirrors cht-sync dbt column names,
+ * e.g. `contact_id`) and the cht-datasource ReportInput shape (which expects
+ * `contact` as the contact UUID string). cht-datasource fetches the contact
+ * doc by UUID and minifies it into the nested {_id, parent, ...} form.
+ *
  * @param {object} entry - PowerSync CrudEntry with `table`, `id`, and `opData`
  * @returns {object|null} transformed doc or null if invalid
  */
@@ -70,9 +76,14 @@ const transformCrudEntry = (entry) => {
 
   const doc = { ...opData };
 
-  // For reports, ensure the CouchDB type field is set
-  if (table === 'reports' && !doc.type) {
-    doc.type = 'data_record';
+  if (table === 'reports') {
+    if (!doc.type) {
+      doc.type = 'data_record';
+    }
+    // PowerSync `reports.contact_id` column → cht-datasource `contact` UUID.
+    if (doc.contact_id && !doc.contact) {
+      doc.contact = doc.contact_id;
+    }
   }
 
   return doc;

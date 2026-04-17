@@ -32,6 +32,11 @@ const CHT_URL = process.env.CHT_URL || 'https://nginx';
 const DEVICE_TIER = process.env.DEVICE_TIER || 'go';
 const skipNetwork = process.env.SKIP_NETWORK_THROTTLE === '1';
 const TEST = process.env.TEST || 'both';
+// Real contact UUID and form name for cht-datasource validation on the PowerSync
+// upload path. `contact` must be a UUID that resolves to an existing contact doc;
+// `form` must be in the supported forms list (otherwise Report.v1.create rejects).
+const BENCH_CONTACT_ID = process.env.BENCH_CONTACT_ID || '4ebb22c9-0f8c-4775-87da-30454446745d';
+const BENCH_FORM = process.env.BENCH_FORM || 'anc_followup';
 
 const PROFILES = {
   go:       { cpu: 4, heapMB: 512, label: 'Go Edition (Helio A22, 2GB RAM)' },
@@ -118,6 +123,7 @@ async function waitForInitialSync(page, label) {
 async function launchBrowser() {
   const browser = await puppeteer.launch({
     headless: 'new',
+    protocolTimeout: 120000,
     args: [
       '--no-sandbox', '--disable-setuid-sandbox',
       '--js-flags=--max-old-space-size=' + profile.heapMB,
@@ -279,23 +285,65 @@ async function benchPowerSyncWritePath() {
 
   const { browser, page, client } = await launchBrowser();
 
-  // Set PowerSync URL + force tier
-  await page.evaluateOnNewDocument((tier) => {
-    // Don't set __CHT_POWERSYNC_URL — let the app use location.origin + '/powersync'
-    // which goes through the nginx wss:// proxy, avoiding mixed content
+  // Set PowerSync URL + force tier.
+  // OPFS AccessHandlePoolVFS works when the worker loads from a same-origin HTTPS URL
+  // (NOT from Blob URLs, which is why the standalone OPFS test failed).
+  // Set __CHT_FORCE_VFS='idb' to test IDBBatchAtomicVFS fallback if needed.
+  const forceVfs = process.env.FORCE_VFS || '';
+  await page.evaluateOnNewDocument((tier, vfs) => {
     window.__CHT_FORCE_DEVICE_TIER = tier;
-  }, DEVICE_TIER);
+    if (vfs) window.__CHT_FORCE_VFS = vfs;
+  }, DEVICE_TIER, forceVfs);
 
+  // Capture console output for debugging (filter out noisy change notifications and ngrx)
   page.on('console', msg => {
     const text = msg.text();
-    if (text.match(/powersync|PowerSync|skipping PouchDB|uploadData|upload/i)) {
-      console.log('    [app] ' + text);
+    if (text.includes('Change notification firing') || text.includes('prev state') ||
+        text.includes('next state') || text.includes('action') || text === 'console.groupEnd' ||
+        text.startsWith('%c')) return;
+    console.log('    [app:' + msg.type() + '] ' + text);
+  });
+
+  // Capture page errors
+  page.on('pageerror', err => {
+    console.log('    [PAGE ERROR] ' + err.message);
+  });
+
+  // Capture failed requests (worker files, WASM files)
+  page.on('requestfailed', req => {
+    console.log('    [REQ FAIL] ' + req.url() + ' — ' + req.failure()?.errorText);
+  });
+
+  // Track worker-related requests
+  page.on('response', res => {
+    const url = res.url();
+    if (url.match(/worker|wasm|\.js$/i) && res.status() !== 200) {
+      console.log('    [HTTP ' + res.status() + '] ' + url);
+    }
+    if (url.match(/worker|wasm/i)) {
+      console.log('    [LOADED ' + res.status() + '] ' + url);
     }
   });
 
+  // Clear storage + unregister service workers, then navigate
+  console.log('  Clearing browser storage + service workers...');
+  await page.goto(CHT_URL + '/medic/login', { waitUntil: 'networkidle2', timeout: 60000 });
+
+  // Unregister all service workers so we get fresh code from the server
+  await page.evaluate(async () => {
+    const regs = await navigator.serviceWorker.getRegistrations();
+    for (const r of regs) await r.unregister();
+  });
+
+  const cdpClear = await page.target().createCDPSession();
+  await cdpClear.send('Storage.clearDataForOrigin', {
+    origin: CHT_URL,
+    storageTypes: 'all',
+  });
+  await page.reload({ waitUntil: 'networkidle2' });
+
   // Login + initial sync
   console.log('  Phase 1: Login + initial sync...');
-  await page.goto(CHT_URL + '/medic/login', { waitUntil: 'networkidle2', timeout: 60000 });
   await handleLoginFlow(page, USERNAME, PASSWORD);
   await waitForInitialSync(page, 'PowerSync');
 
@@ -315,6 +363,104 @@ async function benchPowerSyncWritePath() {
   if (!psDbReady) {
     console.log('  __ps_db NOT available after 120s. PowerSync may not have initialized.');
     console.log('  Falling back to Node.js measurement...');
+  } else {
+    // Diagnostic: check sync connection status (Step 6 from debugging doc)
+    const syncStatus = await page.evaluate(() => {
+      const db = window.__ps_db;
+      if (!db) return { error: 'no __ps_db' };
+      const s = db.currentStatus;
+      return {
+        connected: s?.connected,
+        connecting: s?.connecting,
+        lastSyncedAt: s?.lastSyncedAt?.toISOString?.() || s?.lastSyncedAt,
+        hasSynced: s?.hasSynced,
+        dataFlowStatus: s?.dataFlowStatus,
+        uploadError: s?.uploadError?.message,
+        downloadError: s?.downloadError?.message,
+      };
+    });
+    console.log('  Sync status:', JSON.stringify(syncStatus, null, 2));
+
+    if (!syncStatus.connected && !syncStatus.connecting) {
+      console.log('  WARNING: SDK is not connected and not trying to connect.');
+      console.log('  This suggests connect() was never called or fetchCredentials failed.');
+    }
+  }
+
+  // --- Deep diagnostic: inspect DB internals ---
+  console.log('\n  Deep diagnostic: inspecting __ps_db internals...');
+  const dbInternals = await page.evaluate(() => {
+    const db = window.__ps_db;
+    if (!db) return { error: 'no __ps_db' };
+    const keys = Object.keys(db).filter(k => !k.startsWith('_'));
+    const proto = Object.getOwnPropertyNames(Object.getPrototypeOf(db)).filter(k => k !== 'constructor').slice(0, 20);
+    return {
+      type: db.constructor?.name,
+      keys,
+      protoMethods: proto,
+      closed: db.closed,
+      ready: typeof db.ready,
+      isReady: db.isReady,
+      // Check if there's an internal database adapter
+      hasAdapter: !!db.database,
+      adapterType: db.database?.constructor?.name,
+      // Check worker handle
+      hasOptions: !!db.options,
+      flags: db.options?.flags,
+    };
+  });
+  console.log('  DB internals:', JSON.stringify(dbInternals, null, 2));
+
+  // Check if db.ready resolves or hangs
+  console.log('\n  Checking if db.ready resolves...');
+  const readyResult = await page.evaluate(async () => {
+    const db = window.__ps_db;
+    if (!db) return { error: 'no db' };
+    try {
+      await Promise.race([
+        db.ready,  // Internal SDK ready promise
+        new Promise((_, reject) => setTimeout(() => reject(new Error('db.ready timed out after 10s')), 10000)),
+      ]);
+      return { ready: true };
+    } catch (e) {
+      return { error: e.message };
+    }
+  });
+  console.log('  db.ready result:', JSON.stringify(readyResult));
+
+  // --- Diagnostic: verify execute() works at all with a SELECT ---
+  console.log('\n  Diagnostic: testing db.execute(SELECT 1)...');
+  const selectTest = await page.evaluate(async () => {
+    const db = window.__ps_db;
+    if (!db || !db.execute) return { error: 'no __ps_db' };
+    try {
+      const result = await Promise.race([
+        db.execute('SELECT 1 as test'),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('SELECT timed out after 15s')), 15000)),
+      ]);
+      return { ok: true, rows: result?.rows?._array || result?.rows?.length };
+    } catch (e) {
+      return { error: e.message, stack: e.stack?.split('\n').slice(0, 3).join(' | ') };
+    }
+  });
+  console.log('  SELECT test:', JSON.stringify(selectTest));
+
+  if (selectTest.error) {
+    console.log('  db.execute() is broken — even SELECT fails. OPFS/WASM worker may be deadlocked.');
+    console.log('  Checking if getAll works instead...');
+    const getAllTest = await page.evaluate(async () => {
+      const db = window.__ps_db;
+      try {
+        const result = await Promise.race([
+          db.getAll('SELECT name FROM sqlite_master WHERE type="table" LIMIT 5'),
+          new Promise((_, reject) => setTimeout(() => reject(new Error('getAll timed out after 15s')), 15000)),
+        ]);
+        return { ok: true, tables: result };
+      } catch (e) {
+        return { error: e.message };
+      }
+    });
+    console.log('  getAll test:', JSON.stringify(getAllTest));
   }
 
   // --- Test A: Single write local persist ---
@@ -324,25 +470,36 @@ async function benchPowerSyncWritePath() {
   const persistResults = [];
   for (let i = 0; i < 10; i++) {
     const docId = 'benchmark-write-ps-' + Date.now() + '-' + i;
-    const ms = await page.evaluate(async (id) => {
+    // Use JS-level timeout to catch hangs — don't let CDP protocol timeout swallow the error
+    const ms = await page.evaluate(async (id, form, contactId) => {
       const db = window.__ps_db;
       if (!db || !db.execute) {
         return { ms: -1, error: 'PowerSync DB not accessible from page context' };
       }
 
-      const start = performance.now();
-      await db.execute(
-        'INSERT INTO reports (id, form, patient_id, reported_date, fields) VALUES (?, ?, ?, ?, ?)',
-        [id, 'benchmark_write', '12345', String(Date.now()), '{"test":true,"iteration":"' + id + '"}']
-      );
-      return { ms: Math.round(performance.now() - start) };
-    }, docId);
+      try {
+        const start = performance.now();
+        await Promise.race([
+          db.execute(
+            'INSERT INTO reports (id, form, patient_id, reported_date, fields, contact_id) VALUES (?, ?, ?, ?, ?, ?)',
+            [id, form, '12345', new Date().toISOString(), '{"test":true,"iteration":"' + id + '"}', contactId]
+          ),
+          new Promise((_, reject) => setTimeout(() => reject(new Error('INSERT timed out after 30s')), 30000)),
+        ]);
+        return { ms: Math.round(performance.now() - start) };
+      } catch (e) {
+        return { ms: -1, error: e.message };
+      }
+    }, docId, BENCH_FORM, BENCH_CONTACT_ID);
 
     if (ms.error) {
       console.log('    Write ' + (i + 1) + ': FAILED — ' + ms.error);
-      if (i === 0) {
-        console.log('    PowerSync DB not accessible from page evaluate.');
-        console.log('    The app needs to expose the DB instance globally.');
+      if (i === 0 && ms.error.includes('timed out')) {
+        console.log('    db.execute(INSERT) hangs. WASM worker may be blocked on OPFS file handles.');
+        console.log('    Falling back to Node.js measurement...');
+        break;
+      }
+      if (i === 0 && ms.error.includes('not accessible')) {
         console.log('    Falling back to Node.js measurement...');
         break;
       }
@@ -453,8 +610,8 @@ async function benchPowerSyncWritePath() {
       const docId = crypto.randomUUID();
       const start = Date.now();
       await db.execute(
-        'INSERT INTO reports (id, form, patient_id, reported_date, fields) VALUES (?, ?, ?, ?, ?)',
-        [docId, 'benchmark_write', '12345', String(Date.now()), '{"test":true}']
+        'INSERT INTO reports (id, form, patient_id, reported_date, fields, contact_id) VALUES (?, ?, ?, ?, ?, ?)',
+        [docId, BENCH_FORM, '12345', new Date().toISOString(), '{"test":true}', BENCH_CONTACT_ID]
       );
       const ms = Date.now() - start;
       persistResults.push(ms);
@@ -470,8 +627,8 @@ async function benchPowerSyncWritePath() {
     const uploadDocId = crypto.randomUUID();
     const tServerWrite = Date.now();
     await db.execute(
-      'INSERT INTO reports (id, form, patient_id, reported_date, fields) VALUES (?, ?, ?, ?, ?)',
-      [uploadDocId, 'benchmark_server_write', '12345', String(Date.now()), '{"server_test":true}']
+      'INSERT INTO reports (id, form, patient_id, reported_date, fields, contact_id) VALUES (?, ?, ?, ?, ?, ?)',
+      [uploadDocId, BENCH_FORM, '12345', new Date().toISOString(), '{"server_test":true}', BENCH_CONTACT_ID]
     );
     console.log('    Wrote locally at T+0ms, waiting for uploadData to fire...');
 
@@ -492,8 +649,8 @@ async function benchPowerSyncWritePath() {
     const batchStart = Date.now();
     for (let i = 0; i < 10; i++) {
       await db.execute(
-        'INSERT INTO reports (id, form, patient_id, reported_date, fields) VALUES (?, ?, ?, ?, ?)',
-        [crypto.randomUUID(), 'benchmark_batch', '12345', String(Date.now()), '{"batch":true}']
+        'INSERT INTO reports (id, form, patient_id, reported_date, fields, contact_id) VALUES (?, ?, ?, ?, ?, ?)',
+        [crypto.randomUUID(), BENCH_FORM, '12345', new Date().toISOString(), '{"batch":true}', BENCH_CONTACT_ID]
       );
     }
     batchMs = Date.now() - batchStart;
@@ -509,6 +666,80 @@ async function benchPowerSyncWritePath() {
     avgPersist = Math.round(persistResults.reduce((a, b) => a + b, 0) / persistResults.length);
     minPersist = Math.min(...persistResults);
     maxPersist = Math.max(...persistResults);
+
+    // --- Test B: Write then detect upload on server ---
+    // Detection note: cht-datasource's Report.v1.create mints a new CouchDB `_id`;
+    // the PowerSync client UUID is NOT preserved as `_id`. We poll via Mango _find
+    // by contact + reported_date window + a unique marker embedded in `fields`.
+    console.log('\n  Test B: Write → server upload (via PowerSync uploadData)');
+    const serverMarker = 'ps-bench-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8);
+    const tWrite = Date.now();
+    await page.evaluate(async (form, contactId, marker) => {
+      await window.__ps_db.execute(
+        'INSERT INTO reports (id, form, patient_id, reported_date, fields, contact_id) VALUES (?, ?, ?, ?, ?, ?)',
+        [
+          'benchmark-write-ps-server-' + marker,
+          form,
+          '12345',
+          new Date().toISOString(),
+          JSON.stringify({ server_test: true, marker }),
+          contactId,
+        ]
+      );
+    }, BENCH_FORM, BENCH_CONTACT_ID, serverMarker);
+    console.log('    Wrote to WASM SQLite at T+0ms, polling server via _find (marker=' + serverMarker + ')...');
+
+    for (let sec = 0; sec < 15; sec++) {
+      await new Promise(r => setTimeout(r, 2000));
+      const elapsed = Date.now() - tWrite;
+      try {
+        const res = await couchReq('POST', '/medic/_find', JSON.stringify({
+          selector: {
+            type: 'data_record',
+            form: BENCH_FORM,
+            'contact._id': BENCH_CONTACT_ID,
+            fields: { '$regex': serverMarker },
+          },
+          fields: ['_id'],
+          limit: 1,
+        }));
+        if (res && Array.isArray(res.docs) && res.docs.length > 0) {
+          serverDetectedMs = elapsed;
+          console.log('    ** Doc found on server at T+' + elapsed + 'ms (server _id=' + res.docs[0]._id + ') **');
+          break;
+        }
+      } catch {}
+      if (sec % 5 === 4) {
+        console.log('    T+' + elapsed + 'ms: not on server yet...');
+      }
+    }
+    if (serverDetectedMs < 0) {
+      console.log('    Doc NOT found on server within 30s');
+    }
+
+    // --- Test C: Batch write (10 docs) ---
+    console.log('\n  Test C: Batch write — 10 docs local persist');
+    batchMs = await page.evaluate(async (form, contactId) => {
+      const db = window.__ps_db;
+      const start = performance.now();
+      for (let i = 0; i < 10; i++) {
+        await db.execute(
+          'INSERT INTO reports (id, form, patient_id, reported_date, fields, contact_id) VALUES (?, ?, ?, ?, ?, ?)',
+          ['benchmark-batch-ps-' + Date.now() + '-' + i, form, '12345', new Date().toISOString(), '{"batch":true,"i":' + i + '}', contactId]
+        );
+      }
+      return Math.round(performance.now() - start);
+    }, BENCH_FORM, BENCH_CONTACT_ID);
+    console.log('    10 docs: ' + batchMs + 'ms (' + Math.round(batchMs / 10) + 'ms/doc)');
+
+    // Check upload queue
+    const queueCount = await page.evaluate(async () => {
+      try {
+        const stats = await window.__ps_db.getUploadQueueStats();
+        return stats.count;
+      } catch { return -1; }
+    });
+    if (queueCount >= 0) console.log('    Upload queue pending: ' + queueCount);
   }
 
   await browser.close();

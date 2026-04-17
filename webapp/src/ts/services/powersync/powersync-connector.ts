@@ -3,28 +3,24 @@
  *
  * Handles two concerns:
  * 1. fetchCredentials() - Gets JWT tokens from CHT API for PowerSync authentication
- * 2. uploadData() - Sends local writes to CHT API (PowerSync is read+sync only;
- *    client writes go through CHT API, not directly to PostgreSQL)
+ * 2. uploadData() - Batches CRUD operations and POSTs them to the CHT API's dedicated
+ *    PowerSync upload endpoint (/api/v1/powersync/upload). That endpoint routes writes
+ *    through cht-datasource and is offline-user safe (isOnline: false).
  *
- * HTTP status code handling per PowerSync requirements:
- * - 2xx from backend even for validation errors (4xx blocks upload queue permanently)
- * - 5xx triggers automatic retry with backoff
- * - Validation errors are written to a local-only table for UI display
+ * Both endpoints are absolute same-origin paths. Building URLs from `apiBaseUrl`
+ * (LocationService.url = "https://host/medic") would prefix /medic/ and cause the
+ * request to be caught by the CouchDB proxy / db-doc middleware on the API.
  *
- * CHT API endpoints:
- * - POST /api/v1/people - Create person contacts
- * - POST /api/v1/places - Create place contacts (clinic, health_center, district_hospital)
- * - POST /api/v1/records - Create reports/data records
- * - POST /api/v1/feedback - Submit user feedback (from meta DB)
- * Note: tasks and targets are generated client-side by the rules engine and synced
- * via PowerSync — they do not have dedicated write endpoints.
+ * Response handling (matches CHT server contract at powersync-upload.js):
+ * - 5xx → throw to trigger PowerSync retry with backoff
+ * - 4xx → log to local feedback table and advance. Throwing would block the queue
+ *   indefinitely on auth/feature-flag errors the client can't self-correct.
+ * - 200 with { results: [{ok, error}] } → log per-item failures, advance
  */
-import { UpdateType } from '@powersync/web';
 import type {
   AbstractPowerSyncDatabase,
   PowerSyncBackendConnector,
   PowerSyncCredentials,
-  CrudEntry,
 } from '@powersync/web';
 
 export interface ChtConnectorConfig {
@@ -46,12 +42,14 @@ export interface ChtConnectorConfig {
   fetchTimeoutMs?: number;
 }
 
-/**
- * CHT person contact types — these use /api/v1/people.
- * All other contact types (clinic, health_center, district_hospital, custom places)
- * use /api/v1/places.
- */
-const PERSON_TYPES = new Set(['person']);
+/** CHT PowerSync upload endpoint — receives batches of PowerSync CrudEntry. */
+const UPLOAD_ENDPOINT = '/api/v1/powersync/upload';
+
+/** CHT PowerSync token endpoint — returns a signed JWT for the sync service. */
+const TOKEN_ENDPOINT = '/api/v1/powersync-token';
+
+/** Max entries per upload POST. Must match MAX_BATCH_SIZE in api/src/controllers/powersync-upload.js. */
+const MAX_UPLOAD_BATCH = 100;
 
 /**
  * Default timeout for HTTP requests (30 seconds).
@@ -104,8 +102,9 @@ export class ChtPowerSyncConnector implements PowerSyncBackendConnector {
       };
     }
 
-    // Production mode: fetch from CHT API
-    const response = await this.fetchWithTimeout(`${this.config.apiBaseUrl}/api/v1/powersync-token`, {
+    // Production mode: fetch from CHT API. Absolute same-origin path — building
+    // from apiBaseUrl would prefix /medic/ and route through the CouchDB proxy.
+    const response = await this.fetchWithTimeout(TOKEN_ENDPOINT, {
       credentials: 'same-origin',
       headers: { 'Accept': 'application/json' },
     });
@@ -124,12 +123,9 @@ export class ChtPowerSyncConnector implements PowerSyncBackendConnector {
   }
 
   /**
-   * Upload local writes to CHT API.
+   * Upload local writes to the CHT PowerSync batch endpoint.
    *
-   * Called automatically whenever local writes are pending.
-   * Must be synchronous with the actual backend write.
-   * If it throws, PowerSync backs off and retries automatically.
-   *
+   * Called automatically by the SDK whenever local writes are pending.
    * CRITICAL: transaction.complete() must be called or the upload queue stalls permanently.
    */
   async uploadData(database: AbstractPowerSyncDatabase): Promise<void> {
@@ -139,54 +135,43 @@ export class ChtPowerSyncConnector implements PowerSyncBackendConnector {
     }
 
     try {
-      for (const op of transaction.crud) {
-        const endpoint = this.resolveEndpoint(op);
-        if (!endpoint) {
-          console.warn(`PowerSync: No API endpoint for table '${op.table}', skipping`);
+      const ops = transaction.crud.map(op => ({
+        op: op.op,
+        table: op.table,
+        id: op.id,
+        opData: op.opData,
+      }));
+
+      for (let i = 0; i < ops.length; i += MAX_UPLOAD_BATCH) {
+        const chunk = ops.slice(i, i + MAX_UPLOAD_BATCH);
+        const response = await this.fetchWithTimeout(UPLOAD_ENDPOINT, {
+          method: 'POST',
+          credentials: 'same-origin',
+          headers: {
+            'Content-Type': 'application/json',
+            'Accept': 'application/json',
+          },
+          body: JSON.stringify({ crud: chunk }),
+        });
+
+        if (response.status >= 500) {
+          const text = await response.text().catch(() => 'Unknown server error');
+          throw new Error(`Server error ${response.status}: ${text}`);
+        }
+
+        if (!response.ok) {
+          const errorText = await response.text().catch(() => 'Unknown error');
+          console.warn(`PowerSync upload rejected (${response.status}):`, errorText);
+          await this.logBatchError(database, response.status, errorText, chunk);
           continue;
         }
 
-        const url = `${this.config.apiBaseUrl}${endpoint}`;
-
-        switch (op.op) {
-          case UpdateType.PUT: {
-            const body = this.transformForApi(op.table, { id: op.id, ...op.opData });
-            const response = await this.fetchWithTimeout(url, {
-              method: 'POST',
-              credentials: 'same-origin',
-              headers: {
-                'Content-Type': 'application/json',
-                'Accept': 'application/json',
-              },
-              body: JSON.stringify(body),
-            });
-            await this.handleResponse(response, database, op);
-            break;
-          }
-
-          case UpdateType.PATCH: {
-            const body = this.transformForApi(op.table, { id: op.id, ...op.opData });
-            const response = await this.fetchWithTimeout(`${url}/${op.id}`, {
-              method: 'PUT',
-              credentials: 'same-origin',
-              headers: {
-                'Content-Type': 'application/json',
-                'Accept': 'application/json',
-              },
-              body: JSON.stringify(body),
-            });
-            await this.handleResponse(response, database, op);
-            break;
-          }
-
-          case UpdateType.DELETE: {
-            const response = await this.fetchWithTimeout(`${url}/${op.id}`, {
-              method: 'DELETE',
-              credentials: 'same-origin',
-              headers: { 'Accept': 'application/json' },
-            });
-            await this.handleResponse(response, database, op);
-            break;
+        const body = await response.json().catch(() => null);
+        const results: Array<{ id: string; ok: boolean; error?: string }> = body?.results ?? [];
+        for (const r of results) {
+          if (!r.ok) {
+            console.warn(`PowerSync upload item error for ${r.id}:`, r.error);
+            await this.logItemError(database, r);
           }
         }
       }
@@ -194,136 +179,53 @@ export class ChtPowerSyncConnector implements PowerSyncBackendConnector {
       // MUST call complete() to advance the queue
       await transaction.complete();
     } catch (ex) {
-      // Throw to trigger PowerSync retry with backoff
+      // Throw to trigger PowerSync retry with backoff (5xx path)
       console.error('PowerSync upload error:', ex);
       throw ex;
     }
   }
 
   /**
-   * Resolve the CHT API endpoint for a given CRUD operation.
-   *
-   * Contacts require special handling: persons use /api/v1/people,
-   * places (clinic, health_center, district_hospital) use /api/v1/places.
-   * The contact_type field in opData determines which endpoint to use.
-   *
-   * Tasks and targets are generated locally by the rules engine and synced
-   * through PowerSync — they don't have dedicated upload endpoints.
-   * Read status is local-only and doesn't get uploaded.
+   * Record a batch-level failure in the local-only feedback table.
+   * PowerSync advances past 4xx errors — logging here is the only user-visible signal.
    */
-  private resolveEndpoint(op: CrudEntry): string | null {
-    switch (op.table) {
-      case 'contacts': {
-        // Determine if person or place based on contact_type/type in opData
-        const contactType = op.opData?.contact_type || op.opData?.type;
-        if (PERSON_TYPES.has(contactType)) {
-          return '/api/v1/people';
-        }
-        return '/api/v1/places';
-      }
-      case 'reports':
-        return '/api/v1/records';
-      case 'feedback':
-        return '/api/v1/feedback';
-      // Tasks and targets are client-generated by rules engine.
-      // They sync via PowerSync but don't have dedicated CHT API write endpoints.
-      // The server receives them through the PostgreSQL sync path.
-      case 'tasks':
-      case 'targets':
-        return null;
-      // Settings are read-only on client (admin-only writes on server)
-      case 'settings':
-        return null;
-      // Local-only tables don't need upload endpoints
-      case 'telemetry':
-      case 'read_status':
-        return null;
-      default:
-        return null;
-    }
-  }
-
-  /**
-   * Handle API response. Per PowerSync guidance:
-   * - 5xx: throw to retry
-   * - 4xx validation errors: log to local-only table, don't block queue
-   */
-  private async handleResponse(
-    response: Response,
+  private async logBatchError(
     database: AbstractPowerSyncDatabase,
-    op: CrudEntry
+    status: number,
+    errorText: string,
+    chunk: Array<{ op: string; table: string; id: string; opData?: Record<string, any> }>
   ): Promise<void> {
-    if (response.ok) {
-      return;
-    }
-
-    if (response.status >= 500) {
-      const text = await response.text().catch(() => 'Unknown server error');
-      throw new Error(`Server error ${response.status}: ${text}`);
-    }
-
-    // 4xx: validation error - log it but don't block the queue
-    const errorText = await response.text().catch(() => 'Unknown validation error');
-    console.warn(`PowerSync upload validation error for ${op.table}/${op.id}:`, errorText);
-
-    // Write validation error to local-only feedback table for UI display
     try {
       await database.execute(
         `INSERT INTO feedback (id, type, message, info, reported_date) VALUES (uuid(), ?, ?, ?, ?)`,
         [
           'upload_error',
-          `Failed to save ${op.table}: ${response.status}`,
-          JSON.stringify({ table: op.table, id: op.id, op: op.op, error: errorText }),
+          `Upload batch rejected (${status})`,
+          JSON.stringify({ status, error: errorText, ids: chunk.map(o => o.id) }),
           new Date().toISOString(),
         ]
       );
     } catch (e) {
-      console.error('Failed to log upload error to local feedback table:', e);
+      console.error('Failed to log upload batch error to feedback table:', e);
     }
   }
 
-  /**
-   * Transform PowerSync row data into CHT API format.
-   * PowerSync stores booleans as 0/1; CHT API expects true/false.
-   * JSON text fields need to be parsed back to objects.
-   */
-  private transformForApi(table: string, data: Record<string, any>): Record<string, any> {
-    const result = { ...data };
-
-    // Parse JSON text fields back to objects
-    const jsonFields: Record<string, string[]> = {
-      contacts: ['parent', 'geolocation'],
-      reports: ['fields', 'geolocation'],
-      tasks: ['state_history', 'emission'],
-      targets: ['targets'],
-      settings: ['doc'],
-      feedback: ['info'],
-      telemetry: ['metrics', 'device'],
-    };
-
-    const fieldsToParseForTable = jsonFields[table] || [];
-    for (const field of fieldsToParseForTable) {
-      if (typeof result[field] === 'string') {
-        try {
-          result[field] = JSON.parse(result[field]);
-        } catch {
-          // Keep as string if not valid JSON
-        }
-      }
+  private async logItemError(
+    database: AbstractPowerSyncDatabase,
+    result: { id: string; ok: boolean; error?: string }
+  ): Promise<void> {
+    try {
+      await database.execute(
+        `INSERT INTO feedback (id, type, message, info, reported_date) VALUES (uuid(), ?, ?, ?, ?)`,
+        [
+          'upload_error',
+          `Upload item failed: ${result.id}`,
+          JSON.stringify({ id: result.id, error: result.error }),
+          new Date().toISOString(),
+        ]
+      );
+    } catch (e) {
+      console.error('Failed to log upload item error to feedback table:', e);
     }
-
-    // Convert integer booleans back to actual booleans
-    const booleanFields: Record<string, string[]> = {
-      reports: ['verified', 'is_private', 'needs_signoff'],
-    };
-
-    const boolFieldsForTable = booleanFields[table] || [];
-    for (const field of boolFieldsForTable) {
-      if (field in result) {
-        result[field] = result[field] === 1;
-      }
-    }
-
-    return result;
   }
 }
