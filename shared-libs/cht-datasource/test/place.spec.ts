@@ -347,7 +347,7 @@ describe('place', () => {
         expect(assertDataContext.calledOnceWithExactly(dataContext)).to.be.true;
         expect(adapt.calledOnceWithExactly(dataContext, Local.Place.v1.create, Remote.Place.v1.create, Postgres.Place.v1.create))
           .to.be.true;
-        expect(createPlaceDoc.calledOnceWithExactly(input)).to.be.true;
+        expect(createPlaceDoc.calledOnceWithExactly(input, undefined)).to.be.true;
       });
 
       it('Throws error is input is not a record', async () => {

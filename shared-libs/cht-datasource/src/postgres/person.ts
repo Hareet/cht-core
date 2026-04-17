@@ -102,7 +102,7 @@ export namespace v1 {
     const createPgDoc = createDoc(ctx);
     const getPgDoc = getDocById(ctx);
 
-    return async (input: Input.v1.PersonInput): Promise<Person.v1.Person> => {
+    return async (input: Input.v1.PersonInput, idHint?: string): Promise<Person.v1.Person> => {
       const settingsData = ctx.settings.getAll();
       const customType = contactTypeUtils.getTypeById(settingsData, input.type);
       if (!contactTypeUtils.isPersonType(customType ?? { id: input.type })) {
@@ -123,7 +123,8 @@ export namespace v1 {
         parent: { _id: parent._id },
         reported_date: getReportedDateTimestamp(input.reported_date),
       };
-      return createPgDoc(personDoc) as Promise<Person.v1.Person>;
+      const created = idHint ? createPgDoc(personDoc, idHint) : createPgDoc(personDoc);
+      return created as Promise<Person.v1.Person>;
     };
   };
 

@@ -135,7 +135,7 @@ export namespace v1 {
     const minifyMedicDoc = minifyDoc(medicDb);
     const getForms = getSupportedForms(medicDb);
 
-    return async (input: Input.v1.ReportInput): Promise<Report.v1.Report> => {
+    return async (input: Input.v1.ReportInput, idHint?: string): Promise<Report.v1.Report> => {
       assertReportInput(input);
       const [contact, supportedForms] = await Promise.all([
         getMedicDoc(input.contact),
@@ -154,7 +154,8 @@ export namespace v1 {
         reported_date: getReportedDateTimestamp(input.reported_date),
         type: 'data_record',
       });
-      return createMedicDoc(reportDoc) as Promise<Report.v1.Report>;
+      const created = idHint ? createMedicDoc(reportDoc, idHint) : createMedicDoc(reportDoc);
+      return created as Promise<Report.v1.Report>;
     };
   };
 

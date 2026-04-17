@@ -346,7 +346,7 @@ describe('person', () => {
         expect(assertDataContext.calledOnceWithExactly(dataContext)).to.be.true;
         expect(adapt.calledOnceWithExactly(dataContext, Local.Person.v1.create, Remote.Person.v1.create, Postgres.Person.v1.create))
           .to.be.true;
-        expect(createPersonDoc.calledOnceWithExactly(input)).to.be.true;
+        expect(createPersonDoc.calledOnceWithExactly(input, undefined)).to.be.true;
       });
 
       it('Throws error is input is not a record', async () => {

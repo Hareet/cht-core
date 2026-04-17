@@ -693,6 +693,25 @@ describe('local doc lib', () => {
       await expect(createDoc(db)(doc)).to.be.rejectedWith('Error creating document.');
       expect(dbPost.calledOnceWithExactly(doc)).to.be.true;
     });
+
+    it('uses db.put with the idHint when one is provided', async () => {
+      const idHint = 'client-minted-uuid';
+      const expectedPutDoc = { ...doc, _id: idHint };
+      dbPut.resolves({ ok: true, rev: '1-rev' });
+
+      const result = await createDoc(db)(doc, idHint);
+
+      expect(result).to.deep.equal({ ...doc, _id: idHint, _rev: '1-rev' });
+      expect(dbPut.calledOnceWithExactly(expectedPutDoc)).to.be.true;
+      expect(dbPost.notCalled).to.be.true;
+    });
+
+    it('throws error when put fails with idHint', async () => {
+      dbPut.resolves({ ok: false });
+      await expect(createDoc(db)(doc, 'client-minted-uuid'))
+        .to.be.rejectedWith('Error creating document.');
+      expect(dbPost.notCalled).to.be.true;
+    });
   });
 
   describe('updateDoc', () => {

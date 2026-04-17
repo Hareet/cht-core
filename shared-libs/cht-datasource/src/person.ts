@@ -145,6 +145,9 @@ export namespace v1 {
     /**
      * Creates a new person record.
      * @param input input fields for creating a person
+     * @param idHint optional server-trusted UUID to use as the new record's `_id`. When omitted,
+     *   a UUID is generated. Intended for upload paths that must preserve a client-generated
+     *   primary key (for example PowerSync), so retried uploads stay idempotent.
      * @returns the created person record
      * @throws InvalidArgumentError if `type` is not provided or is not a supported person contact type
      * @throws InvalidArgumentError if `name` is not provided
@@ -153,11 +156,11 @@ export namespace v1 {
      * @throws InvalidArgumentError if the provided `reported_date` is not in a valid format. Valid formats are
      * 'YYYY-MM-DDTHH:mm:ssZ', 'YYYY-MM-DDTHH:mm:ss.SSSZ', or <unix epoch>.
      */
-    const curriedFn = async (input: Input.v1.PersonInput): Promise<Person> => {
+    const curriedFn = async (input: Input.v1.PersonInput, idHint?: string): Promise<Person> => {
       if (!isRecord(input)) {
         throw new InvalidArgumentError('Person data not provided.');
       }
-      return fn(input);
+      return fn(input, idHint);
     };
     return curriedFn;
   };

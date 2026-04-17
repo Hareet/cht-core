@@ -193,6 +193,16 @@ describe('postgres doc lib', () => {
 
       await expect(createDoc(ctx)({ type: 'person' })).to.be.rejectedWith('Error creating document.');
     });
+
+    it('uses the provided idHint as _id instead of generating a UUID', async () => {
+      poolQuery.resolves({ rows: [], rowCount: 1 });
+      const idHint = 'client-minted-uuid';
+
+      const result = await createDoc(ctx)({ name: 'test', type: 'person' }, idHint);
+
+      expect(result._id).to.equal(idHint);
+      expect(poolQuery.firstCall.args[1][0]).to.equal(idHint);
+    });
   });
 
   describe('updateDoc', () => {

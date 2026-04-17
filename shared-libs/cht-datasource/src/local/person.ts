@@ -125,7 +125,7 @@ export namespace v1 {
     const getMedicDoc = getDocById(medicDb);
     const minifyMedicDoc = minifyDoc(medicDb);
 
-    return async (input: Input.v1.PersonInput): Promise<Person.v1.Person> => {
+    return async (input: Input.v1.PersonInput, idHint?: string): Promise<Person.v1.Person> => {
       assertPersonInput(input);
       const settingsData = settings.getAll();
       const typeProperties = getTypeProperties(settingsData, input);
@@ -137,7 +137,8 @@ export namespace v1 {
         parent,
         reported_date: getReportedDateTimestamp(input.reported_date),
       });
-      return createMedicDoc(personDoc) as Promise<Person.v1.Person>;
+      const created = idHint ? createMedicDoc(personDoc, idHint) : createMedicDoc(personDoc);
+      return created as Promise<Person.v1.Person>;
     };
   };
 

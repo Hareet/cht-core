@@ -99,7 +99,7 @@ export namespace v1 {
     const getPgDocsByIds = getDocsByIds(ctx);
     const createPgDoc = createDoc(ctx);
 
-    return async (input: Input.v1.PlaceInput): Promise<Place.v1.Place> => {
+    return async (input: Input.v1.PlaceInput, idHint?: string): Promise<Place.v1.Place> => {
       const settingsData = ctx.settings.getAll();
       const customType = contactTypeUtils.getTypeById(settingsData, input.type);
       const placeType = customType ?? { id: input.type };
@@ -134,7 +134,8 @@ export namespace v1 {
         contact: contactDoc ? { _id: contactDoc._id } : undefined,
         reported_date: getReportedDateTimestamp(input.reported_date),
       };
-      return createPgDoc(placeDoc) as Promise<Place.v1.Place>;
+      const created = idHint ? createPgDoc(placeDoc, idHint) : createPgDoc(placeDoc);
+      return created as Promise<Place.v1.Place>;
     };
   };
 

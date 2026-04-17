@@ -126,9 +126,18 @@ export const queryDocIdsByType = (ctx: PostgresDataContext) => async (
   return rows.map(row => row._id);
 };
 
-/** @internal */
-export const createDoc = (ctx: PostgresDataContext) => async (data: DataObject): Promise<Doc> => {
-  const id = crypto.randomUUID();
+/**
+ * Creates a new document in the backing table.
+ * When `idHint` is provided it becomes the `_id`; otherwise a UUID is generated.
+ * Preserving a client-supplied id keeps offline-first writers like PowerSync idempotent
+ * — a retried upload hits the existing row instead of creating a duplicate.
+ * @internal
+ */
+export const createDoc = (ctx: PostgresDataContext) => async (
+  data: DataObject,
+  idHint?: string,
+): Promise<Doc> => {
+  const id = idHint ?? crypto.randomUUID();
   const rev = generateRev();
   const doc: Doc = { ...data, _id: id, _rev: rev };
 

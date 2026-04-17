@@ -165,7 +165,7 @@ export namespace v1 {
     const createMedicDoc = createDoc(medicDb);
     const minifyMedicDoc = minifyDoc(medicDb);
 
-    return async (input: Input.v1.PlaceInput): Promise<Place.v1.Place> => {
+    return async (input: Input.v1.PlaceInput, idHint?: string): Promise<Place.v1.Place> => {
       assertPlaceInput(input);
       const settingsData = settings.getAll();
       const typeProperties = getTypeProperties(settingsData, input);
@@ -182,7 +182,8 @@ export namespace v1 {
         contact,
         reported_date: getReportedDateTimestamp(input.reported_date),
       });
-      return createMedicDoc(placeDoc) as Promise<Place.v1.Place>;
+      const created = idHint ? createMedicDoc(placeDoc, idHint) : createMedicDoc(placeDoc);
+      return created as Promise<Place.v1.Place>;
     };
   };
 

@@ -143,6 +143,31 @@ describe('PowerSync Upload Controller', () => {
       expect(reportCreate.calledOnce).to.be.true;
     });
 
+    it('passes the CrudEntry id to cht-datasource as the idHint on create', async () => {
+      const clientUuid = '11111111-2222-3333-4444-555555555555';
+      const newReport = { _id: clientUuid, _rev: '1-abc', form: 'pregnancy', type: 'data_record' };
+      reportGet.resolves(null);
+      reportCreate.resolves(newReport);
+
+      req = {
+        body: {
+          crud: [{
+            op: 'PUT',
+            table: 'reports',
+            id: clientUuid,
+            clientId: 1,
+            opData: { form: 'pregnancy', contact: 'chw-1' }
+          }]
+        }
+      };
+
+      await controller.upload(req, res);
+
+      expect(reportCreate.calledOnce).to.be.true;
+      // Second positional arg is the idHint — preserves the client UUID server-side.
+      expect(reportCreate.firstCall.args[1]).to.equal(clientUuid);
+    });
+
     it('updates a report via PUT when doc already exists (idempotent upsert)', async () => {
       const existing = { _id: 'r-1', _rev: '1-abc', form: 'pregnancy', type: 'data_record' };
       const updated = { ...existing, _rev: '2-def', fields: { lmp: '2024-01-01' } };

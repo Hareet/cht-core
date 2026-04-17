@@ -133,17 +133,20 @@ export namespace v1 {
     /**
      * Creates a new report record.
      * @param input input fields for creating a report
+     * @param idHint optional server-trusted UUID to use as the new record's `_id`. When omitted,
+     *   a UUID is generated. Intended for upload paths that must preserve a client-generated
+     *   primary key (for example PowerSync), so retried uploads stay idempotent.
      * @returns the created report record
      * @throws InvalidArgumentError if `form` is not provided or is not a supported form id
      * @throws InvalidArgumentError if `contact` is not provided or is not the identifier of a valid contact
      * @throws InvalidArgumentError if the provided `reported_date` is not in a valid format. Valid formats are
      * 'YYYY-MM-DDTHH:mm:ssZ', 'YYYY-MM-DDTHH:mm:ss.SSSZ', or <unix epoch>.
      */
-    const curriedFn = async (input: Input.v1.ReportInput): Promise<Report> => {
+    const curriedFn = async (input: Input.v1.ReportInput, idHint?: string): Promise<Report> => {
       if (!isRecord(input)) {
         throw new InvalidArgumentError('Report data not provided.');
       }
-      return fn(input);
+      return fn(input, idHint);
     };
     return curriedFn;
   };

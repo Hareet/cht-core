@@ -135,6 +135,9 @@ export namespace v1 {
     /**
      * Creates a new place record.
      * @param input input fields for creating a place
+     * @param idHint optional server-trusted UUID to use as the new record's `_id`. When omitted,
+     *   a UUID is generated. Intended for upload paths that must preserve a client-generated
+     *   primary key (for example PowerSync), so retried uploads stay idempotent.
      * @returns the created place record
      * @throws InvalidArgumentError if `type` is not provided or is not a supported place contact type
      * @throws InvalidArgumentError if `name` is not provided
@@ -145,11 +148,11 @@ export namespace v1 {
      * 'YYYY-MM-DDTHH:mm:ssZ', 'YYYY-MM-DDTHH:mm:ss.SSSZ', or <unix epoch>.
      * @throws InvalidArgumentError if the provided `contact` is not the identifier of a valid person contact
      */
-    const curriedFn = async (input: Input.v1.PlaceInput): Promise<Place> => {
+    const curriedFn = async (input: Input.v1.PlaceInput, idHint?: string): Promise<Place> => {
       if (!isRecord(input)) {
         throw new InvalidArgumentError('Place data not provided.');
       }
-      return fn(input);
+      return fn(input, idHint);
     };
     return curriedFn;
   };

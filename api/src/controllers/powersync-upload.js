@@ -124,7 +124,10 @@ const processCrudEntry = async (entry) => {
         return { id: result._id, ok: true };
       }
 
-      const result = await tableConfig.create(doc);
+      // Preserve the client-minted UUID as the server `_id`. PowerSync best practice:
+      // client-generated UUIDs must round-trip so retried uploads are idempotent and
+      // cross-device references resolve without an ID mapping table.
+      const result = await tableConfig.create(doc, id);
       return { id: result._id, ok: true };
     }
 

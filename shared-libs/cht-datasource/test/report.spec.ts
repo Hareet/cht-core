@@ -362,7 +362,7 @@ describe('report', () => {
         expect(assertDataContext.calledOnceWithExactly(dataContext)).to.be.true;
         expect(adapt.calledOnceWithExactly(dataContext, Local.Report.v1.create, Remote.Report.v1.create, Postgres.Report.v1.create))
           .to.be.true;
-        expect(createReportDoc.calledOnceWithExactly(input)).to.be.true;
+        expect(createReportDoc.calledOnceWithExactly(input, undefined)).to.be.true;
       });
 
       it('Throws error is input is not a record', async () => {
@@ -374,6 +374,18 @@ describe('report', () => {
         expect(adapt.calledOnceWithExactly(dataContext, Local.Report.v1.create, Remote.Report.v1.create, Postgres.Report.v1.create))
           .to.be.true;
         expect(createReportDoc.notCalled).to.be.true;
+      });
+
+      it('threads the optional idHint through to the adapter', async () => {
+        const input = { form: 'form', contact: 'c1' };
+        const idHint = 'client-minted-uuid';
+        const doc = { ...input, _id: idHint };
+        createReportDoc.resolves(doc);
+
+        const result = await Report.v1.create(dataContext)(input, idHint);
+
+        expect(result).to.equal(doc);
+        expect(createReportDoc.calledOnceWithExactly(input, idHint)).to.be.true;
       });
     });
 

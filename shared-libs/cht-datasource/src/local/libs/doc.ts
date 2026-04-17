@@ -198,8 +198,26 @@ export const fetchAndFilterIds = (
   );
 };
 
-/** @internal */
-export const createDoc = (db: PouchDB.Database) => async (data: DataObject): Promise<Doc> => {
+/**
+ * Creates a new document in the database.
+ * When `idHint` is provided the document is written with that value as `_id`
+ * (via `db.put`). This preserves client-generated UUIDs from offline-first
+ * writers like PowerSync, so re-uploads stay idempotent.
+ * Without an `idHint` the database mints a UUID (via `db.post`) as before.
+ * @internal
+ */
+export const createDoc = (db: PouchDB.Database) => async (
+  data: DataObject,
+  idHint?: string,
+): Promise<Doc> => {
+  if (idHint) {
+    const docWithId = { ...data, _id: idHint };
+    const { rev, ok } = await db.put(docWithId);
+    if (!ok) {
+      throw new Error('Error creating document.');
+    }
+    return { ...docWithId, _rev: rev };
+  }
   const { id, rev, ok } = await db.post(data);
   if (!ok) {
     throw new Error('Error creating document.');

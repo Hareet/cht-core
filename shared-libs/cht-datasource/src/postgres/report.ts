@@ -79,7 +79,7 @@ export namespace v1 {
     const getPgDoc = getDocById(ctx);
     const getPgDocIdsByRange = getDocIdsByIdRange(ctx);
 
-    return async (input: Input.v1.ReportInput): Promise<Report.v1.Report> => {
+    return async (input: Input.v1.ReportInput, idHint?: string): Promise<Report.v1.Report> => {
       // Validate form exists
       const formDocIds = await getPgDocIdsByRange(FORM_DOC_ID_PREFIX, `${FORM_DOC_ID_PREFIX}\ufff0`);
       const supportedForms = formDocIds.map(id => id.substring(FORM_DOC_ID_PREFIX.length));
@@ -99,7 +99,8 @@ export namespace v1 {
         reported_date: getReportedDateTimestamp(input.reported_date),
         type: 'data_record',
       };
-      return createPgDoc(reportDoc) as Promise<Report.v1.Report>;
+      const created = idHint ? createPgDoc(reportDoc, idHint) : createPgDoc(reportDoc);
+      return created as Promise<Report.v1.Report>;
     };
   };
 
