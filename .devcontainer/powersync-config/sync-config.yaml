@@ -314,7 +314,20 @@ streams:
   # USER SETTINGS DOC
   # ================================================================
   # User's own org.couchdb.user:<username> document.
-  # Direct auth.user_id() filter = 1 bucket per user.
+  #
+  # IMPORTANT: the `doc ->> 'type' = 'user-settings'` predicate is load-bearing.
+  # v1.couchdb holds ALL CHT docs (~820K rows). PowerSync's query compiler
+  # extracts `_id = auth.user_id()` into the bucket partition key (partitionBy
+  # = _id) and removes it from the row filter. Without the type predicate,
+  # every row in v1.couchdb becomes its own bucket (~820K buckets, one per
+  # distinct _id value), each with a single row of data. Server-side bucket
+  # bookkeeping on that many buckets stalls the initial sync checkpoint —
+  # observed as `user_settings_doc: 0/N` never draining and hasSynced never
+  # flipping true. See docs.powersync.com/debugging/troubleshooting#how-buckets-are-created-in-sync-streams.
+  #
+  # With the type predicate, only user-settings rows contribute to bucket
+  # creation (~149 buckets for CIV dataset, one per user). Each client still
+  # accesses only its own bucket via `_id = auth.user_id()`.
   user_settings_doc:
     auto_subscribe: true
     priority: 1
@@ -325,6 +338,7 @@ streams:
         CAST(user_settings_doc.doc AS TEXT) AS doc
       FROM "v1"."couchdb" user_settings_doc
       WHERE user_settings_doc._deleted != true
+        AND user_settings_doc.doc ->> 'type' = 'user-settings'
         AND user_settings_doc._id = auth.user_id()
 
   # ================================================================
